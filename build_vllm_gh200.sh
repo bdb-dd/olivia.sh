@@ -3,9 +3,9 @@
 #SBATCH --partition=accel
 #SBATCH --gpus=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=0
-#SBATCH --time=02:00:00
+#SBATCH --time=08:00:00
 #SBATCH --output=build_vllm_%j.log
 
 # =============================================================================
@@ -138,7 +138,7 @@ echo "  User: $(whoami)"
 echo "  PWD: $(pwd)"
 
 echo "Installing build dependencies..."
-pip install --no-cache-dir ninja cmake wheel packaging setuptools-scm
+pip install --no-cache-dir --root-user-action=ignore ninja cmake wheel packaging setuptools-scm
 
 echo "Cloning vLLM repository..."
 cd /opt
@@ -192,6 +192,7 @@ echo "Installing vLLM dependencies (excluding torch)..."
 # This is the key step - we install everything EXCEPT torch
 # Then vLLM will be installed with --no-deps so it can't overwrite torch
 pip install --no-cache-dir \
+    --root-user-action=ignore \
     --constraint /tmp/constraints.txt \
     numpy \
     transformers>=4.45.0 \
@@ -231,39 +232,70 @@ pip install --no-cache-dir \
     2>&1 | tail -20 || true
 
 # Try to install xgrammar (vLLM constraint grammar feature)
-pip install --no-cache-dir xgrammar 2>&1 | tail -5 || echo "xgrammar not available, continuing..."
+pip install --no-cache-dir --root-user-action=ignore xgrammar 2>&1 | tail -5 || echo "xgrammar not available, continuing..."
 
 # Install flash-attention for ARM64 (may need to build from source)
+# CRITICAL: Use --no-deps to prevent flash-attn from pulling in PyPI torch!
 echo ""
-echo "Installing FlashAttention..."
-pip install --no-cache-dir flash-attn --no-build-isolation 2>&1 | tail -20 || {
+echo "Installing FlashAttention (with --no-deps to preserve NGC PyTorch)..."
+pip install --no-cache-dir --no-deps --root-user-action=ignore flash-attn --no-build-isolation 2>&1 | tail -20 || {
     echo "FlashAttention pip install failed, trying from source..."
-    pip install --no-cache-dir git+https://github.com/Dao-AILab/flash-attention.git --no-build-isolation 2>&1 | tail -20 || {
+    pip install --no-cache-dir --no-deps --root-user-action=ignore git+https://github.com/Dao-AILab/flash-attention.git --no-build-isolation 2>&1 | tail -20 || {
         echo "Warning: FlashAttention installation failed (may affect performance)"
     }
 }
 
 # Build and install vLLM
 echo ""
-echo "Building vLLM..."
+echo "========================================"
+echo "Building vLLM CUDA kernels..."
+echo "========================================"
 echo "TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}"
 echo "MAX_JOBS=${MAX_JOBS}"
+echo ""
+echo "This will take 10-30 minutes. Progress shown below:"
+echo "----------------------------------------"
 
 # CRITICAL: Use --no-deps to prevent pip from pulling in its own torch!
 # We already installed all dependencies manually above.
 # This is the key to preserving NGC PyTorch.
+# Using -v for verbose output so we can see compilation progress
 pip install -v --no-cache-dir \
     --no-build-isolation \
     --no-deps \
-    . 2>&1 | tee /tmp/vllm_build.log | tail -100
+    --root-user-action=ignore \
+    . 2>&1 | tee /tmp/vllm_build.log | while IFS= read -r line; do
+        # Show all lines but highlight important ones
+        if [[ "$line" == *"Building"* ]] || \
+           [[ "$line" == *"Compiling"* ]] || \
+           [[ "$line" == *"nvcc"* ]] || \
+           [[ "$line" == *".cpp"* ]] || \
+           [[ "$line" == *".cu"* ]] || \
+           [[ "$line" == *"error"* ]] || \
+           [[ "$line" == *"Error"* ]] || \
+           [[ "$line" == *"warning:"* ]] || \
+           [[ "$line" == *"Successfully"* ]]; then
+            echo "$line"
+        fi
+    done
+
+BUILD_STATUS=${PIPESTATUS[0]}
+echo "----------------------------------------"
+
+# Copy build log to persistent location in sandbox
+cp /tmp/vllm_build.log /opt/vllm_build.log 2>/dev/null || true
+echo "Full build log saved to: /opt/vllm_build.log (inside container)"
 
 # If --no-deps fails due to missing deps, fall back to constraints approach
-if [[ $? -ne 0 ]]; then
+if [[ ${BUILD_STATUS} -ne 0 ]]; then
     echo ""
-    echo "WARNING: --no-deps failed, trying with constraints..."
+    echo "WARNING: --no-deps build failed (exit code: ${BUILD_STATUS})"
+    echo "Trying fallback with constraints..."
+    echo "----------------------------------------"
     pip install -v --no-cache-dir \
         --no-build-isolation \
         --constraint /tmp/constraints.txt \
+        --root-user-action=ignore \
         . 2>&1 | tee /tmp/vllm_build.log | tail -100
 fi
 

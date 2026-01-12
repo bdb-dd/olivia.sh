@@ -23,8 +23,11 @@ mkdir -p "${WORKDIR:-$PWD}/logs"
 # Configuration
 # -----------------------------------------------------------------------------
 
-# Container
-CONTAINER="${CONTAINER:-vllm-gh200-sandbox}"
+# Container directory (shared location on Olivia)
+CONTAINER_DIR="${CONTAINER_DIR:-}"
+
+# Container name (can be just the name or full path)
+CONTAINER="${CONTAINER:-}"
 
 # Model (default: Devstral 123B)
 MODEL="${MODEL:-mistralai/Devstral-2-123B-Instruct-2512}"
@@ -42,6 +45,13 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"    # Max context length
 ENABLE_SPECULATIVE="${ENABLE_SPECULATIVE:-0}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-5}"
 PROMPT_LOOKUP_MAX="${PROMPT_LOOKUP_MAX:-4}"  # Max n-gram window size
+
+# GLM-4.7 specific settings (auto-detected when MODEL contains "GLM-4.7")
+GLM_TOOL_PARSER="${GLM_TOOL_PARSER:-glm47}"
+GLM_REASONING_PARSER="${GLM_REASONING_PARSER:-glm45}"
+ENABLE_AUTO_TOOL_CHOICE="${ENABLE_AUTO_TOOL_CHOICE:-0}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
+MTP_SPECULATIVE_TOKENS="${MTP_SPECULATIVE_TOKENS:-1}"  # MTP speculative tokens for GLM-4.7
 
 # Cache directories
 HF_CACHE="${HF_CACHE:-$PWD/cache/huggingface}"
@@ -73,7 +83,7 @@ echo "vLLM Server for GH200"
 echo "=============================================="
 echo ""
 echo "Configuration:"
-echo "  Container:        ${CONTAINER}"
+echo "  Container dir:    ${CONTAINER_DIR}"
 echo "  Model:            ${MODEL}"
 echo "  Tensor Parallel:  ${TP_SIZE}"
 echo "  GPU Memory:       ${GPU_MEM_UTIL}"
@@ -81,14 +91,34 @@ echo "  Max Model Len:    ${MAX_MODEL_LEN}"
 echo "  Port:             ${PORT}"
 echo "  Attention Backend: ${VLLM_ATTENTION_BACKEND}"
 echo ""
-echo "Speculative Decoding (ngram):"
+# Detect GLM-4.7 model
+IS_GLM47=0
+if [[ "${MODEL}" == *"GLM-4.7"* ]] || [[ "${MODEL}" == *"glm-4.7"* ]]; then
+    IS_GLM47=1
+fi
+
+echo "Speculative Decoding:"
 if [[ "${ENABLE_SPECULATIVE}" == "1" ]]; then
-    echo "  Enabled:          yes"
-    echo "  Method:           ngram"
-    echo "  Spec Tokens:      ${NUM_SPECULATIVE_TOKENS}"
-    echo "  Lookup Max:       ${PROMPT_LOOKUP_MAX}"
+    if [[ "${IS_GLM47}" == "1" ]]; then
+        echo "  Enabled:          yes"
+        echo "  Method:           MTP (Multi-Token Prediction)"
+        echo "  Spec Tokens:      ${MTP_SPECULATIVE_TOKENS}"
+    else
+        echo "  Enabled:          yes"
+        echo "  Method:           ngram"
+        echo "  Spec Tokens:      ${NUM_SPECULATIVE_TOKENS}"
+        echo "  Lookup Max:       ${PROMPT_LOOKUP_MAX}"
+    fi
 else
     echo "  Enabled:          no"
+fi
+
+if [[ "${IS_GLM47}" == "1" ]]; then
+    echo ""
+    echo "GLM-4.7 Settings:"
+    echo "  Tool Parser:      ${GLM_TOOL_PARSER}"
+    echo "  Reasoning Parser: ${GLM_REASONING_PARSER}"
+    echo "  Auto Tool Choice: ${ENABLE_AUTO_TOOL_CHOICE}"
 fi
 echo ""
 echo "GPU Configuration:"
@@ -101,19 +131,71 @@ echo "  vLLM:        ${VLLM_CACHE}"
 echo ""
 
 # -----------------------------------------------------------------------------
-# Pre-flight checks
+# Container discovery and resolution
 # -----------------------------------------------------------------------------
 
-# Check container exists
+# List available containers if none specified
+if [[ -z "${CONTAINER}" ]]; then
+    echo "No container specified. Available containers in ${CONTAINER_DIR}:"
+    echo ""
+    FOUND_CONTAINERS=0
+    if [[ -d "${CONTAINER_DIR}" ]]; then
+        for container in "${CONTAINER_DIR}"/vllm-*-sandbox "${CONTAINER_DIR}"/vllm-*.sif; do
+            if [[ -e "$container" ]]; then
+                FOUND_CONTAINERS=1
+                cname=$(basename "$container")
+                if [[ -d "$container" ]]; then
+                    echo "  ${cname} (sandbox)"
+                else
+                    echo "  ${cname} (sif)"
+                fi
+            fi
+        done
+    fi
+    if [[ "${FOUND_CONTAINERS}" == "0" ]]; then
+        echo "  (none found)"
+    fi
+    echo ""
+    echo "Set CONTAINER=<name> to use a specific container."
+    echo "Example: CONTAINER=vllm-glm47-1-sandbox ./run_vllm_server.sh"
+    exit 1
+fi
+
+# Resolve container path
+CONTAINER_PATH=""
 if [[ -d "${CONTAINER}" ]]; then
+    # Full path to sandbox directory
+    CONTAINER_PATH="${CONTAINER}"
     CONTAINER_TYPE="sandbox"
 elif [[ -f "${CONTAINER}" ]]; then
+    # Full path to SIF file
+    CONTAINER_PATH="${CONTAINER}"
+    CONTAINER_TYPE="sif"
+elif [[ -d "${CONTAINER_DIR}/${CONTAINER}" ]]; then
+    # Name only - look in shared directory (sandbox)
+    CONTAINER_PATH="${CONTAINER_DIR}/${CONTAINER}"
+    CONTAINER_TYPE="sandbox"
+elif [[ -f "${CONTAINER_DIR}/${CONTAINER}" ]]; then
+    # Name only - look in shared directory (sif)
+    CONTAINER_PATH="${CONTAINER_DIR}/${CONTAINER}"
+    CONTAINER_TYPE="sif"
+elif [[ -f "${CONTAINER_DIR}/${CONTAINER}.sif" ]]; then
+    # Name only without .sif extension
+    CONTAINER_PATH="${CONTAINER_DIR}/${CONTAINER}.sif"
     CONTAINER_TYPE="sif"
 else
     echo "Error: Container not found: ${CONTAINER}"
-    echo "Run ./build_vllm_gh200.sh first"
+    echo "Searched in:"
+    echo "  - ${CONTAINER}"
+    echo "  - ${CONTAINER_DIR}/${CONTAINER}"
+    echo "  - ${CONTAINER_DIR}/${CONTAINER}.sif"
+    echo ""
+    echo "Run ./build_vllm_gh200.sh first, or set CONTAINER to a valid path."
     exit 1
 fi
+
+echo "Container:      ${CONTAINER}"
+echo "Container path: ${CONTAINER_PATH}"
 echo "Container type: ${CONTAINER_TYPE}"
 
 # Check HuggingFace token
@@ -145,14 +227,28 @@ if [[ "${ENABLE_CHUNKED_PREFILL:-1}" == "1" ]]; then
     VLLM_ARGS+=("--enable-chunked-prefill")
 fi
 
-# Speculative decoding with ngram (enabled by default)
+# Speculative decoding (method depends on model)
 if [[ "${ENABLE_SPECULATIVE}" == "1" ]]; then
-    # Build JSON config for ngram speculative decoding
-    SPEC_CONFIG=$(cat <<EOF
-{"method": "ngram", "num_speculative_tokens": ${NUM_SPECULATIVE_TOKENS}, "prompt_lookup_max": ${PROMPT_LOOKUP_MAX}}
-EOF
-)
+    if [[ "${IS_GLM47}" == "1" ]]; then
+        # GLM-4.7 uses MTP (Multi-Token Prediction) speculative decoding
+        SPEC_CONFIG='{"method": "mtp", "num_speculative_tokens": '${MTP_SPECULATIVE_TOKENS}'}'
+    else
+        # Default: ngram speculative decoding
+        SPEC_CONFIG='{"method": "ngram", "num_speculative_tokens": '${NUM_SPECULATIVE_TOKENS}', "prompt_lookup_max": '${PROMPT_LOOKUP_MAX}'}'
+    fi
     VLLM_ARGS+=("--speculative-config" "${SPEC_CONFIG}")
+fi
+
+# GLM-4.7 specific arguments
+if [[ "${IS_GLM47}" == "1" ]]; then
+    VLLM_ARGS+=("--tool-call-parser" "${GLM_TOOL_PARSER}")
+    VLLM_ARGS+=("--reasoning-parser" "${GLM_REASONING_PARSER}")
+    if [[ "${ENABLE_AUTO_TOOL_CHOICE}" == "1" ]]; then
+        VLLM_ARGS+=("--enable-auto-tool-choice")
+    fi
+    if [[ -n "${SERVED_MODEL_NAME}" ]]; then
+        VLLM_ARGS+=("--served-model-name" "${SERVED_MODEL_NAME}")
+    fi
 fi
 
 # Optional: Quantization
@@ -200,5 +296,5 @@ singularity exec --nv \
     --env "HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-${HF_TOKEN:-}}" \
     --bind "${HF_CACHE}:${HF_CACHE}" \
     --bind "${VLLM_CACHE}:/root/.cache/vllm" \
-    "${CONTAINER}" \
+    "${CONTAINER_PATH}" \
     "${VLLM_ARGS[@]}"

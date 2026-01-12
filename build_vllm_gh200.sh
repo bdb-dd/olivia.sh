@@ -21,12 +21,127 @@ set -euo pipefail
 # Create logs directory if it doesn't exist
 mkdir -p "${WORKDIR:-$PWD}/logs"
 
+# =============================================================================
+# Model Presets
+# =============================================================================
+# Define model configurations here. Each preset specifies:
+#   - Description: Human-readable description
+#   - VLLM_VERSION: Recommended vLLM version
+#   - TRANSFORMERS_MIN: Minimum transformers version
+#   - NOTES: Any special build considerations
+#
+# To add a new preset, add entries to the case statement below.
+# =============================================================================
+
+show_presets() {
+    echo "Available model presets:"
+    echo ""
+    echo "  glm47      - GLM-4.7 (358B) - Latest flagship model from THUDM"
+    echo "               vLLM: main, transformers>=5.0.0rc0"
+    echo "               Requires ~358GB VRAM (FP8) or ~716GB (BF16)"
+    echo ""
+    echo "  devstral   - Devstral/Mistral models (7B-123B)"
+    echo "               vLLM: main, transformers>=4.45.0"
+    echo "               Standard Mistral architecture"
+    echo ""
+    echo "  llama      - Llama 3.x models (8B-405B)"
+    echo "               vLLM: main, transformers>=4.45.0"
+    echo "               Meta's Llama architecture"
+    echo ""
+    echo "  qwen       - Qwen 2.5 models (7B-72B)"
+    echo "               vLLM: main, transformers>=4.45.0"
+    echo "               Alibaba's Qwen architecture"
+    echo ""
+    echo "  generic    - Generic build (default)"
+    echo "               vLLM: main, transformers>=4.45.0"
+    echo "               Use for unlisted models"
+    echo ""
+    echo "Usage: MODEL_ID=<preset> ./build_vllm_gh200.sh"
+    echo "       MODEL_ID=glm47 ./build_vllm_gh200.sh"
+    echo ""
+    echo "Override defaults: MODEL_ID=glm47 VLLM_VERSION=v0.6.6 ./build_vllm_gh200.sh"
+}
+
+# Apply preset configuration
+apply_preset() {
+    local preset="$1"
+
+    case "${preset}" in
+        glm47|GLM47|glm-4.7|GLM-4.7)
+            MODEL_ID="glm47"
+            PRESET_VLLM_VERSION="main"
+            PRESET_TRANSFORMERS=">=5.0.0rc0"
+            PRESET_NOTES="GLM-4.7 requires MTP speculative decoding, tool/reasoning parsers"
+            ;;
+        devstral|mistral|Devstral|Mistral)
+            MODEL_ID="devstral"
+            PRESET_VLLM_VERSION="main"
+            PRESET_TRANSFORMERS=">=4.45.0"
+            PRESET_NOTES="Standard Mistral architecture, ngram speculative decoding supported"
+            ;;
+        llama|llama3|Llama|Llama3)
+            MODEL_ID="llama"
+            PRESET_VLLM_VERSION="main"
+            PRESET_TRANSFORMERS=">=4.45.0"
+            PRESET_NOTES="Meta Llama architecture"
+            ;;
+        qwen|qwen2|Qwen|Qwen2)
+            MODEL_ID="qwen"
+            PRESET_VLLM_VERSION="main"
+            PRESET_TRANSFORMERS=">=4.45.0"
+            PRESET_NOTES="Alibaba Qwen architecture"
+            ;;
+        generic|Generic)
+            MODEL_ID="generic"
+            PRESET_VLLM_VERSION="main"
+            PRESET_TRANSFORMERS=">=4.45.0"
+            PRESET_NOTES="Generic build for unlisted models"
+            ;;
+        help|--help|-h|list)
+            show_presets
+            exit 0
+            ;;
+        "")
+            echo "No MODEL_ID specified."
+            echo ""
+            show_presets
+            exit 1
+            ;;
+        *)
+            # Unknown preset - use as custom MODEL_ID
+            echo "Note: '${preset}' is not a known preset, using as custom MODEL_ID"
+            MODEL_ID="${preset}"
+            PRESET_VLLM_VERSION="main"
+            PRESET_TRANSFORMERS=">=4.45.0"
+            PRESET_NOTES="Custom model configuration"
+            ;;
+    esac
+}
+
+# =============================================================================
 # Configuration
+# =============================================================================
+
 WORKDIR="${WORKDIR:-$PWD}"
-SANDBOX_NAME="vllm-gh200-sandbox"
-FINAL_IMAGE="vllm-gh200.sif"
 NGC_IMAGE="docker://nvcr.io/nvidia/pytorch:25.12-py3"
-VLLM_VERSION="${VLLM_VERSION:-main}"  # Use 'v0.6.6' for stable, 'main' for latest
+
+# Container output directory (shared location on Olivia)
+CONTAINER_DIR="${CONTAINER_DIR:-}"
+
+# Model identifier - apply preset first
+MODEL_ID="${MODEL_ID:-}"
+apply_preset "${MODEL_ID}"
+
+# Allow override of preset defaults
+VLLM_VERSION="${VLLM_VERSION:-${PRESET_VLLM_VERSION}}"
+
+# Build index (for multiple builds of same model type)
+BUILD_INDEX="${BUILD_INDEX:-1}"
+
+# Derived names
+SANDBOX_NAME="vllm-${MODEL_ID}-${BUILD_INDEX}-sandbox"
+SANDBOX_PATH="${CONTAINER_DIR}/${SANDBOX_NAME}"
+FINAL_IMAGE="${CONTAINER_DIR}/vllm-${MODEL_ID}-${BUILD_INDEX}.sif"
 
 # Cache directories (bind mount these to avoid filling container)
 CACHE_DIR="${WORKDIR}/cache"
@@ -34,13 +149,24 @@ PIP_CACHE="${CACHE_DIR}/pip"
 HF_CACHE="${CACHE_DIR}/huggingface"
 
 echo "=============================================="
-echo "Building vLLM for GH200 - Option A (Constraints)"
+echo "Building vLLM for GH200"
 echo "=============================================="
-echo "Work directory: ${WORKDIR}"
-echo "Sandbox: ${SANDBOX_NAME}"
-echo "vLLM version: ${VLLM_VERSION}"
-echo "NGC base: ${NGC_IMAGE}"
 echo ""
+echo "Preset:         ${MODEL_ID}"
+echo "  Transformers: ${PRESET_TRANSFORMERS}"
+echo "  Notes:        ${PRESET_NOTES}"
+echo ""
+echo "Build Configuration:"
+echo "  Container dir:  ${CONTAINER_DIR}"
+echo "  Build index:    ${BUILD_INDEX}"
+echo "  Sandbox:        ${SANDBOX_NAME}"
+echo "  Sandbox path:   ${SANDBOX_PATH}"
+echo "  vLLM version:   ${VLLM_VERSION}"
+echo "  NGC base:       ${NGC_IMAGE}"
+echo ""
+
+# Create container directory if it doesn't exist
+mkdir -p "${CONTAINER_DIR}"
 
 # Create cache directories
 mkdir -p "${PIP_CACHE}" "${HF_CACHE}"
@@ -65,22 +191,22 @@ fi
 # -----------------------------------------------------------------------------
 echo "[Phase 1] Creating sandbox from NGC base image..."
 
-if [[ -d "${SANDBOX_NAME}" ]]; then
+if [[ -d "${SANDBOX_PATH}" ]]; then
     if [[ "${BATCH_MODE}" == "1" ]]; then
         echo "Sandbox already exists. Using existing sandbox (batch mode)."
     else
         echo "Sandbox already exists. Remove it? (y/N)"
         read -r response
         if [[ "$response" =~ ^[Yy]$ ]]; then
-            rm -rf "${SANDBOX_NAME}"
+            rm -rf "${SANDBOX_PATH}"
         else
             echo "Using existing sandbox"
         fi
     fi
 fi
 
-if [[ ! -d "${SANDBOX_NAME}" ]]; then
-    singularity build --sandbox "${SANDBOX_NAME}" "${NGC_IMAGE}"
+if [[ ! -d "${SANDBOX_PATH}" ]]; then
+    singularity build --sandbox "${SANDBOX_PATH}" "${NGC_IMAGE}"
 fi
 
 # -----------------------------------------------------------------------------
@@ -89,7 +215,7 @@ fi
 echo ""
 echo "[Phase 2] Verifying NGC PyTorch installation..."
 
-singularity exec --nv "${SANDBOX_NAME}" python3 -c "
+singularity exec --nv "${SANDBOX_PATH}" python3 -c "
 import torch
 import sys
 
@@ -111,7 +237,7 @@ print('\\n✓ NGC PyTorch verified')
 "
 
 # Save PyTorch info for later verification
-singularity exec --nv "${SANDBOX_NAME}" python3 -c "import torch; print(torch.__version__)" > pytorch_version_before.txt
+singularity exec --nv "${SANDBOX_PATH}" python3 -c "import torch; print(torch.__version__)" > pytorch_version_before.txt
 echo "NGC PyTorch version saved to pytorch_version_before.txt"
 
 # -----------------------------------------------------------------------------
@@ -129,9 +255,15 @@ else
     SING_OPTS="--nv --writable"
 fi
 
+# Export preset values for use inside container
+export PRESET_TRANSFORMERS="${PRESET_TRANSFORMERS}"
+export VLLM_VERSION="${VLLM_VERSION}"
+
 singularity exec ${SING_OPTS} \
+    --env "PRESET_TRANSFORMERS=${PRESET_TRANSFORMERS}" \
+    --env "VLLM_VERSION=${VLLM_VERSION}" \
     --bind "${PIP_CACHE}:/root/.cache/pip" \
-    "${SANDBOX_NAME}" /bin/bash << 'BUILDSCRIPT'
+    "${SANDBOX_PATH}" /bin/bash << 'BUILDSCRIPT'
 
 set -euo pipefail
 
@@ -189,7 +321,10 @@ nvcc --version
 
 # Strategy: Install dependencies first, then vLLM with --no-deps
 echo ""
+# Use preset transformers version (passed via --env)
+TRANSFORMERS_PKG="transformers${PRESET_TRANSFORMERS:->=4.45.0}"
 echo "Installing vLLM dependencies (excluding torch)..."
+echo "  Transformers package: ${TRANSFORMERS_PKG}"
 
 # Parse requirements but skip torch-related packages
 # This is the key step - we install everything EXCEPT torch
@@ -198,7 +333,7 @@ pip install --no-cache-dir \
     --root-user-action=ignore \
     --constraint /tmp/constraints.txt \
     numpy \
-    transformers>=4.45.0 \
+    "${TRANSFORMERS_PKG}" \
     tokenizers>=0.19.0 \
     sentencepiece \
     fastapi \
@@ -355,7 +490,7 @@ BUILDSCRIPT
 echo ""
 echo "[Phase 4] Final verification..."
 
-singularity exec --nv "${SANDBOX_NAME}" python3 << 'VERIFY'
+singularity exec --nv "${SANDBOX_PATH}" python3 << 'VERIFY'
 import sys
 print("=" * 50)
 print("Final Installation Verification")
@@ -409,7 +544,7 @@ VERIFY
 # Compare PyTorch versions
 echo ""
 BEFORE=$(cat pytorch_version_before.txt)
-AFTER=$(singularity exec --nv "${SANDBOX_NAME}" python3 -c "import torch; print(torch.__version__)")
+AFTER=$(singularity exec --nv "${SANDBOX_PATH}" python3 -c "import torch; print(torch.__version__)")
 echo "PyTorch version before: ${BEFORE}"
 echo "PyTorch version after:  ${AFTER}"
 
@@ -428,7 +563,7 @@ CREATE_SIF="${CREATE_SIF:-0}"
 if [[ "${BATCH_MODE}" == "1" ]]; then
     if [[ "${CREATE_SIF}" == "1" ]]; then
         echo "[Phase 5] Converting sandbox to SIF (CREATE_SIF=1)..."
-        singularity build "${FINAL_IMAGE}" "${SANDBOX_NAME}"
+        singularity build "${FINAL_IMAGE}" "${SANDBOX_PATH}"
         echo "✓ Created ${FINAL_IMAGE}"
     else
         echo "[Phase 5] Skipping SIF conversion (set CREATE_SIF=1 to enable)"
@@ -439,7 +574,7 @@ else
     
     if [[ "$convert_response" =~ ^[Yy]$ ]]; then
         echo "Converting to ${FINAL_IMAGE}..."
-        singularity build "${FINAL_IMAGE}" "${SANDBOX_NAME}"
+        singularity build "${FINAL_IMAGE}" "${SANDBOX_PATH}"
         echo "✓ Created ${FINAL_IMAGE}"
         echo ""
         echo "You can now use: singularity exec --nv ${FINAL_IMAGE} ..."

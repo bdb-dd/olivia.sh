@@ -704,6 +704,10 @@ cmd_server() {
                 action="cancel"
                 shift
                 ;;
+            ssh|shell)
+                action="ssh"
+                shift
+                ;;
             --container|-c)
                 container="$2"
                 shift 2
@@ -946,6 +950,23 @@ cmd_server() {
                 exit 1
             fi
             ;;
+        ssh)
+            # Find the node running the vLLM server
+            local node_name
+            if ! node_name=$(find_vllm_node); then
+                error "No running vLLM server found"
+                echo "" >&2
+                echo "    Start one with: ./olivia.sh server start <preset>" >&2
+                exit 1
+            fi
+
+            success "Opening shell on GPU node: ${node_name}"
+            echo "    (Type 'exit' to return)" >&2
+            echo "" >&2
+
+            # SSH to Olivia, then SSH to the GPU node
+            ssh_run -t "${REMOTE_USER}@${REMOTE_HOST}" "ssh ${node_name}"
+            ;;
     esac
 }
 
@@ -962,6 +983,7 @@ Actions:
     status              Show running server status
     list, ls            List available containers
     logs                Tail logs of running server
+    ssh, shell          Open a shell on the GPU node
     deploy              Upload run_vllm_server.sh to cluster
 
 Presets (with default models):
@@ -987,6 +1009,7 @@ Examples:
     ./olivia.sh server restart glm47 -d              Deploy and restart
     ./olivia.sh server status                        Check running server
     ./olivia.sh server logs                          Tail server logs
+    ./olivia.sh server ssh                           Shell into GPU node
     ./olivia.sh server cancel                        Stop running server
 EOF
 }

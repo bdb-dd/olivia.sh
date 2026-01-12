@@ -71,6 +71,7 @@ Unified CLI for managing vLLM on the Olivia HPC cluster. Uses SSH ControlMaster 
 ./olivia.sh server restart glm47     # Cancel running job and restart
 ./olivia.sh server restart glm47 -d  # Deploy script and restart
 ./olivia.sh server logs              # Tail logs of running server
+./olivia.sh server ssh               # Open shell on GPU node
 ./olivia.sh server cancel            # Cancel running vLLM job
 ./olivia.sh server deploy            # Upload run_vllm_server.sh to cluster
 ```

@@ -4,9 +4,10 @@
 #SBATCH --gpus=4
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=0G
+#SBATCH --mem=0
 #SBATCH --time=08:00:00
-#SBATCH --output=vllm_server_%j.log
+#SBATCH --output=logs/vllm_server_%j.log
+#SBATCH --error=logs/vllm_server_%j.log
 
 # =============================================================================
 # Run vLLM Server on GH200
@@ -14,6 +15,9 @@
 # =============================================================================
 
 set -euo pipefail
+
+# Create logs directory if it doesn't exist
+mkdir -p "${WORKDIR:-$PWD}/logs"
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -27,7 +31,7 @@ MODEL="${MODEL:-mistralai/Devstral-2-123B-Instruct-2512}"
 
 # Server settings
 PORT="${PORT:-8000}"
-HOST="${HOST:-0.0.0.0}"
+HOST="0.0.0.0"  # Always bind to 0.0.0.0, not hostname
 
 # GPU settings
 TP_SIZE="${TP_SIZE:-4}"                    # Tensor parallel size
@@ -56,8 +60,8 @@ export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"         # Enable InfiniBand if av
 # Memory optimizations
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
-# vLLM specific
-export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
+# vLLM attention backend (now set via CLI arg instead of env var)
+VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
 
 echo "=============================================="
 echo "vLLM Server for GH200"
@@ -70,6 +74,7 @@ echo "  Tensor Parallel:  ${TP_SIZE}"
 echo "  GPU Memory:       ${GPU_MEM_UTIL}"
 echo "  Max Model Len:    ${MAX_MODEL_LEN}"
 echo "  Port:             ${PORT}"
+echo "  Attention Backend: ${VLLM_ATTENTION_BACKEND}"
 echo ""
 echo "GPU Configuration:"
 echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
@@ -115,6 +120,7 @@ VLLM_ARGS=(
     "--max-model-len" "${MAX_MODEL_LEN}"
     "--host" "${HOST}"
     "--port" "${PORT}"
+    "--attention-config.backend" "${VLLM_ATTENTION_BACKEND}"
 )
 
 # Optional: Enable chunked prefill for long contexts
@@ -170,7 +176,6 @@ singularity exec --nv \
     --env "NCCL_P2P_LEVEL=${NCCL_P2P_LEVEL}" \
     --env "NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL}" \
     --env "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}" \
-    --env "VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND}" \
     --env "HF_HOME=${HF_CACHE}" \
     --env "HF_TOKEN=${HF_TOKEN:-}" \
     --env "HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-${HF_TOKEN:-}}" \

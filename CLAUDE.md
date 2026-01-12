@@ -27,6 +27,8 @@ Unified CLI for managing vLLM on the Olivia HPC cluster. Uses SSH ControlMaster 
 ./olivia.sh chat --no-stream   # Disable streaming
 ```
 
+**Note:** The chat module verifies a vLLM server is running before connecting. If no server is found, it will prompt you to start one.
+
 #### Build Module
 ```bash
 ./olivia.sh build              # Show build help
@@ -50,13 +52,36 @@ Unified CLI for managing vLLM on the Olivia HPC cluster. Uses SSH ControlMaster 
 
 #### Server Module
 ```bash
-./olivia.sh server             # Show server help
-./olivia.sh server deploy      # Upload run_vllm_server.sh to cluster
-./olivia.sh server restart     # Cancel and restart vLLM job
-./olivia.sh server restart -d  # Deploy script and restart
-./olivia.sh server logs        # Tail logs of running server
-./olivia.sh server cancel      # Cancel running vLLM job
+./olivia.sh server                   # Show server help
+./olivia.sh server list              # List available containers
+./olivia.sh server status            # Show running server status
+
+# Start a server (uses preset with default model)
+./olivia.sh server start glm47       # Start GLM-4.7 server
+./olivia.sh server start devstral    # Start Devstral server
+./olivia.sh server start llama       # Start Llama server
+./olivia.sh server start qwen        # Start Qwen server
+
+# Start with options
+./olivia.sh server start glm47 --index 2              # Use vllm-glm47-2-sandbox
+./olivia.sh server start glm47 --model custom/model   # Override default model
+./olivia.sh server start -c vllm-custom-1-sandbox -m my/model  # Explicit container
+
+# Other actions
+./olivia.sh server restart glm47     # Cancel running job and restart
+./olivia.sh server restart glm47 -d  # Deploy script and restart
+./olivia.sh server logs              # Tail logs of running server
+./olivia.sh server cancel            # Cancel running vLLM job
+./olivia.sh server deploy            # Upload run_vllm_server.sh to cluster
 ```
+
+**Server presets** (with default models):
+| Preset | Default Model |
+|--------|---------------|
+| `glm47` | `zai-org/GLM-4.7-FP8` |
+| `devstral` | `mistralai/Devstral-2-123B-Instruct-2512` |
+| `llama` | `meta-llama/Llama-3.3-70B-Instruct` |
+| `qwen` | `Qwen/Qwen2.5-72B-Instruct` |
 
 #### Tunnel Module
 ```bash
@@ -179,6 +204,8 @@ Runs vLLM server with GH200-optimized settings:
 - `MAX_MODEL_LEN`: Maximum context length (default: 32768)
 - `HF_TOKEN`: HuggingFace token for gated models
 - `VLLM_ATTENTION_BACKEND`: Attention backend (default: `FLASH_ATTN`)
+- `VERBOSE`: Set to `1` for detailed logging including weight loading progress (default: `0`)
+- `VLLM_LOGGING_LEVEL`: Logging level - `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`, or `DEBUG` if VERBOSE=1)
 
 **Speculative Decoding (ngram):**
 - `ENABLE_SPECULATIVE`: Enable speculative decoding (default: `0`)

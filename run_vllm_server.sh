@@ -75,6 +75,17 @@ export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"         # Enable InfiniBand if av
 # Memory optimizations
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
+# Logging configuration
+# Set VERBOSE=1 for detailed vLLM logging (shows weight loading progress, etc.)
+VERBOSE="${VERBOSE:-0}"
+if [[ "${VERBOSE}" == "1" ]]; then
+    VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-DEBUG}"
+else
+    VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}"
+fi
+# Enable vLLM's internal logging configuration
+VLLM_CONFIGURE_LOGGING="${VLLM_CONFIGURE_LOGGING:-1}"
+
 # vLLM attention backend (now set via CLI arg instead of env var)
 VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
 
@@ -90,6 +101,7 @@ echo "  GPU Memory:       ${GPU_MEM_UTIL}"
 echo "  Max Model Len:    ${MAX_MODEL_LEN}"
 echo "  Port:             ${PORT}"
 echo "  Attention Backend: ${VLLM_ATTENTION_BACKEND}"
+echo "  Log Level:        ${VLLM_LOGGING_LEVEL}"
 echo ""
 # Detect GLM-4.7 model
 IS_GLM47=0
@@ -286,11 +298,18 @@ echo "=============================================="
 echo ""
 
 # Run with singularity
+echo ""
+echo "[$(date '+%H:%M:%S')] Starting vLLM server..."
+echo "[$(date '+%H:%M:%S')] Loading model weights (this may take several minutes for large models)..."
+echo ""
+
 singularity exec --nv \
     --env "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}" \
     --env "NCCL_P2P_LEVEL=${NCCL_P2P_LEVEL}" \
     --env "NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL}" \
     --env "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}" \
+    --env "VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL}" \
+    --env "VLLM_CONFIGURE_LOGGING=${VLLM_CONFIGURE_LOGGING}" \
     --env "HF_HOME=${HF_CACHE}" \
     --env "HF_TOKEN=${HF_TOKEN:-}" \
     --env "HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-${HF_TOKEN:-}}" \

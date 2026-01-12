@@ -32,7 +32,6 @@ LOCAL_PORT="${LOCAL_PORT:-8000}"
 JOB_NAME_PATTERN="vllm"
 
 # Remote paths
-REMOTE_WORKDIR="${REMOTE_WORKDIR:-}"
 REMOTE_CONTAINER_DIR="${REMOTE_CONTAINER_DIR:-}"
 
 # Local paths
@@ -277,19 +276,30 @@ tail_job_logs() {
 
     local wait_count=0
     local max_wait=120
+    local node_shown=false
 
     while ! ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "test -f '${log_file}'" 2>/dev/null; do
         if [[ -n "$job_id" ]]; then
-            local job_state
-            job_state=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
-                "squeue -j ${job_id} -h -o '%T'" 2>/dev/null) || true
+            local job_info
+            job_info=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+                "squeue -j ${job_id} -h -o '%T %N'" 2>/dev/null) || true
 
-            if [[ -z "$job_state" ]]; then
+            if [[ -z "$job_info" ]]; then
                 error "Job ${job_id} no longer in queue - may have failed"
                 return 1
             fi
 
-            printf "\r    Job state: %-10s (waiting for log file...)" "$job_state" >&2
+            local job_state node_name
+            job_state=$(echo "$job_info" | awk '{print $1}')
+            node_name=$(echo "$job_info" | awk '{print $2}')
+
+            if [[ "$job_state" == "RUNNING" && -n "$node_name" && "$node_shown" == "false" ]]; then
+                echo "" >&2
+                success "Job running on node: ${node_name}"
+                node_shown=true
+            else
+                printf "\r    Job state: %-10s (waiting for log file...)" "$job_state" >&2
+            fi
         fi
 
         sleep 2
@@ -302,6 +312,17 @@ tail_job_logs() {
             return 0
         fi
     done
+
+    # Show node info if not already shown
+    if [[ -n "$job_id" && "$node_shown" == "false" ]]; then
+        local node_name
+        node_name=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+            "squeue -j ${job_id} -h -o '%N'" 2>/dev/null) || true
+        if [[ -n "$node_name" ]]; then
+            echo "" >&2
+            success "Job running on node: ${node_name}"
+        fi
+    fi
 
     echo "" >&2
     success "Job started - tailing logs"
@@ -548,16 +569,45 @@ EOF
 # MODULE: Server
 # =============================================================================
 
+# Default model mappings for presets
+get_default_model() {
+    local preset="$1"
+    case "${preset}" in
+        glm47|glm-4.7)
+            echo "zai-org/GLM-4.7-FP8"
+            ;;
+        devstral|mistral)
+            echo "mistralai/Devstral-2-123B-Instruct-2512"
+            ;;
+        llama|llama3)
+            echo "meta-llama/Llama-3.3-70B-Instruct"
+            ;;
+        qwen|qwen2)
+            echo "Qwen/Qwen2.5-72B-Instruct"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
+# Resolve preset to container name
+resolve_container_name() {
+    local preset="$1"
+    local index="${2:-1}"
+    echo "vllm-${preset}-${index}-sandbox"
+}
+
 deploy_server_script() {
     if [[ ! -f "${LOCAL_SERVER_SCRIPT}" ]]; then
         error "Server script not found: ${LOCAL_SERVER_SCRIPT}"
         return 1
     fi
 
-    info "Uploading run_vllm_server.sh to ${REMOTE_HOST}:${REMOTE_WORKDIR}/"
+    info "Uploading run_vllm_server.sh to ${REMOTE_HOST}:${REMOTE_CONTAINER_DIR}/"
 
     if ! scp_run "${LOCAL_SERVER_SCRIPT}" \
-        "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_WORKDIR}/run_vllm_server.sh"; then
+        "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_CONTAINER_DIR}/run_vllm_server.sh"; then
         error "Failed to upload server script"
         return 1
     fi
@@ -566,12 +616,27 @@ deploy_server_script() {
     return 0
 }
 
+list_server_containers() {
+    info "Available containers in ${REMOTE_CONTAINER_DIR}:"
+    echo ""
+    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+        "ls -1d ${REMOTE_CONTAINER_DIR}/vllm-*-sandbox ${REMOTE_CONTAINER_DIR}/vllm-*.sif 2>/dev/null | xargs -I{} basename {}" 2>/dev/null || true
+    echo ""
+}
+
 start_server_job() {
-    info "Starting vLLM server job..."
+    local container="$1"
+    local model="$2"
+
+    info "Starting vLLM server..."
+    echo "    Container: ${container}" >&2
+    echo "    Model:     ${model}" >&2
+
+    local env_vars="CONTAINER=${container} MODEL=${model}"
 
     local submit_output
     if ! submit_output=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
-        "cd ${REMOTE_WORKDIR} && sbatch run_vllm_server.sh" 2>&1); then
+        "cd ${REMOTE_CONTAINER_DIR} && ${env_vars} sbatch run_vllm_server.sh" 2>&1); then
         error "Failed to submit job"
         echo "$submit_output" >&2
         return 1
@@ -583,15 +648,41 @@ start_server_job() {
     echo "$job_id"
 }
 
+check_container_exists() {
+    local container="$1"
+    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+        "test -d '${REMOTE_CONTAINER_DIR}/${container}' || test -f '${REMOTE_CONTAINER_DIR}/${container}'" 2>/dev/null
+}
+
 cmd_server() {
     local action=""
     local do_deploy=false
+    local container=""
+    local model=""
+    local preset=""
+    local index="1"
+    local tail_logs=true
 
+    # Parse arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            start)
+                action="start"
+                shift
+                # Check if next arg is a preset (not a flag)
+                if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+                    preset="$1"
+                    shift
+                fi
+                ;;
             restart)
                 action="restart"
                 shift
+                # Check if next arg is a preset (not a flag)
+                if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+                    preset="$1"
+                    shift
+                fi
                 ;;
             deploy)
                 action="deploy"
@@ -601,12 +692,36 @@ cmd_server() {
                 action="logs"
                 shift
                 ;;
+            list|ls)
+                action="list"
+                shift
+                ;;
+            status)
+                action="status"
+                shift
+                ;;
             cancel|stop)
                 action="cancel"
                 shift
                 ;;
+            --container|-c)
+                container="$2"
+                shift 2
+                ;;
+            --model|-m)
+                model="$2"
+                shift 2
+                ;;
+            --index|-i)
+                index="$2"
+                shift 2
+                ;;
             --deploy|-d)
                 do_deploy=true
+                shift
+                ;;
+            --no-tail)
+                tail_logs=false
                 shift
                 ;;
             -h|--help)
@@ -614,14 +729,24 @@ cmd_server() {
                 exit 0
                 ;;
             *)
-                error "Unknown argument: $1"
-                cmd_server_help
-                exit 1
+                # Could be a preset for start/restart command
+                if [[ -z "$action" ]]; then
+                    error "Unknown argument: $1"
+                    cmd_server_help
+                    exit 1
+                elif [[ ("$action" == "start" || "$action" == "restart") && -z "$preset" && ! "$1" =~ ^- ]]; then
+                    preset="$1"
+                    shift
+                else
+                    error "Unknown argument: $1"
+                    exit 1
+                fi
                 ;;
         esac
     done
 
-    if [[ -z "$action" && ! $do_deploy ]]; then
+    # Show help if no action
+    if [[ -z "$action" ]]; then
         cmd_server_help
         exit 0
     fi
@@ -629,6 +754,39 @@ cmd_server() {
     ensure_master_connection || exit 1
 
     case "$action" in
+        list)
+            list_server_containers
+            ;;
+        status)
+            info "vLLM server status:"
+            local job_info
+            job_info=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+                "squeue -u \$USER -h -o '%j %i %N %T %M' | grep -i vllm" 2>/dev/null) || true
+            if [[ -n "$job_info" ]]; then
+                echo ""
+                echo "$job_info" | while read -r name id node state time; do
+                    if [[ "$state" == "RUNNING" ]]; then
+                        success "Server is RUNNING"
+                        echo "    Job ID:   ${id}"
+                        echo "    Node:     ${node}"
+                        echo "    Uptime:   ${time}"
+                        echo ""
+                        echo "    Connect:  ./olivia.sh chat"
+                        echo "    Logs:     ./olivia.sh server logs"
+                    else
+                        warn "Server is ${state}"
+                        echo "    Job ID:   ${id}"
+                        echo "    Node:     ${node:-pending}"
+                    fi
+                done
+                echo ""
+            else
+                warn "No vLLM server found"
+                echo ""
+                echo "    Start one with: ./olivia.sh server start <preset>" >&2
+                echo "    List containers: ./olivia.sh server list" >&2
+            fi
+            ;;
         deploy)
             deploy_server_script
             ;;
@@ -639,30 +797,148 @@ cmd_server() {
                 kill_tunnel
             fi
             ;;
-        restart)
+        start)
+            # Resolve container name
+            if [[ -n "$preset" ]]; then
+                container=$(resolve_container_name "$preset" "$index")
+                if [[ -z "$model" ]]; then
+                    model=$(get_default_model "$preset")
+                fi
+            fi
+
+            if [[ -z "$container" ]]; then
+                error "No container specified"
+                echo "" >&2
+                echo "Usage:" >&2
+                echo "    ./olivia.sh server start <preset>              # e.g., glm47, devstral" >&2
+                echo "    ./olivia.sh server start --container <name>    # explicit container" >&2
+                echo "" >&2
+                list_server_containers
+                exit 1
+            fi
+
+            if [[ -z "$model" ]]; then
+                error "No model specified"
+                echo "" >&2
+                echo "Usage:" >&2
+                echo "    ./olivia.sh server start glm47 --model zai-org/GLM-4.7-FP8" >&2
+                echo "" >&2
+                exit 1
+            fi
+
+            # Check container exists
+            if ! check_container_exists "$container"; then
+                error "Container not found: ${container}"
+                echo "" >&2
+                list_server_containers
+                exit 1
+            fi
+
+            # Deploy if requested
             if $do_deploy; then
                 deploy_server_script || exit 1
                 echo ""
             fi
+
+            # Check if server already running
+            if find_job_id "vllm" >/dev/null 2>&1; then
+                warn "A vLLM server is already running"
+                echo "    Cancel it first with: ./olivia.sh server cancel" >&2
+                echo "    Or use 'restart' to replace it" >&2
+                exit 1
+            fi
+
+            # Close existing tunnel
+            if is_tunnel_alive; then
+                info "Closing existing tunnel..."
+                kill_tunnel
+            fi
+
+            # Start server
+            local job_id
+            if ! job_id=$(start_server_job "$container" "$model"); then
+                exit 1
+            fi
+
+            if $tail_logs; then
+                local log_file="${REMOTE_CONTAINER_DIR}/logs/vllm_server_${job_id}.log"
+                tail_job_logs "$log_file" "$job_id"
+                echo ""
+                info "Connect with: ./olivia.sh chat"
+            else
+                echo ""
+                info "Server starting in background"
+                echo "    Check status: ./olivia.sh server status" >&2
+                echo "    View logs:    ./olivia.sh server logs" >&2
+                echo "    Connect:      ./olivia.sh chat" >&2
+            fi
+            ;;
+        restart)
+            # For restart, we need container and model
+            if [[ -n "$preset" ]]; then
+                container=$(resolve_container_name "$preset" "$index")
+                if [[ -z "$model" ]]; then
+                    model=$(get_default_model "$preset")
+                fi
+            fi
+
+            # If no container specified, try to get from running job or show error
+            if [[ -z "$container" ]]; then
+                error "No container specified for restart"
+                echo "" >&2
+                echo "Usage:" >&2
+                echo "    ./olivia.sh server restart <preset>              # e.g., glm47, devstral" >&2
+                echo "    ./olivia.sh server restart --container <name> --model <model>" >&2
+                exit 1
+            fi
+
+            if [[ -z "$model" ]]; then
+                error "No model specified for restart"
+                echo "" >&2
+                echo "Usage:" >&2
+                echo "    ./olivia.sh server restart glm47 --model zai-org/GLM-4.7-FP8" >&2
+                exit 1
+            fi
+
+            # Check container exists
+            if ! check_container_exists "$container"; then
+                error "Container not found: ${container}"
+                echo "" >&2
+                list_server_containers
+                exit 1
+            fi
+
+            # Deploy if requested
+            if $do_deploy; then
+                deploy_server_script || exit 1
+                echo ""
+            fi
+
+            # Cancel existing job
             cancel_job "vllm"
             if is_tunnel_alive; then
                 info "Closing tunnel (node will change)..."
                 kill_tunnel
             fi
             echo ""
+
+            # Start server
             local job_id
-            if ! job_id=$(start_server_job); then
+            if ! job_id=$(start_server_job "$container" "$model"); then
                 exit 1
             fi
-            local log_file="${REMOTE_WORKDIR}/logs/vllm_server_${job_id}.log"
-            tail_job_logs "$log_file" "$job_id"
-            echo ""
-            info "Reconnect with: ./olivia.sh chat"
+
+            if $tail_logs; then
+                local log_file="${REMOTE_CONTAINER_DIR}/logs/vllm_server_${job_id}.log"
+                tail_job_logs "$log_file" "$job_id"
+                echo ""
+                info "Connect with: ./olivia.sh chat"
+            fi
             ;;
         logs)
             local job_id
             if job_id=$(find_job_id "vllm"); then
-                local log_file="${REMOTE_WORKDIR}/logs/vllm_server_${job_id}.log"
+                local log_file="${REMOTE_CONTAINER_DIR}/logs/vllm_server_${job_id}.log"
                 info "Tailing logs for job ${job_id}..."
                 ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "tail -f '${log_file}'" || true
             else
@@ -680,21 +956,38 @@ Usage: ./olivia.sh server <action> [options]
 Manage vLLM server on Olivia.
 
 Actions:
-    deploy              Upload run_vllm_server.sh to cluster
-    restart             Cancel running job and start new one
-    cancel, stop        Cancel running vLLM job
+    start <preset>      Start vLLM server with a container
+    restart <preset>    Cancel running job and start new one
+    stop, cancel        Cancel running vLLM job
+    status              Show running server status
+    list, ls            List available containers
     logs                Tail logs of running server
+    deploy              Upload run_vllm_server.sh to cluster
+
+Presets (with default models):
+    glm47               GLM-4.7-FP8 (zai-org/GLM-4.7-FP8)
+    devstral            Devstral 123B (mistralai/Devstral-2-123B-Instruct-2512)
+    llama               Llama 3.3 70B (meta-llama/Llama-3.3-70B-Instruct)
+    qwen                Qwen 2.5 72B (Qwen/Qwen2.5-72B-Instruct)
 
 Options:
+    --container, -c     Explicit container name
+    --model, -m         HuggingFace model ID
+    --index, -i         Container index (default: 1)
     --deploy, -d        Deploy script before action
+    --no-tail           Don't tail logs after starting
     -h, --help          Show this help
 
 Examples:
-    ./olivia.sh server deploy           Upload server script
-    ./olivia.sh server restart          Restart server
-    ./olivia.sh server restart -d       Deploy and restart
-    ./olivia.sh server logs             Tail server logs
-    ./olivia.sh server cancel           Stop running server
+    ./olivia.sh server list                          List containers
+    ./olivia.sh server start glm47                   Start GLM-4.7 server
+    ./olivia.sh server start devstral                Start Devstral server
+    ./olivia.sh server start glm47 --index 2         Use vllm-glm47-2-sandbox
+    ./olivia.sh server start --container vllm-glm47-1-sandbox --model zai-org/GLM-4.7-FP8
+    ./olivia.sh server restart glm47 -d              Deploy and restart
+    ./olivia.sh server status                        Check running server
+    ./olivia.sh server logs                          Tail server logs
+    ./olivia.sh server cancel                        Stop running server
 EOF
 }
 
@@ -766,6 +1059,30 @@ EOF
 # MODULE: Chat
 # =============================================================================
 
+# Check if vLLM server is running and ready
+check_server_running() {
+    local job_info
+    job_info=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+        "squeue -u \$USER -h -o '%j %i %N %T' | grep -i vllm" 2>/dev/null) || true
+
+    if [[ -z "$job_info" ]]; then
+        return 1
+    fi
+
+    # Check if job is RUNNING (not PENDING)
+    if echo "$job_info" | grep -q "RUNNING"; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Get server job info for display
+get_server_info() {
+    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+        "squeue -u \$USER -h -o '%j %i %N %T %M' | grep -i vllm" 2>/dev/null || true
+}
+
 cmd_chat() {
     local stream_flag="--stream"
     local tunnel_only=false
@@ -798,6 +1115,50 @@ cmd_chat() {
 
     ensure_master_connection || exit 1
 
+    # First, check if server is running at all
+    info "Checking for running vLLM server..."
+
+    local server_info
+    server_info=$(get_server_info)
+
+    if [[ -z "$server_info" ]]; then
+        error "No vLLM server found"
+        echo "" >&2
+        echo "No vLLM job is currently running on Olivia." >&2
+        echo "" >&2
+        info "To start a server:"
+        echo "    ./olivia.sh server start glm47      # Start GLM-4.7" >&2
+        echo "    ./olivia.sh server start devstral   # Start Devstral" >&2
+        echo "    ./olivia.sh server list             # List available containers" >&2
+        exit 1
+    fi
+
+    # Check if job is RUNNING vs PENDING
+    if ! echo "$server_info" | grep -q "RUNNING"; then
+        warn "vLLM server job found but not yet running"
+        echo "" >&2
+        echo "Job status:" >&2
+        echo "$server_info" | while read -r name id node state time; do
+            echo "    $name (Job $id): $state" >&2
+        done
+        echo "" >&2
+        info "Wait for the job to start, or check logs:"
+        echo "    ./olivia.sh server logs" >&2
+        echo "    ./olivia.sh server status" >&2
+        exit 1
+    fi
+
+    # Server is running - extract node info for display
+    local running_node running_job_id running_time
+    running_node=$(echo "$server_info" | grep "RUNNING" | awk '{print $3}')
+    running_job_id=$(echo "$server_info" | grep "RUNNING" | awk '{print $2}')
+    running_time=$(echo "$server_info" | grep "RUNNING" | awk '{print $5}')
+
+    success "vLLM server is running"
+    echo "    Node:    ${running_node}" >&2
+    echo "    Job ID:  ${running_job_id}" >&2
+    echo "    Uptime:  ${running_time}" >&2
+
     # Check/setup tunnel
     local gpu_node
     local need_new_tunnel=true
@@ -805,23 +1166,18 @@ cmd_chat() {
     if is_tunnel_alive; then
         local existing_node
         existing_node=$(get_tunnel_node)
-        info "Checking if vLLM job is still on ${existing_node}..."
+        info "Checking if server is still on ${existing_node}..."
         if gpu_node=$(find_vllm_node 2>/dev/null) && [[ "$gpu_node" == "$existing_node" ]]; then
             success "Tunnel valid for ${gpu_node}"
             need_new_tunnel=false
         elif [[ -n "${gpu_node:-}" ]]; then
-            warn "Job moved from ${existing_node} to ${gpu_node}"
+            warn "Server moved from ${existing_node} to ${gpu_node}"
         fi
     fi
 
     if $need_new_tunnel; then
         if ! gpu_node=$(find_vllm_node); then
-            error "No running vLLM job found"
-            echo "" >&2
-            info "Current jobs:"
-            ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "squeue -u \$USER" 2>&1 || true
-            echo "" >&2
-            info "Start a server with: ./olivia.sh server restart"
+            error "Could not find server node"
             exit 1
         fi
 

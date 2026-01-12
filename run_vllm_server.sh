@@ -86,6 +86,9 @@ fi
 # Enable vLLM's internal logging configuration
 VLLM_CONFIGURE_LOGGING="${VLLM_CONFIGURE_LOGGING:-1}"
 
+# Cache quantized weights (MARLIN, AWQ, etc.) to speed up subsequent loads
+VLLM_CACHE_QUANTIZED_WEIGHTS="${VLLM_CACHE_QUANTIZED_WEIGHTS:-1}"
+
 # vLLM attention backend (now set via CLI arg instead of env var)
 VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
 
@@ -297,10 +300,81 @@ echo "Press Ctrl+C to stop"
 echo "=============================================="
 echo ""
 
+# Estimate loading time based on model size
+estimate_loading_time() {
+    local model="$1"
+    local estimate=""
+    local size_hint=""
+
+    # Detect model size from name patterns
+    case "${model,,}" in  # lowercase for matching
+        *glm-4.7*|*glm4.7*)
+            if [[ "${model,,}" == *fp4* ]] || [[ "${model,,}" == *nvfp4* ]] || [[ "${model,,}" == *int4* ]]; then
+                estimate="15-25 minutes"
+                size_hint="358B params @ 4-bit (~179GB weights)"
+            elif [[ "${model,,}" == *fp8* ]]; then
+                estimate="25-40 minutes"
+                size_hint="358B params @ FP8 (~358GB weights)"
+            else
+                estimate="30-45 minutes"
+                size_hint="358B params @ BF16 (~716GB weights)"
+            fi
+            ;;
+        *405b*|*400b*)
+            estimate="20-35 minutes"
+            size_hint="~400B params"
+            ;;
+        *123b*|*120b*|*devstral*)
+            estimate="8-15 minutes"
+            size_hint="~123B params"
+            ;;
+        *70b*|*72b*|*65b*)
+            estimate="5-10 minutes"
+            size_hint="~70B params"
+            ;;
+        *32b*|*34b*|*33b*)
+            estimate="3-6 minutes"
+            size_hint="~32B params"
+            ;;
+        *13b*|*14b*)
+            estimate="2-4 minutes"
+            size_hint="~13B params"
+            ;;
+        *7b*|*8b*|*9b*)
+            estimate="1-3 minutes"
+            size_hint="~7-9B params"
+            ;;
+        *1b*|*2b*|*3b*)
+            estimate="30-60 seconds"
+            size_hint="~1-3B params"
+            ;;
+        *)
+            estimate="varies by model size"
+            size_hint="unknown size"
+            ;;
+    esac
+
+    echo "${estimate}|${size_hint}"
+}
+
+# Get loading estimate
+LOAD_ESTIMATE=$(estimate_loading_time "${MODEL}")
+ESTIMATE_TIME="${LOAD_ESTIMATE%%|*}"
+ESTIMATE_SIZE="${LOAD_ESTIMATE##*|}"
+
 # Run with singularity
 echo ""
-echo "[$(date '+%H:%M:%S')] Starting vLLM server..."
-echo "[$(date '+%H:%M:%S')] Loading model weights (this may take several minutes for large models)..."
+echo "=============================================="
+echo "Starting vLLM Server"
+echo "=============================================="
+echo ""
+echo "Model: ${MODEL}"
+echo "Size:  ${ESTIMATE_SIZE}"
+echo ""
+echo "Estimated loading time: ${ESTIMATE_TIME}"
+echo "(Actual time depends on storage speed and cache status)"
+echo ""
+echo "[$(date '+%H:%M:%S')] Starting model loading..."
 echo ""
 
 singularity exec --nv \
@@ -310,6 +384,7 @@ singularity exec --nv \
     --env "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}" \
     --env "VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL}" \
     --env "VLLM_CONFIGURE_LOGGING=${VLLM_CONFIGURE_LOGGING}" \
+    --env "VLLM_CACHE_QUANTIZED_WEIGHTS=${VLLM_CACHE_QUANTIZED_WEIGHTS}" \
     --env "HF_HOME=${HF_CACHE}" \
     --env "HF_TOKEN=${HF_TOKEN:-}" \
     --env "HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-${HF_TOKEN:-}}" \

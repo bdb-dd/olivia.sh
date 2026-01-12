@@ -10,6 +10,9 @@
 #   ./chat_tunnel.sh --tunnel-only  # Just set up tunnel, don't start chat
 #   ./chat_tunnel.sh --kill       # Kill existing tunnel
 #   ./chat_tunnel.sh --status     # Check tunnel and job status
+#   ./chat_tunnel.sh --deploy     # Upload latest run_vllm_server.sh to cluster
+#   ./chat_tunnel.sh --restart    # Cancel and restart the vLLM job
+#   ./chat_tunnel.sh --deploy-restart  # Deploy and restart in one step
 #
 # The tunnel stays open after the chat exits. Use --kill to close it.
 # Only ONE 2FA prompt per session - uses SSH ControlMaster.
@@ -26,6 +29,12 @@ REMOTE_HOST="${REMOTE_HOST:-}"
 REMOTE_PORT=8000
 LOCAL_PORT="${LOCAL_PORT:-8000}"
 JOB_NAME_PATTERN="vllm"  # Matches job names containing "vllm"
+
+# Remote working directory for vLLM
+REMOTE_WORKDIR="${REMOTE_WORKDIR:-}"
+
+# Local script to deploy
+LOCAL_SERVER_SCRIPT="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/run_vllm_server.sh"
 
 # SSH control socket for connection reuse (single socket for all operations)
 SSH_CONTROL_DIR="${HOME}/.ssh/controls"
@@ -157,6 +166,160 @@ kill_tunnel() {
         warn "No active tunnel found"
         return 1
     fi
+}
+
+# -----------------------------------------------------------------------------
+# Deploy and restart functions
+# -----------------------------------------------------------------------------
+
+deploy_server_script() {
+    if [[ ! -f "${LOCAL_SERVER_SCRIPT}" ]]; then
+        error "Server script not found: ${LOCAL_SERVER_SCRIPT}"
+        return 1
+    fi
+
+    info "Uploading run_vllm_server.sh to ${REMOTE_HOST}:${REMOTE_WORKDIR}/"
+
+    # Use scp with ControlMaster for efficient transfer
+    if ! scp -o "ControlPath=${SSH_CONTROL_SOCKET}" \
+        "${LOCAL_SERVER_SCRIPT}" \
+        "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_WORKDIR}/run_vllm_server.sh"; then
+        error "Failed to upload server script"
+        return 1
+    fi
+
+    success "Server script deployed successfully"
+    return 0
+}
+
+find_vllm_job_id() {
+    # Find the job ID of the running vLLM job
+    local squeue_output
+    if ! squeue_output=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "squeue -u \$USER -h -o '%j %i %T'" 2>/dev/null); then
+        error "Failed to run squeue on ${REMOTE_HOST}"
+        return 1
+    fi
+
+    # Find running vLLM job and get its ID
+    local job_line
+    job_line=$(echo "$squeue_output" | grep -i "${JOB_NAME_PATTERN}" | grep "RUNNING" | head -n1) || true
+
+    if [[ -z "$job_line" ]]; then
+        return 1  # No running job
+    fi
+
+    # Extract job ID (second field)
+    echo "$job_line" | awk '{print $2}'
+}
+
+cancel_vllm_job() {
+    info "Looking for running vLLM job..."
+
+    local job_id
+    if ! job_id=$(find_vllm_job_id); then
+        warn "No running vLLM job found"
+        return 0  # Not an error - job might not exist
+    fi
+
+    info "Canceling job ${job_id}..."
+    if ! ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "scancel ${job_id}"; then
+        error "Failed to cancel job ${job_id}"
+        return 1
+    fi
+
+    success "Job ${job_id} canceled"
+
+    # Kill the tunnel since the node will change
+    if is_tunnel_alive; then
+        info "Closing tunnel (node will change after restart)..."
+        kill_tunnel
+    fi
+
+    return 0
+}
+
+start_vllm_job() {
+    info "Starting new vLLM server job..."
+
+    local submit_output
+    if ! submit_output=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+        "cd ${REMOTE_WORKDIR} && sbatch run_vllm_server.sh" 2>&1); then
+        error "Failed to submit job"
+        echo "$submit_output" >&2
+        return 1
+    fi
+
+    # Extract job ID from "Submitted batch job 12345"
+    local new_job_id
+    new_job_id=$(echo "$submit_output" | grep -oE '[0-9]+' | tail -1)
+
+    success "Submitted job ${new_job_id}"
+
+    # Store job ID for log tailing
+    echo "$new_job_id"
+}
+
+tail_job_logs() {
+    local job_id="$1"
+    local log_file="${REMOTE_WORKDIR}/logs/vllm_server_${job_id}.log"
+
+    echo ""
+    info "Waiting for job ${job_id} to start..."
+    echo "    (Press Ctrl+C to stop watching - job will continue running)"
+    echo ""
+
+    # Wait for log file to appear (job to start), with timeout
+    local wait_count=0
+    local max_wait=60  # 60 seconds max wait
+
+    while ! ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "test -f '${log_file}'" 2>/dev/null; do
+        # Check job status
+        local job_state
+        job_state=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+            "squeue -j ${job_id} -h -o '%T'" 2>/dev/null) || true
+
+        if [[ -z "$job_state" ]]; then
+            error "Job ${job_id} no longer in queue - may have failed"
+            return 1
+        fi
+
+        printf "\r    Job state: %-10s (waiting for log file...)" "$job_state"
+
+        sleep 2
+        ((wait_count+=2))
+
+        if [[ $wait_count -ge $max_wait ]]; then
+            echo ""
+            warn "Timeout waiting for log file"
+            echo "    Check manually: ssh ${REMOTE_HOST} 'tail -f ${log_file}'"
+            return 0
+        fi
+    done
+
+    echo ""
+    success "Job started - tailing logs"
+    echo "    Log file: ${log_file}"
+    echo ""
+    echo "==========================================="
+
+    # Tail the log file (user can Ctrl+C to exit)
+    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "tail -f '${log_file}'" || true
+
+    echo ""
+    info "Log tailing stopped. Job continues running."
+    echo "    Reconnect with: ./chat_tunnel.sh"
+}
+
+restart_server() {
+    cancel_vllm_job
+    echo ""
+
+    local job_id
+    if ! job_id=$(start_vllm_job); then
+        return 1
+    fi
+
+    tail_job_logs "$job_id"
 }
 
 # -----------------------------------------------------------------------------
@@ -302,6 +465,9 @@ Options:
     --kill-all       Kill tunnel AND close SSH master connection
     --status         Show tunnel and job status
     --no-stream      Disable streaming in chat client
+    --deploy         Upload latest run_vllm_server.sh to cluster
+    --restart        Cancel running vLLM job and start a new one
+    --deploy-restart Deploy script and restart server (combines --deploy --restart)
     -h, --help       Show this help message
 
 Environment variables:
@@ -312,6 +478,9 @@ Examples:
     $(basename "$0") --port 9000  # Use local port 9000
     $(basename "$0") --kill       # Close the tunnel
     $(basename "$0") --kill-all   # Close tunnel + SSH connection
+    $(basename "$0") --deploy     # Upload latest server script
+    $(basename "$0") --restart    # Cancel and restart vLLM job
+    $(basename "$0") --deploy-restart  # Deploy and restart in one step
 EOF
 }
 
@@ -344,6 +513,23 @@ main() {
             --status)
                 show_status
                 exit 0
+                ;;
+            --deploy)
+                ensure_master_connection || exit 1
+                deploy_server_script
+                exit $?
+                ;;
+            --restart)
+                ensure_master_connection || exit 1
+                restart_server
+                exit $?
+                ;;
+            --deploy-restart)
+                ensure_master_connection || exit 1
+                deploy_server_script || exit 1
+                echo ""
+                restart_server
+                exit $?
                 ;;
             --no-stream)
                 stream_flag=""

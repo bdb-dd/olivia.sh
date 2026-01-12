@@ -38,6 +38,11 @@ TP_SIZE="${TP_SIZE:-4}"                    # Tensor parallel size
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"       # GPU memory utilization
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"    # Max context length
 
+# Speculative decoding settings (ngram method, disabled by default - works best for repetitive content)
+ENABLE_SPECULATIVE="${ENABLE_SPECULATIVE:-0}"
+NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-5}"
+PROMPT_LOOKUP_MAX="${PROMPT_LOOKUP_MAX:-4}"  # Max n-gram window size
+
 # Cache directories
 HF_CACHE="${HF_CACHE:-$PWD/cache/huggingface}"
 VLLM_CACHE="${VLLM_CACHE:-$PWD/cache/vllm}"
@@ -76,6 +81,16 @@ echo "  Max Model Len:    ${MAX_MODEL_LEN}"
 echo "  Port:             ${PORT}"
 echo "  Attention Backend: ${VLLM_ATTENTION_BACKEND}"
 echo ""
+echo "Speculative Decoding (ngram):"
+if [[ "${ENABLE_SPECULATIVE}" == "1" ]]; then
+    echo "  Enabled:          yes"
+    echo "  Method:           ngram"
+    echo "  Spec Tokens:      ${NUM_SPECULATIVE_TOKENS}"
+    echo "  Lookup Max:       ${PROMPT_LOOKUP_MAX}"
+else
+    echo "  Enabled:          no"
+fi
+echo ""
 echo "GPU Configuration:"
 echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 echo "  NCCL_P2P_LEVEL:       ${NCCL_P2P_LEVEL}"
@@ -113,6 +128,7 @@ fi
 # Build vLLM command
 # -----------------------------------------------------------------------------
 
+# Use python module invocation (more reliable than vllm CLI which may not be in PATH)
 VLLM_ARGS=(
     "vllm" "serve" "${MODEL}"
     "--tensor-parallel-size" "${TP_SIZE}"
@@ -121,6 +137,7 @@ VLLM_ARGS=(
     "--host" "${HOST}"
     "--port" "${PORT}"
     "--attention-config.backend" "${VLLM_ATTENTION_BACKEND}"
+    "--compilation-config" '{"mode": "NONE"}'
 )
 
 # Optional: Enable chunked prefill for long contexts
@@ -128,12 +145,14 @@ if [[ "${ENABLE_CHUNKED_PREFILL:-1}" == "1" ]]; then
     VLLM_ARGS+=("--enable-chunked-prefill")
 fi
 
-# Optional: Speculative decoding
-if [[ -n "${SPECULATIVE_MODEL:-}" ]]; then
-    VLLM_ARGS+=(
-        "--speculative-model" "${SPECULATIVE_MODEL}"
-        "--num-speculative-tokens" "${NUM_SPECULATIVE_TOKENS:-5}"
-    )
+# Speculative decoding with ngram (enabled by default)
+if [[ "${ENABLE_SPECULATIVE}" == "1" ]]; then
+    # Build JSON config for ngram speculative decoding
+    SPEC_CONFIG=$(cat <<EOF
+{"method": "ngram", "num_speculative_tokens": ${NUM_SPECULATIVE_TOKENS}, "prompt_lookup_max": ${PROMPT_LOOKUP_MAX}}
+EOF
+)
+    VLLM_ARGS+=("--speculative-config" "${SPEC_CONFIG}")
 fi
 
 # Optional: Quantization

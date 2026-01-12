@@ -50,6 +50,7 @@ Runs vLLM server with GH200-optimized settings:
 - NCCL optimizations for NVLink (`NCCL_P2P_LEVEL=NVL`)
 - GPU reordering for better performance (`CUDA_VISIBLE_DEVICES=1,2,3,0`)
 - Flash Attention backend
+- Speculative decoding with ngram method (disabled by default, enable for repetitive workloads)
 
 ### Key Environment Variables
 
@@ -59,12 +60,17 @@ Runs vLLM server with GH200-optimized settings:
 - `MAX_JOBS`: Parallel compilation jobs (default: 8)
 
 **Server:**
-- `MODEL`: HuggingFace model ID
+- `MODEL`: HuggingFace model ID (default: `mistralai/Devstral-2-123B-Instruct-2512`)
 - `TP_SIZE`: Tensor parallel size (default: 4)
 - `GPU_MEM_UTIL`: GPU memory utilization (default: 0.90)
 - `MAX_MODEL_LEN`: Maximum context length (default: 32768)
 - `HF_TOKEN`: HuggingFace token for gated models
 - `VLLM_ATTENTION_BACKEND`: Attention backend (default: `FLASH_ATTN`)
+
+**Speculative Decoding (ngram):**
+- `ENABLE_SPECULATIVE`: Enable speculative decoding (default: `0`)
+- `NUM_SPECULATIVE_TOKENS`: Number of tokens to speculate (default: 5)
+- `PROMPT_LOOKUP_MAX`: Max n-gram window size (default: 4)
 
 ### Container/Cache Structure
 - `vllm-gh200-sandbox/`: Singularity sandbox (writable container)

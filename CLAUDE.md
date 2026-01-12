@@ -6,9 +6,76 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This repository contains scripts for building and running vLLM on NVIDIA GH200 (GraceHopper) ARM64 GPUs, specifically targeting the NRIS Olivia HPC cluster. The key challenge is preserving NGC's custom PyTorch build while installing vLLM and its dependencies.
 
-## Commands
+## Olivia CLI (`olivia.sh`)
 
-### Build vLLM Container
+Unified CLI for managing vLLM on the Olivia HPC cluster. Uses SSH ControlMaster for single 2FA authentication per session.
+
+### Quick Start
+```bash
+./olivia.sh                    # Show help
+./olivia.sh chat               # Connect to vLLM and start chat
+./olivia.sh status             # Check cluster and connection status
+```
+
+### Modules
+
+#### Chat Module
+```bash
+./olivia.sh chat               # Connect and start interactive chat
+./olivia.sh chat --port 9000   # Use different local port
+./olivia.sh chat --tunnel-only # Just set up tunnel, don't start chat
+./olivia.sh chat --no-stream   # Disable streaming
+```
+
+#### Build Module
+```bash
+./olivia.sh build              # Show build help
+./olivia.sh build --presets    # List available model presets
+./olivia.sh build --list       # List existing containers on cluster
+
+# Build containers (deploys script and submits SLURM job)
+./olivia.sh build glm47        # Build GLM-4.7 container
+./olivia.sh build devstral     # Build Devstral container
+./olivia.sh build llama        # Build Llama container
+
+# Build options
+./olivia.sh build glm47 --index 2    # Build second container (safe, won't touch existing)
+./olivia.sh build glm47 --force      # Rebuild existing container (use with caution!)
+./olivia.sh build glm47 --sif        # Create SIF image after build
+./olivia.sh build glm47 --vllm v0.6.6  # Override vLLM version
+./olivia.sh build glm47 --no-tail    # Don't tail logs after submitting
+```
+
+**Safety:** By default, builds will **fail** if a container with the same name already exists. Use `--index N` to create a new container, or `--force` to explicitly overwrite.
+
+#### Server Module
+```bash
+./olivia.sh server             # Show server help
+./olivia.sh server deploy      # Upload run_vllm_server.sh to cluster
+./olivia.sh server restart     # Cancel and restart vLLM job
+./olivia.sh server restart -d  # Deploy script and restart
+./olivia.sh server logs        # Tail logs of running server
+./olivia.sh server cancel      # Cancel running vLLM job
+```
+
+#### Tunnel Module
+```bash
+./olivia.sh tunnel             # Show tunnel status
+./olivia.sh tunnel up          # Open tunnel to vLLM server
+./olivia.sh tunnel down        # Close tunnel
+```
+
+#### Global Options
+```bash
+./olivia.sh --kill-all         # Close tunnel and SSH connection
+./olivia.sh --version          # Show version
+```
+
+## Direct Script Commands
+
+The underlying scripts can still be used directly on the cluster:
+
+### Build vLLM Container (`build_vllm_gh200.sh`)
 ```bash
 # List available model presets
 ./build_vllm_gh200.sh
@@ -26,8 +93,11 @@ MODEL_ID=glm47 BUILD_INDEX=2 ./build_vllm_gh200.sh
 # Override preset defaults
 MODEL_ID=glm47 VLLM_VERSION=v0.6.6 ./build_vllm_gh200.sh
 
-# Submit as SLURM job
+# Submit as SLURM job (will FAIL if container exists - safe default)
 MODEL_ID=glm47 sbatch build_vllm_gh200.sh
+
+# Submit with explicit overwrite permission
+MODEL_ID=glm47 OVERWRITE=1 sbatch build_vllm_gh200.sh
 
 # Create SIF image after build
 MODEL_ID=glm47 CREATE_SIF=1 ./build_vllm_gh200.sh
@@ -36,7 +106,9 @@ MODEL_ID=glm47 CREATE_SIF=1 ./build_vllm_gh200.sh
 MODEL_ID=my-custom-model ./build_vllm_gh200.sh
 ```
 
-### Run vLLM Server
+**Safety:** In batch mode (sbatch), the build will fail if a container already exists unless `OVERWRITE=1` is set. This prevents accidental overwrites of working containers.
+
+### Run vLLM Server (`run_vllm_server.sh`)
 ```bash
 # List available containers (run without CONTAINER set)
 ./run_vllm_server.sh
@@ -95,6 +167,7 @@ Runs vLLM server with GH200-optimized settings:
 - `BUILD_INDEX`: Build index for multiple builds of same model (default: `1`)
 - `VLLM_VERSION`: vLLM version to build (default: `main`)
 - `CREATE_SIF`: Set to `1` to create SIF image after build
+- `OVERWRITE`: Set to `1` to allow overwriting existing containers in batch mode (default: `0`)
 - `MAX_JOBS`: Parallel compilation jobs (default: 8)
 
 **Server:**

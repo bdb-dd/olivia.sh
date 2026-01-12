@@ -177,6 +177,9 @@ if [[ -n "${SLURM_JOB_ID:-}" ]]; then
     BATCH_MODE=1
 fi
 
+# Overwrite protection (requires OVERWRITE=1 to rebuild existing container in batch mode)
+OVERWRITE="${OVERWRITE:-0}"
+
 # Check if fakeroot is available
 FAKEROOT_AVAILABLE=0
 if singularity exec --fakeroot --help &>/dev/null; then
@@ -193,14 +196,40 @@ echo "[Phase 1] Creating sandbox from NGC base image..."
 
 if [[ -d "${SANDBOX_PATH}" ]]; then
     if [[ "${BATCH_MODE}" == "1" ]]; then
-        echo "Sandbox already exists. Using existing sandbox (batch mode)."
+        if [[ "${OVERWRITE}" == "1" ]]; then
+            echo "WARNING: Sandbox already exists. OVERWRITE=1 set, will rebuild."
+            echo "         Existing container: ${SANDBOX_PATH}"
+            echo ""
+        else
+            echo ""
+            echo "=============================================="
+            echo "ERROR: Container already exists!"
+            echo "=============================================="
+            echo ""
+            echo "  Existing: ${SANDBOX_NAME}"
+            echo "  Path:     ${SANDBOX_PATH}"
+            echo ""
+            echo "To avoid accidentally overwriting working containers,"
+            echo "batch mode requires explicit confirmation."
+            echo ""
+            echo "Options:"
+            echo "  1. Build with a different index:"
+            echo "     MODEL_ID=${MODEL_ID} BUILD_INDEX=2 sbatch build_vllm_gh200.sh"
+            echo ""
+            echo "  2. Force overwrite existing container:"
+            echo "     MODEL_ID=${MODEL_ID} OVERWRITE=1 sbatch build_vllm_gh200.sh"
+            echo ""
+            exit 1
+        fi
     else
-        echo "Sandbox already exists. Remove it? (y/N)"
+        echo "Sandbox already exists: ${SANDBOX_NAME}"
+        echo "Remove it and rebuild? (y/N)"
         read -r response
         if [[ "$response" =~ ^[Yy]$ ]]; then
+            echo "Removing existing sandbox..."
             rm -rf "${SANDBOX_PATH}"
         else
-            echo "Using existing sandbox"
+            echo "Using existing sandbox (will rebuild vLLM inside it)"
         fi
     fi
 fi

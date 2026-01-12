@@ -18,6 +18,9 @@
 
 set -euo pipefail
 
+# Create logs directory if it doesn't exist
+mkdir -p "${WORKDIR:-$PWD}/logs"
+
 # Configuration
 WORKDIR="${WORKDIR:-$PWD}"
 SANDBOX_NAME="vllm-gh200-sandbox"
@@ -229,10 +232,31 @@ pip install --no-cache-dir \
     protobuf \
     ray \
     psutil \
-    2>&1 | tail -20 || true
+    cbor2 \
+    cachetools \
+    scipy \
+    diskcache \
+    xxhash \
+    anthropic==0.71.0 \
+    grpcio-reflection>=1.76.0 \
+    ijson \
+    "llguidance>=1.3.0,<1.4.0" \
+    mcp \
+    model-hosting-container-standards>=0.1.10 \
+    openai-harmony>=0.0.3 \
+    opencv-python-headless>=4.11.0 \
+    pybase64 \
+    setproctitle \
+    lark==1.2.2 \
+    2>&1 | tail -30 || true
 
 # Try to install xgrammar (vLLM constraint grammar feature)
 pip install --no-cache-dir --root-user-action=ignore xgrammar 2>&1 | tail -5 || echo "xgrammar not available, continuing..."
+
+# Install flashinfer (use --no-deps to avoid pulling torch)
+echo ""
+echo "Installing flashinfer-python..."
+pip install --no-cache-dir --root-user-action=ignore --no-deps flashinfer-python 2>&1 | tail -5 || echo "flashinfer not available for ARM64, continuing..."
 
 # Install flash-attention for ARM64 (may need to build from source)
 # CRITICAL: Use --no-deps to prevent flash-attn from pulling in PyPI torch!

@@ -54,7 +54,7 @@ GLM_TOOL_PARSER="${GLM_TOOL_PARSER:-glm47}"
 GLM_REASONING_PARSER="${GLM_REASONING_PARSER:-glm45}"
 ENABLE_AUTO_TOOL_CHOICE="${ENABLE_AUTO_TOOL_CHOICE:-0}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
-MTP_SPECULATIVE_TOKENS="${MTP_SPECULATIVE_TOKENS:-1}"  # MTP speculative tokens for GLM-4.7
+MTP_SPECULATIVE_TOKENS="${MTP_SPECULATIVE_TOKENS:-3}"  # MTP speculative tokens for GLM-4.7
 
 # MoE (Mixture of Experts) settings
 # Expert parallel is required for AWQ-quantized MoE models to shard experts across GPUs

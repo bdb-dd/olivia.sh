@@ -162,58 +162,91 @@ class DevstralChat:
         }
     
     def _stream_response(self, payload: dict, start_time: float) -> Tuple[str, dict]:
-        """Handle streaming response."""
+        """Handle streaming response with token batching for improved throughput."""
         response_content = ""
         first_token_time = None
         prompt_tokens = 0
         completion_tokens = 0
-        
+
+        # Token batching settings - reduces I/O overhead over SSH tunnel
+        BATCH_SIZE = 10  # Number of tokens to batch before printing
+        BATCH_CHARS = 50  # Or flush when buffer exceeds this many chars
+        BATCH_TIMEOUT = 0.1  # Max seconds to hold tokens before flushing
+
+        token_buffer = ""
+        last_flush_time = time.time()
+        tokens_in_buffer = 0
+
         resp = requests.post(
             f"{self.base_url}/v1/chat/completions",
             json=payload,
             stream=True,
             timeout=300
         )
-        
+
         if resp.status_code != 200:
             return "", {}
-        
+
         if RICH_AVAILABLE:
             console.print("\n[bold blue]Assistant:[/bold blue] ", end="")
         else:
             print("\nAssistant: ", end="", flush=True)
-        
+
+        def flush_buffer():
+            nonlocal token_buffer, last_flush_time, tokens_in_buffer
+            if token_buffer:
+                print(token_buffer, end="", flush=True)
+                token_buffer = ""
+                tokens_in_buffer = 0
+                last_flush_time = time.time()
+
         for line in resp.iter_lines():
             if line:
                 line = line.decode('utf-8')
                 if line.startswith("data: "):
                     data_str = line[6:]
                     if data_str == "[DONE]":
+                        flush_buffer()  # Flush any remaining tokens
                         break
                     try:
                         data = json.loads(data_str)
-                        
+
                         if first_token_time is None and data.get("choices"):
                             first_token_time = time.time() - start_time
-                        
+
                         delta = data.get("choices", [{}])[0].get("delta", {})
                         content = delta.get("content", "")
                         if content:
-                            print(content, end="", flush=True)
+                            token_buffer += content
+                            tokens_in_buffer += 1
                             response_content += content
-                        
+
+                            # Flush buffer if: enough tokens, enough chars, or timeout
+                            current_time = time.time()
+                            should_flush = (
+                                tokens_in_buffer >= BATCH_SIZE or
+                                len(token_buffer) >= BATCH_CHARS or
+                                (current_time - last_flush_time) >= BATCH_TIMEOUT or
+                                '\n' in content  # Always flush on newlines for readability
+                            )
+
+                            if should_flush:
+                                flush_buffer()
+
                         usage = data.get("usage")
                         if usage:
                             prompt_tokens = usage.get("prompt_tokens", 0)
                             completion_tokens = usage.get("completion_tokens", 0)
                     except json.JSONDecodeError:
                         pass
-        
+
+        # Final flush in case anything remains
+        flush_buffer()
         print()
-        
+
         if completion_tokens == 0:
             completion_tokens = int(len(response_content.split()) * 1.3)
-        
+
         return response_content, {
             "first_token_time": first_token_time,
             "prompt_tokens": prompt_tokens,

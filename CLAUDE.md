@@ -67,6 +67,9 @@ Unified CLI for managing vLLM on the Olivia HPC cluster. Uses SSH ControlMaster 
 ./olivia.sh server start glm47 --model custom/model   # Override default model
 ./olivia.sh server start -c vllm-custom-1-sandbox -m my/model  # Explicit container
 
+# Monitoring
+./olivia.sh server watch             # Smart monitor: GPU loading -> health -> ready
+
 # Other actions
 ./olivia.sh server restart glm47     # Cancel running job and restart
 ./olivia.sh server restart glm47 -d  # Deploy script and restart
@@ -76,10 +79,17 @@ Unified CLI for managing vLLM on the Olivia HPC cluster. Uses SSH ControlMaster 
 ./olivia.sh server deploy            # Upload run_vllm_server.sh to cluster
 ```
 
+**Watch command phases:**
+1. **WAITING** - Waits for SLURM job to be submitted
+2. **PENDING** - Job queued, waiting for resources
+3. **LOADING** - GPU memory increasing as weights load (progress bar)
+4. **INIT** - Weights loaded, checking /health endpoint
+5. **SERVING** - Live throughput monitoring (tok/s, active requests, KV cache)
+
 **Server presets** (with default models):
 | Preset | Default Model |
 |--------|---------------|
-| `glm47` | `zai-org/GLM-4.7-FP8` |
+| `glm47` | `QuantTrio/GLM-4.7-AWQ` |
 | `devstral` | `mistralai/Devstral-2-123B-Instruct-2512` |
 | `llama` | `meta-llama/Llama-3.3-70B-Instruct` |
 | `qwen` | `Qwen/Qwen2.5-72B-Instruct` |
@@ -140,13 +150,13 @@ MODEL_ID=my-custom-model ./build_vllm_gh200.sh
 ./run_vllm_server.sh
 
 # Run specific container by name
-CONTAINER=vllm-glm47-1-sandbox MODEL=zai-org/GLM-4.7-FP8 ./run_vllm_server.sh
+CONTAINER=vllm-glm47-1-sandbox MODEL=QuantTrio/GLM-4.7-AWQ ./run_vllm_server.sh
 
 # Run Devstral container
 CONTAINER=vllm-devstral-1-sandbox MODEL=mistralai/Devstral-2-123B-Instruct-2512 ./run_vllm_server.sh
 
 # Submit as SLURM job
-CONTAINER=vllm-glm47-1-sandbox MODEL=zai-org/GLM-4.7-FP8 sbatch run_vllm_server.sh
+CONTAINER=vllm-glm47-1-sandbox MODEL=QuantTrio/GLM-4.7-AWQ sbatch run_vllm_server.sh
 ```
 
 ## Architecture
@@ -227,7 +237,7 @@ Runs vLLM server with GH200-optimized settings:
 
 | Model | Size | GH200 Compatible | Notes |
 |-------|------|------------------|-------|
-| `zai-org/GLM-4.7-FP8` | ~358GB | Yes | Tight fit on 4×96GB, reduce MAX_MODEL_LEN |
+| `QuantTrio/GLM-4.7-AWQ` | ~358GB | Yes | Tight fit on 4×96GB, reduce MAX_MODEL_LEN |
 | `QuantTrio/GLM-4.7-AWQ` | ~181GB | **Yes (Recommended)** | AWQ 4-bit, leaves room for KV cache |
 | `Salyut1/GLM-4.7-NVFP4` | ~179GB | **No** | Requires Blackwell GPUs (B100/B200) |
 
@@ -244,7 +254,7 @@ MODEL_ID=glm47 ./build_vllm_gh200.sh
 CONTAINER=vllm-glm47-1-sandbox MODEL=QuantTrio/GLM-4.7-AWQ ./run_vllm_server.sh
 
 # Run GLM-4.7 with FP8 quantization (tight fit, reduce context length)
-CONTAINER=vllm-glm47-1-sandbox MODEL=zai-org/GLM-4.7-FP8 MAX_MODEL_LEN=8192 ./run_vllm_server.sh
+CONTAINER=vllm-glm47-1-sandbox MODEL=QuantTrio/GLM-4.7-AWQ MAX_MODEL_LEN=8192 ./run_vllm_server.sh
 
 # Run GLM-4.7 AWQ with MTP speculative decoding
 CONTAINER=vllm-glm47-1-sandbox MODEL=QuantTrio/GLM-4.7-AWQ ENABLE_SPECULATIVE=1 ./run_vllm_server.sh

@@ -574,7 +574,7 @@ get_default_model() {
     local preset="$1"
     case "${preset}" in
         glm47|glm-4.7)
-            echo "zai-org/GLM-4.7-FP8"
+            echo "QuantTrio/GLM-4.7-AWQ"
             ;;
         devstral|mistral)
             echo "mistralai/Devstral-2-123B-Instruct-2512"
@@ -654,6 +654,200 @@ check_container_exists() {
         "test -d '${REMOTE_CONTAINER_DIR}/${container}' || test -f '${REMOTE_CONTAINER_DIR}/${container}'" 2>/dev/null
 }
 
+# =============================================================================
+# Server Watch - Intelligent model loading monitor
+# =============================================================================
+
+server_watch() {
+    local interval="${1:-3}"  # Update interval in seconds
+
+    echo ""
+    info "Starting intelligent server watch..."
+    echo "    Press Ctrl+C to exit"
+    echo ""
+
+    local phase="waiting"  # waiting, loading, initializing, serving
+    local prev_mem=0
+    local stable_count=0
+    local health_checks=0
+    local max_health_checks=60  # Give up after ~3 minutes of health checks
+    local node_name=""
+    local job_id=""
+    local log_file=""
+
+    # Cleanup on exit
+    trap 'echo ""; info "Watch stopped"; return 0' INT TERM
+
+    while true; do
+        # Phase 1: Wait for job to start
+        if [[ "$phase" == "waiting" ]]; then
+            local job_info
+            job_info=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+                "squeue -u \$USER -h -o '%j %i %N %T' | grep -i vllm" 2>/dev/null) || true
+
+            if [[ -z "$job_info" ]]; then
+                printf "\r\033[K[WAITING] No vLLM job found. Waiting for job submission..."
+            else
+                local state
+                state=$(echo "$job_info" | awk '{print $4}' | head -1)
+                job_id=$(echo "$job_info" | awk '{print $2}' | head -1)
+                node_name=$(echo "$job_info" | awk '{print $3}' | head -1)
+
+                if [[ "$state" == "RUNNING" && -n "$node_name" ]]; then
+                    echo ""
+                    success "Job ${job_id} running on ${node_name}"
+                    log_file="${REMOTE_CONTAINER_DIR}/logs/vllm_server_${job_id}.log"
+                    phase="loading"
+                    sleep 2  # Give container time to start
+                elif [[ "$state" == "PENDING" ]]; then
+                    printf "\r\033[K[PENDING] Job ${job_id} waiting for resources..."
+                else
+                    printf "\r\033[K[${state}] Job ${job_id}..."
+                fi
+            fi
+            sleep "$interval"
+            continue
+        fi
+
+        # Phase 2: Monitor GPU memory loading
+        if [[ "$phase" == "loading" || "$phase" == "initializing" ]]; then
+            # Get GPU memory usage from node
+            local gpu_info
+            gpu_info=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+                "ssh ${node_name} 'nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits' 2>/dev/null" 2>/dev/null) || true
+
+            if [[ -n "$gpu_info" ]]; then
+                # Parse GPU info (format: "used, total, util" per GPU)
+                local total_used=0
+                local total_mem=0
+                local gpu_count=0
+                local max_util=0
+
+                while IFS=',' read -r used total util; do
+                    used=$(echo "$used" | tr -d ' ')
+                    total=$(echo "$total" | tr -d ' ')
+                    util=$(echo "$util" | tr -d ' ')
+                    total_used=$((total_used + used))
+                    total_mem=$((total_mem + total))
+                    gpu_count=$((gpu_count + 1))
+                    if [[ "$util" -gt "$max_util" ]]; then
+                        max_util="$util"
+                    fi
+                done <<< "$gpu_info"
+
+                # Convert to GB
+                local used_gb=$((total_used / 1024))
+                local total_gb=$((total_mem / 1024))
+                local pct=$((total_used * 100 / total_mem))
+
+                # Check if memory is stable (loading complete)
+                if [[ "$total_used" -eq "$prev_mem" ]]; then
+                    stable_count=$((stable_count + 1))
+                else
+                    stable_count=0
+                fi
+                prev_mem=$total_used
+
+                # Progress bar
+                local bar_width=30
+                local filled=$((pct * bar_width / 100))
+                local empty=$((bar_width - filled))
+                local bar=$(printf '%*s' "$filled" '' | tr ' ' '█')
+                bar+=$(printf '%*s' "$empty" '' | tr ' ' '░')
+
+                if [[ "$phase" == "loading" ]]; then
+                    printf "\r\033[K[LOADING] GPU Memory: [%s] %d/%dGB (%d%%) | GPUs: %d" \
+                        "$bar" "$used_gb" "$total_gb" "$pct" "$gpu_count"
+
+                    # If memory stable for ~15 seconds, switch to initializing phase
+                    if [[ "$stable_count" -ge 5 && "$used_gb" -gt 10 ]]; then
+                        echo ""
+                        info "Weights loaded (~${used_gb}GB). Initializing model..."
+                        phase="initializing"
+                        stable_count=0
+                    fi
+                else
+                    # Initializing phase - check health endpoint
+                    printf "\r\033[K[INIT] GPU: %d/%dGB | Checking server health..." \
+                        "$used_gb" "$total_gb"
+
+                    # Try health endpoint via SSH tunnel to node
+                    local health_status
+                    health_status=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+                        "curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://${node_name}:${REMOTE_PORT}/health" 2>/dev/null) || health_status="000"
+
+                    health_checks=$((health_checks + 1))
+
+                    if [[ "$health_status" == "200" ]]; then
+                        echo ""
+                        echo ""
+                        success "Server is READY! Monitoring throughput..."
+                        echo ""
+                        phase="serving"
+                    elif [[ "$health_checks" -ge "$max_health_checks" ]]; then
+                        echo ""
+                        warn "Server not responding after ${health_checks} checks"
+                        echo "    Check logs: ./olivia.sh server logs"
+                        return 1
+                    fi
+                fi
+            else
+                printf "\r\033[K[LOADING] Waiting for GPU info from ${node_name}..."
+            fi
+        fi
+
+        # Phase 3: Monitor throughput when serving
+        if [[ "$phase" == "serving" ]]; then
+            # Get GPU memory for display
+            local gpu_info
+            gpu_info=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+                "ssh ${node_name} 'nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits' 2>/dev/null" 2>/dev/null) || true
+
+            local total_used=0
+            local total_mem=0
+            if [[ -n "$gpu_info" ]]; then
+                while IFS=',' read -r used total; do
+                    used=$(echo "$used" | tr -d ' ')
+                    total=$(echo "$total" | tr -d ' ')
+                    total_used=$((total_used + used))
+                    total_mem=$((total_mem + total))
+                done <<< "$gpu_info"
+            fi
+            local used_gb=$((total_used / 1024))
+            local total_gb=$((total_mem / 1024))
+
+            # Get latest throughput from logs
+            # Format: "Avg prompt throughput: 1.9 tokens/s, Avg generation throughput: 7.6 tokens/s, Running: 1 reqs"
+            local log_line
+            log_line=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+                "tail -20 '${log_file}' 2>/dev/null | grep -o 'Avg generation throughput: [0-9.]*.*Running: [0-9]* reqs' | tail -1" 2>/dev/null) || true
+
+            local gen_throughput="--"
+            local running_reqs="0"
+            local kv_cache="--"
+
+            if [[ -n "$log_line" ]]; then
+                gen_throughput=$(echo "$log_line" | grep -oE 'generation throughput: [0-9.]+' | grep -oE '[0-9.]+') || gen_throughput="--"
+                running_reqs=$(echo "$log_line" | grep -oE 'Running: [0-9]+' | grep -oE '[0-9]+') || running_reqs="0"
+            fi
+
+            # Get KV cache usage
+            local kv_line
+            kv_line=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+                "tail -5 '${log_file}' 2>/dev/null | grep -o 'KV cache usage: [0-9.]*%' | tail -1" 2>/dev/null) || true
+            if [[ -n "$kv_line" ]]; then
+                kv_cache=$(echo "$kv_line" | grep -oE '[0-9.]+%') || kv_cache="--"
+            fi
+
+            # Display serving status
+            printf "\r\033[K[SERVING] GPU: %d/%dGB | Throughput: %s tok/s | Reqs: %s | KV: %s" \
+                "$used_gb" "$total_gb" "$gen_throughput" "$running_reqs" "$kv_cache"
+        fi
+
+        sleep "$interval"
+    done
+}
+
 cmd_server() {
     local action=""
     local do_deploy=false
@@ -706,6 +900,10 @@ cmd_server() {
                 ;;
             ssh|shell)
                 action="ssh"
+                shift
+                ;;
+            watch)
+                action="watch"
                 shift
                 ;;
             --container|-c)
@@ -825,7 +1023,7 @@ cmd_server() {
                 error "No model specified"
                 echo "" >&2
                 echo "Usage:" >&2
-                echo "    ./olivia.sh server start glm47 --model zai-org/GLM-4.7-FP8" >&2
+                echo "    ./olivia.sh server start glm47 --model QuantTrio/GLM-4.7-AWQ" >&2
                 echo "" >&2
                 exit 1
             fi
@@ -900,7 +1098,7 @@ cmd_server() {
                 error "No model specified for restart"
                 echo "" >&2
                 echo "Usage:" >&2
-                echo "    ./olivia.sh server restart glm47 --model zai-org/GLM-4.7-FP8" >&2
+                echo "    ./olivia.sh server restart glm47 --model QuantTrio/GLM-4.7-AWQ" >&2
                 exit 1
             fi
 
@@ -967,6 +1165,9 @@ cmd_server() {
             # SSH to Olivia, then SSH to the GPU node
             ssh_run -t "${REMOTE_USER}@${REMOTE_HOST}" "ssh ${node_name}"
             ;;
+        watch)
+            server_watch
+            ;;
     esac
 }
 
@@ -981,13 +1182,14 @@ Actions:
     restart <preset>    Cancel running job and start new one
     stop, cancel        Cancel running vLLM job
     status              Show running server status
+    watch               Smart monitor: GPU loading -> health check -> ready
     list, ls            List available containers
     logs                Tail logs of running server
     ssh, shell          Open a shell on the GPU node
     deploy              Upload run_vllm_server.sh to cluster
 
 Presets (with default models):
-    glm47               GLM-4.7-FP8 (zai-org/GLM-4.7-FP8)
+    glm47               GLM-4.7-AWQ (QuantTrio/GLM-4.7-AWQ)
     devstral            Devstral 123B (mistralai/Devstral-2-123B-Instruct-2512)
     llama               Llama 3.3 70B (meta-llama/Llama-3.3-70B-Instruct)
     qwen                Qwen 2.5 72B (Qwen/Qwen2.5-72B-Instruct)
@@ -1003,9 +1205,10 @@ Options:
 Examples:
     ./olivia.sh server list                          List containers
     ./olivia.sh server start glm47                   Start GLM-4.7 server
+    ./olivia.sh server watch                         Monitor loading progress
     ./olivia.sh server start devstral                Start Devstral server
     ./olivia.sh server start glm47 --index 2         Use vllm-glm47-2-sandbox
-    ./olivia.sh server start --container vllm-glm47-1-sandbox --model zai-org/GLM-4.7-FP8
+    ./olivia.sh server start --container vllm-glm47-1-sandbox --model QuantTrio/GLM-4.7-AWQ
     ./olivia.sh server restart glm47 -d              Deploy and restart
     ./olivia.sh server status                        Check running server
     ./olivia.sh server logs                          Tail server logs

@@ -41,8 +41,11 @@ TP_SIZE="${TP_SIZE:-4}"                    # Tensor parallel size
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"       # GPU memory utilization
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"    # Max context length
 
-# Speculative decoding settings (ngram method, disabled by default - works best for repetitive content)
-ENABLE_SPECULATIVE="${ENABLE_SPECULATIVE:-0}"
+# Speculative decoding settings
+# - "auto": Enable MTP for GLM-4.7, disabled for other models
+# - "1": Force enable (MTP for GLM-4.7, ngram for others)
+# - "0": Force disable
+ENABLE_SPECULATIVE="${ENABLE_SPECULATIVE:-auto}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-5}"
 PROMPT_LOOKUP_MAX="${PROMPT_LOOKUP_MAX:-4}"  # Max n-gram window size
 
@@ -142,8 +145,20 @@ elif [[ "${ENABLE_EXPERT_PARALLEL}" == "auto" ]]; then
     fi
 fi
 
-echo "Speculative Decoding:"
+# Determine if speculative decoding should be enabled
+USE_SPECULATIVE=0
 if [[ "${ENABLE_SPECULATIVE}" == "1" ]]; then
+    USE_SPECULATIVE=1
+elif [[ "${ENABLE_SPECULATIVE}" == "auto" ]]; then
+    # Auto-enable MTP for GLM-4.7 (improves throughput significantly)
+    if [[ "${IS_GLM47}" == "1" ]]; then
+        USE_SPECULATIVE=1
+        echo "[INFO] Auto-enabling MTP speculative decoding for GLM-4.7"
+    fi
+fi
+
+echo "Speculative Decoding:"
+if [[ "${USE_SPECULATIVE}" == "1" ]]; then
     if [[ "${IS_GLM47}" == "1" ]]; then
         echo "  Enabled:          yes"
         echo "  Method:           MTP (Multi-Token Prediction)"
@@ -392,7 +407,7 @@ if [[ "${ENABLE_CHUNKED_PREFILL:-1}" == "1" ]]; then
 fi
 
 # Speculative decoding (method depends on model)
-if [[ "${ENABLE_SPECULATIVE}" == "1" ]]; then
+if [[ "${USE_SPECULATIVE}" == "1" ]]; then
     if [[ "${IS_GLM47}" == "1" ]]; then
         # GLM-4.7 uses MTP (Multi-Token Prediction) speculative decoding
         SPEC_CONFIG='{"method": "mtp", "num_speculative_tokens": '${MTP_SPECULATIVE_TOKENS}'}'

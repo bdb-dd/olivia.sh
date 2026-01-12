@@ -53,6 +53,10 @@ ENABLE_AUTO_TOOL_CHOICE="${ENABLE_AUTO_TOOL_CHOICE:-0}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
 MTP_SPECULATIVE_TOKENS="${MTP_SPECULATIVE_TOKENS:-1}"  # MTP speculative tokens for GLM-4.7
 
+# MoE (Mixture of Experts) settings
+# Expert parallel is required for AWQ-quantized MoE models to shard experts across GPUs
+ENABLE_EXPERT_PARALLEL="${ENABLE_EXPERT_PARALLEL:-auto}"  # auto, 0, or 1
+
 # Cache directories
 HF_CACHE="${HF_CACHE:-$PWD/cache/huggingface}"
 VLLM_CACHE="${VLLM_CACHE:-$PWD/cache/vllm}"
@@ -92,6 +96,13 @@ VLLM_CACHE_QUANTIZED_WEIGHTS="${VLLM_CACHE_QUANTIZED_WEIGHTS:-1}"
 # vLLM attention backend (now set via CLI arg instead of env var)
 VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
 
+# AWQ-specific optimizations (recommended by QuantTrio/GLM-4.7-AWQ)
+# These help with AWQ-quantized MoE models on Hopper GPUs
+export VLLM_USE_DEEP_GEMM="${VLLM_USE_DEEP_GEMM:-0}"
+export VLLM_USE_FLASHINFER_MOE_FP8="${VLLM_USE_FLASHINFER_MOE_FP8:-1}"
+export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+
 echo "=============================================="
 echo "vLLM Server for GH200"
 echo "=============================================="
@@ -110,6 +121,25 @@ echo ""
 IS_GLM47=0
 if [[ "${MODEL}" == *"GLM-4.7"* ]] || [[ "${MODEL}" == *"glm-4.7"* ]]; then
     IS_GLM47=1
+fi
+
+# Detect AWQ quantized model
+IS_AWQ=0
+if [[ "${MODEL,,}" == *"-awq"* ]] || [[ "${MODEL,,}" == *"awq"* ]]; then
+    IS_AWQ=1
+fi
+
+# Determine if expert parallel should be enabled
+# Auto-enable for AWQ-quantized MoE models (GLM-4.7-AWQ)
+USE_EXPERT_PARALLEL=0
+if [[ "${ENABLE_EXPERT_PARALLEL}" == "1" ]]; then
+    USE_EXPERT_PARALLEL=1
+elif [[ "${ENABLE_EXPERT_PARALLEL}" == "auto" ]]; then
+    # Auto-enable for AWQ MoE models
+    if [[ "${IS_AWQ}" == "1" ]] && [[ "${IS_GLM47}" == "1" ]]; then
+        USE_EXPERT_PARALLEL=1
+        echo "[INFO] Auto-enabling expert parallel for AWQ MoE model"
+    fi
 fi
 
 echo "Speculative Decoding:"
@@ -134,6 +164,10 @@ if [[ "${IS_GLM47}" == "1" ]]; then
     echo "  Tool Parser:      ${GLM_TOOL_PARSER}"
     echo "  Reasoning Parser: ${GLM_REASONING_PARSER}"
     echo "  Auto Tool Choice: ${ENABLE_AUTO_TOOL_CHOICE}"
+    if [[ "${IS_AWQ}" == "1" ]]; then
+        echo "  Quantization:     AWQ (Hopper-compatible)"
+        echo "  Expert Parallel:  ${USE_EXPERT_PARALLEL}"
+    fi
 fi
 echo ""
 echo "GPU Configuration:"
@@ -226,69 +260,112 @@ fi
 # -----------------------------------------------------------------------------
 # Some NVFP4 quantized models are missing k_scale/v_scale parameters.
 # This patch adds a check to skip these if missing.
+#
+# WARNING: NVFP4 requires Blackwell GPUs (B100/B200) for native FP4 compute.
+# GH200/Hopper GPUs do NOT support NVFP4 - use AWQ quantization instead.
 
 if [[ "${MODEL,,}" == *"nvfp4"* ]] || [[ "${MODEL,,}" == *"nv-fp4"* ]]; then
     echo ""
-    echo "[NVFP4] Detected NVFP4 quantized model: ${MODEL}"
-    echo "[NVFP4] Checking if vLLM patch is needed..."
+    echo "=============================================="
+    echo "WARNING: NVFP4 model detected!"
+    echo "=============================================="
+    echo ""
+    echo "NVFP4 quantization requires Blackwell GPUs (B100/B200) for native"
+    echo "FP4 compute. GH200/Hopper GPUs do NOT have FP4 tensor cores."
+    echo ""
+    echo "The model will FAIL with: 'No compiled nvfp4 quantization kernel'"
+    echo ""
+    echo "Recommended alternatives for GH200:"
+    echo "  - QuantTrio/GLM-4.7-AWQ  (AWQ 4-bit, ~181GB, works on Hopper)"
+    echo "  - zai-org/GLM-4.7-FP8    (FP8, ~358GB, needs reduced context)"
+    echo ""
+    echo "Continuing anyway in case you're on Blackwell hardware..."
+    echo "=============================================="
+    echo ""
+    echo "[NVFP4] Checking and applying vLLM patch if needed..."
 
-    VLLM_GLM4_PATH="/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/glm4_moe.py"
-    PATCH_MARKER="k_scale' in name or 'v_scale' in name"
+    if [[ "${CONTAINER_TYPE}" == "sif" ]]; then
+        echo ""
+        echo "ERROR: Cannot patch a read-only SIF container."
+        echo "Please use a sandbox container or rebuild with the patch."
+        exit 1
+    fi
 
-    # Check if patch is already applied
-    PATCH_STATUS=$(singularity exec "${CONTAINER_PATH}" grep -c "${PATCH_MARKER}" "${VLLM_GLM4_PATH}" 2>/dev/null || echo "0")
-
-    if [[ "${PATCH_STATUS}" == "0" ]]; then
-        echo "[NVFP4] Patch not found. Applying NVFP4 compatibility patch..."
-
-        if [[ "${CONTAINER_TYPE}" == "sif" ]]; then
-            echo ""
-            echo "ERROR: Cannot patch a read-only SIF container."
-            echo "Please use a sandbox container or rebuild with the patch."
-            exit 1
-        fi
-
-        # Apply patch inside the container
-        singularity exec --fakeroot --writable "${CONTAINER_PATH}" python3 -c "
+    # Apply/verify patch inside the container
+    # This script checks if patch exists in the RIGHT place and applies if not
+    singularity exec --fakeroot --writable "${CONTAINER_PATH}" python3 -c "
 import os, re, sys
 
-path = '${VLLM_GLM4_PATH}'
-if not os.path.exists(path):
-    print(f'ERROR: File not found: {path}')
+VLLM_GLM4_PATH = '/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/glm4_moe.py'
+
+if not os.path.exists(VLLM_GLM4_PATH):
+    print(f'ERROR: File not found: {VLLM_GLM4_PATH}')
     sys.exit(1)
 
-with open(path, 'r') as f:
+with open(VLLM_GLM4_PATH, 'r') as f:
+    content = f.read()
+    lines = content.split('\n')
+
+# Check if patch is correctly applied (the continue line should be RIGHT BEFORE param = params_dict[name])
+patch_pattern = r\"if \('k_scale' in name or 'v_scale' in name\) and name not in params_dict: continue\"
+target_pattern = r'param = params_dict\[name\]'
+
+# Find if patch already exists in correct location
+import re as re_module
+patch_matches = list(re_module.finditer(patch_pattern, content))
+target_matches = list(re_module.finditer(target_pattern, content))
+
+patch_needed = True
+if patch_matches and target_matches:
+    # Check if any patch is right before a target
+    for pm in patch_matches:
+        patch_end = pm.end()
+        # Find what comes after the patch (skip whitespace/newlines)
+        rest = content[patch_end:].lstrip()
+        if rest.startswith('param = params_dict[name]'):
+            patch_needed = False
+            break
+
+if not patch_needed:
+    print('[NVFP4] Patch already correctly applied.')
+    sys.exit(0)
+
+print('[NVFP4] Applying patch...')
+
+# Read and patch
+with open(VLLM_GLM4_PATH, 'r') as f:
     lines = f.readlines()
 
 target = 'param = params_dict[name]'
 new_lines = []
-patched = False
+patched_count = 0
 
-for line in lines:
-    if target in line and not patched:
-        ws = re.match(r'^(\s*)', line).group(1)
-        new_lines.append(f\"{ws}if ('k_scale' in name or 'v_scale' in name) and name not in params_dict: continue\\n\")
-        patched = True
+for i, line in enumerate(lines):
+    # Check if this line has the target and previous line is NOT already the patch
+    if target in line:
+        # Check if previous line already has the patch
+        prev_line = new_lines[-1] if new_lines else ''
+        if 'k_scale' not in prev_line and 'v_scale' not in prev_line:
+            ws = re_module.match(r'^(\s*)', line).group(1)
+            patch_line = f\"{ws}if ('k_scale' in name or 'v_scale' in name) and name not in params_dict: continue\n\"
+            new_lines.append(patch_line)
+            patched_count += 1
     new_lines.append(line)
 
-if patched:
-    with open(path, 'w') as f:
+if patched_count > 0:
+    with open(VLLM_GLM4_PATH, 'w') as f:
         f.writelines(new_lines)
-    print('Patch applied successfully')
+    print(f'[NVFP4] Patch applied successfully ({patched_count} location(s))')
 else:
-    print('WARNING: Could not find target line to patch')
+    print('[NVFP4] WARNING: Could not find target line to patch')
     sys.exit(1)
 "
-        PATCH_RESULT=$?
-        if [[ ${PATCH_RESULT} -ne 0 ]]; then
-            echo ""
-            echo "ERROR: Failed to apply NVFP4 patch."
-            echo "You may need to apply it manually or use a different model."
-            exit 1
-        fi
-        echo "[NVFP4] Patch applied successfully!"
-    else
-        echo "[NVFP4] Patch already applied."
+    PATCH_RESULT=$?
+    if [[ ${PATCH_RESULT} -ne 0 ]]; then
+        echo ""
+        echo "ERROR: Failed to apply NVFP4 patch."
+        echo "You may need to apply it manually or use a different model."
+        exit 1
     fi
     echo ""
 fi
@@ -338,6 +415,11 @@ if [[ "${IS_GLM47}" == "1" ]]; then
     fi
 fi
 
+# Expert parallel for MoE models (required for AWQ-quantized MoE like GLM-4.7-AWQ)
+if [[ "${USE_EXPERT_PARALLEL}" == "1" ]]; then
+    VLLM_ARGS+=("--enable-expert-parallel")
+fi
+
 # Optional: Quantization
 if [[ -n "${QUANTIZATION:-}" ]]; then
     VLLM_ARGS+=("--quantization" "${QUANTIZATION}")
@@ -381,7 +463,10 @@ estimate_loading_time() {
     # Detect model size from name patterns
     case "${model,,}" in  # lowercase for matching
         *glm-4.7*|*glm4.7*)
-            if [[ "${model,,}" == *fp4* ]] || [[ "${model,,}" == *nvfp4* ]] || [[ "${model,,}" == *int4* ]]; then
+            if [[ "${model,,}" == *awq* ]]; then
+                estimate="10-20 minutes"
+                size_hint="358B params @ AWQ 4-bit (~181GB weights)"
+            elif [[ "${model,,}" == *fp4* ]] || [[ "${model,,}" == *nvfp4* ]] || [[ "${model,,}" == *int4* ]]; then
                 estimate="15-25 minutes"
                 size_hint="358B params @ 4-bit (~179GB weights)"
             elif [[ "${model,,}" == *fp8* ]]; then

@@ -220,23 +220,45 @@ Runs vLLM server with GH200-optimized settings:
 - `SERVED_MODEL_NAME`: Custom model name for API (default: empty, uses model ID)
 - `MTP_SPECULATIVE_TOKENS`: MTP speculative tokens for GLM-4.7 (default: `1`)
 
+**MoE (Mixture of Experts) / AWQ Settings:**
+- `ENABLE_EXPERT_PARALLEL`: Enable expert parallel sharding (default: `auto` - auto-enables for AWQ MoE models)
+
+### GLM-4.7 Quantization Options
+
+| Model | Size | GH200 Compatible | Notes |
+|-------|------|------------------|-------|
+| `zai-org/GLM-4.7-FP8` | ~358GB | Yes | Tight fit on 4×96GB, reduce MAX_MODEL_LEN |
+| `QuantTrio/GLM-4.7-AWQ` | ~181GB | **Yes (Recommended)** | AWQ 4-bit, leaves room for KV cache |
+| `Salyut1/GLM-4.7-NVFP4` | ~179GB | **No** | Requires Blackwell GPUs (B100/B200) |
+
+**Important:** NVFP4 quantization requires native FP4 tensor cores only available on Blackwell GPUs. GH200/Hopper GPUs will fail with `No compiled nvfp4 quantization kernel`.
+
 ### GLM-4.7 Usage
 
 ```bash
 # Build GLM-4.7 container
 MODEL_ID=glm47 ./build_vllm_gh200.sh
 
-# Run GLM-4.7 with FP8 quantization (recommended for 4x GH200)
-CONTAINER=vllm-glm47-1-sandbox MODEL=zai-org/GLM-4.7-FP8 ./run_vllm_server.sh
+# Run GLM-4.7 with AWQ quantization (RECOMMENDED for GH200)
+# Leaves ~200GB headroom for KV cache
+CONTAINER=vllm-glm47-1-sandbox MODEL=QuantTrio/GLM-4.7-AWQ ./run_vllm_server.sh
 
-# Run GLM-4.7 with MTP speculative decoding
-CONTAINER=vllm-glm47-1-sandbox MODEL=zai-org/GLM-4.7-FP8 ENABLE_SPECULATIVE=1 ./run_vllm_server.sh
+# Run GLM-4.7 with FP8 quantization (tight fit, reduce context length)
+CONTAINER=vllm-glm47-1-sandbox MODEL=zai-org/GLM-4.7-FP8 MAX_MODEL_LEN=8192 ./run_vllm_server.sh
+
+# Run GLM-4.7 AWQ with MTP speculative decoding
+CONTAINER=vllm-glm47-1-sandbox MODEL=QuantTrio/GLM-4.7-AWQ ENABLE_SPECULATIVE=1 ./run_vllm_server.sh
 
 # Run GLM-4.7 with tool calling enabled
-CONTAINER=vllm-glm47-1-sandbox MODEL=zai-org/GLM-4.7-FP8 ENABLE_AUTO_TOOL_CHOICE=1 ./run_vllm_server.sh
+CONTAINER=vllm-glm47-1-sandbox MODEL=QuantTrio/GLM-4.7-AWQ ENABLE_AUTO_TOOL_CHOICE=1 ./run_vllm_server.sh
 ```
 
-**Note:** GLM-4.7 (358B parameters) requires ~358GB VRAM with FP8 quantization or ~716GB with BF16. Minimum 4 GPUs with tensor parallelism.
+**Memory requirements for GLM-4.7 (358B parameters):**
+| Quantization | Model Size | 4×GH200 (384GB) | Notes |
+|--------------|------------|-----------------|-------|
+| AWQ 4-bit | ~181GB | ~200GB free for KV cache | Recommended |
+| FP8 | ~358GB | ~26GB free | Reduce MAX_MODEL_LEN |
+| BF16 | ~716GB | Won't fit | Needs 8+ GPUs |
 
 ### Container/Cache Structure
 

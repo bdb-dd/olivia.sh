@@ -222,6 +222,78 @@ if [[ -z "${HF_TOKEN:-}" && -z "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
 fi
 
 # -----------------------------------------------------------------------------
+# NVFP4 Model Patch (for models like Salyut1/GLM-4.7-NVFP4)
+# -----------------------------------------------------------------------------
+# Some NVFP4 quantized models are missing k_scale/v_scale parameters.
+# This patch adds a check to skip these if missing.
+
+if [[ "${MODEL,,}" == *"nvfp4"* ]] || [[ "${MODEL,,}" == *"nv-fp4"* ]]; then
+    echo ""
+    echo "[NVFP4] Detected NVFP4 quantized model: ${MODEL}"
+    echo "[NVFP4] Checking if vLLM patch is needed..."
+
+    VLLM_GLM4_PATH="/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/glm4_moe.py"
+    PATCH_MARKER="k_scale' in name or 'v_scale' in name"
+
+    # Check if patch is already applied
+    PATCH_STATUS=$(singularity exec "${CONTAINER_PATH}" grep -c "${PATCH_MARKER}" "${VLLM_GLM4_PATH}" 2>/dev/null || echo "0")
+
+    if [[ "${PATCH_STATUS}" == "0" ]]; then
+        echo "[NVFP4] Patch not found. Applying NVFP4 compatibility patch..."
+
+        if [[ "${CONTAINER_TYPE}" == "sif" ]]; then
+            echo ""
+            echo "ERROR: Cannot patch a read-only SIF container."
+            echo "Please use a sandbox container or rebuild with the patch."
+            exit 1
+        fi
+
+        # Apply patch inside the container
+        singularity exec --fakeroot --writable "${CONTAINER_PATH}" python3 -c "
+import os, re, sys
+
+path = '${VLLM_GLM4_PATH}'
+if not os.path.exists(path):
+    print(f'ERROR: File not found: {path}')
+    sys.exit(1)
+
+with open(path, 'r') as f:
+    lines = f.readlines()
+
+target = 'param = params_dict[name]'
+new_lines = []
+patched = False
+
+for line in lines:
+    if target in line and not patched:
+        ws = re.match(r'^(\s*)', line).group(1)
+        new_lines.append(f\"{ws}if ('k_scale' in name or 'v_scale' in name) and name not in params_dict: continue\\n\")
+        patched = True
+    new_lines.append(line)
+
+if patched:
+    with open(path, 'w') as f:
+        f.writelines(new_lines)
+    print('Patch applied successfully')
+else:
+    print('WARNING: Could not find target line to patch')
+    sys.exit(1)
+"
+        PATCH_RESULT=$?
+        if [[ ${PATCH_RESULT} -ne 0 ]]; then
+            echo ""
+            echo "ERROR: Failed to apply NVFP4 patch."
+            echo "You may need to apply it manually or use a different model."
+            exit 1
+        fi
+        echo "[NVFP4] Patch applied successfully!"
+    else
+        echo "[NVFP4] Patch already applied."
+    fi
+    echo ""
+fi
+
+# -----------------------------------------------------------------------------
 # Build vLLM command
 # -----------------------------------------------------------------------------
 

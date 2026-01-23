@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This repository contains scripts for building and running vLLM on NVIDIA GH200 (GraceHopper) ARM64 GPUs, specifically targeting the NRIS Olivia HPC cluster. The key challenge is preserving NGC's custom PyTorch build while installing vLLM and its dependencies.
+This repository contains scripts for building and running vLLM on NVIDIA GH200 (GraceHopper) ARM64 GPUs on HPC clusters. The key challenge is preserving NGC's custom PyTorch build while installing vLLM and its dependencies.
 
 ## Olivia CLI (`olivia.sh`)
 
-Unified CLI for managing vLLM on the Olivia HPC cluster. Uses SSH ControlMaster for single 2FA authentication per session.
+Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for single 2FA authentication per session.
 
 ### Quick Start
 ```bash
@@ -84,7 +84,15 @@ Unified CLI for managing vLLM on the Olivia HPC cluster. Uses SSH ControlMaster 
 2. **PENDING** - Job queued, waiting for resources
 3. **LOADING** - GPU memory increasing as weights load (progress bar)
 4. **INIT** - Weights loaded, checking /health endpoint
-5. **SERVING** - Live throughput monitoring (tok/s, active requests, KV cache)
+5. **SERVING** - Live throughput monitoring (tok/s, active requests, KV cache, poll interval)
+
+**Watch command features:**
+- **Runs indefinitely** - Continues monitoring even after server is ready; automatically recovers if job stops
+- **Desktop notifications** (macOS/Linux) - Notifies when:
+  - Job transitions from PENDING → RUNNING
+  - Server becomes READY
+  - Job stops or fails
+- **Linear back-off** - Poll interval starts at 3s, increases by 3s per iteration when idle, caps at 60s. Resets to 3s when activity is detected
 
 **Server presets** (with default models):
 | Preset | Default Model |
@@ -197,17 +205,16 @@ Runs vLLM server with GH200-optimized settings:
 
 ### Key Environment Variables
 
-**Build:**
-- `CONTAINER_DIR`: Output directory for containers (default: `/path/to/containers`)
+**Build:**) 
+- `CONTAINER_DIR`: Output directory for containers (required)
 - `MODEL_ID`: Model identifier for naming (default: `generic`, e.g., `glm47`, `devstral`)
 - `BUILD_INDEX`: Build index for multiple builds of same model (default: `1`)
 - `VLLM_VERSION`: vLLM version to build (default: `main`)
 - `CREATE_SIF`: Set to `1` to create SIF image after build
 - `OVERWRITE`: Set to `1` to allow overwriting existing containers in batch mode (default: `0`)
-- `MAX_JOBS`: Parallel compilation jobs (default: 8)
 
 **Server:**
-- `CONTAINER_DIR`: Directory to search for containers (default: `/path/to/containers`)
+- `CONTAINER_DIR`: Directory to search for containers (required)
 - `CONTAINER`: Container name or path (if not set, lists available containers)
 - `MODEL`: HuggingFace model ID (default: `mistralai/Devstral-2-123B-Instruct-2512`)
 - `TP_SIZE`: Tensor parallel size (default: 4)
@@ -293,7 +300,7 @@ Client <--[batched SSE]--> Proxy:8001 <--[per-token SSE]--> vLLM:8000
 ENABLE_PROXY=1 CONTAINER=vllm-glm47-1-sandbox MODEL=QuantTrio/GLM-4.7-AWQ ./run_vllm_server.sh
 
 # Then tunnel to proxy port instead of vLLM port
-ssh -L 8001:localhost:8001 user@olivia...
+ssh -L 8001:localhost:8001 user@<cluster-login-host>...
 
 # Connect chat client to proxy port
 python chat_devstral.py localhost --port 8001 --stream
@@ -312,7 +319,7 @@ python vllm_proxy.py --vllm-port 8000 --proxy-port 8001 --batch-tokens 15 --batc
 
 ### Container/Cache Structure
 
-**Shared containers on the cluster** (`/path/to/containers/`):
+**Shared containers on the cluster** (`CONTAINER_DIR`):
 - `vllm-{model}-{index}-sandbox/`: Singularity sandbox (writable container)
 - `vllm-{model}-{index}.sif`: Compressed Singularity image (optional)
 

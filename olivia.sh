@@ -73,6 +73,47 @@ header() {
     echo ""
 }
 
+require_remote_config() {
+    if [[ -z "${REMOTE_HOST}" ]]; then
+        error "REMOTE_HOST is not set"
+        echo "    Set REMOTE_HOST to your cluster login hostname (e.g. export REMOTE_HOST=mycluster)" >&2
+        return 1
+    fi
+    if [[ -z "${REMOTE_CONTAINER_DIR}" ]]; then
+        error "REMOTE_CONTAINER_DIR is not set"
+        echo "    Set REMOTE_CONTAINER_DIR to the container directory on the cluster" >&2
+        echo "    (e.g. export REMOTE_CONTAINER_DIR=/path/to/containers)" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Desktop notification helper (macOS/Linux)
+# On macOS, prefers terminal-notifier if installed (brew install terminal-notifier)
+notify() {
+    local title="$1"
+    local message="$2"
+    local sound="${3:-}"  # Optional sound
+
+    if [[ "$(uname)" == "Darwin" ]]; then
+        # Play sound directly with afplay (more reliable than notification sounds)
+        if [[ -n "$sound" && -f "/System/Library/Sounds/${sound}.aiff" ]]; then
+            afplay "/System/Library/Sounds/${sound}.aiff" &>/dev/null &
+        fi
+
+        if command -v terminal-notifier &>/dev/null; then
+            # terminal-notifier: better macOS integration with custom app attribution
+            terminal-notifier -title "$title" -message "$message" -group "olivia-vllm" 2>/dev/null || true
+        else
+            # Fallback: osascript (appears as "Script Editor")
+            osascript -e "display notification \"${message}\" with title \"${title}\"" 2>/dev/null || true
+        fi
+    elif command -v notify-send &>/dev/null; then
+        # Linux: use notify-send
+        notify-send "$title" "$message" 2>/dev/null || true
+    fi
+}
+
 # SSH helpers
 ssh_opts() {
     echo -o "ControlMaster=auto" -o "ControlPath=${SSH_CONTROL_SOCKET}" -o "ControlPersist=600"
@@ -95,6 +136,7 @@ is_master_alive() {
 }
 
 ensure_master_connection() {
+    require_remote_config || return 1
     mkdir -p "${SSH_CONTROL_DIR}"
     chmod 700 "${SSH_CONTROL_DIR}"
 
@@ -659,11 +701,14 @@ check_container_exists() {
 # =============================================================================
 
 server_watch() {
-    local interval="${1:-3}"  # Update interval in seconds
+    local base_interval="${1:-3}"  # Base update interval in seconds
+    local max_interval=60          # Maximum interval (1 minute)
+    local backoff_increment=3      # Seconds to add per iteration during back-off
+    local current_interval="$base_interval"
 
     echo ""
     info "Starting intelligent server watch..."
-    echo "    Press Ctrl+C to exit"
+    echo "    Press Ctrl+C to exit (monitoring continues indefinitely)"
     echo ""
 
     local phase="waiting"  # waiting, loading, initializing, serving
@@ -674,6 +719,8 @@ server_watch() {
     local node_name=""
     local job_id=""
     local log_file=""
+    local prev_state=""        # Track previous job state for notifications
+    local serving_iterations=0 # Count iterations in serving phase for back-off
 
     # Cleanup on exit
     trap 'echo ""; info "Watch stopped"; return 0' INT TERM
@@ -687,30 +734,59 @@ server_watch() {
 
             if [[ -z "$job_info" ]]; then
                 printf "\r\033[K[WAITING] No vLLM job found. Waiting for job submission..."
+                prev_state=""
             else
                 local state
                 state=$(echo "$job_info" | awk '{print $4}' | head -1)
                 job_id=$(echo "$job_info" | awk '{print $2}' | head -1)
                 node_name=$(echo "$job_info" | awk '{print $3}' | head -1)
 
+                # Notify on state transitions
+                if [[ "$state" == "RUNNING" && "$prev_state" == "PENDING" ]]; then
+                    notify "Olivia vLLM" "Job ${job_id} is now RUNNING on ${node_name}" "Glass"
+                fi
+
                 if [[ "$state" == "RUNNING" && -n "$node_name" ]]; then
                     echo ""
                     success "Job ${job_id} running on ${node_name}"
                     log_file="${REMOTE_CONTAINER_DIR}/logs/vllm_server_${job_id}.log"
                     phase="loading"
+                    current_interval="$base_interval"  # Reset interval
+                    prev_state="$state"
                     sleep 2  # Give container time to start
+                    continue
                 elif [[ "$state" == "PENDING" ]]; then
                     printf "\r\033[K[PENDING] Job ${job_id} waiting for resources..."
                 else
                     printf "\r\033[K[${state}] Job ${job_id}..."
                 fi
+                prev_state="$state"
             fi
-            sleep "$interval"
+            sleep "$current_interval"
             continue
         fi
 
         # Phase 2: Monitor GPU memory loading
         if [[ "$phase" == "loading" || "$phase" == "initializing" ]]; then
+            # Check if job is still running
+            local job_check
+            job_check=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+                "squeue -j ${job_id} -h -o '%T' 2>/dev/null" 2>/dev/null) || true
+
+            if [[ -z "$job_check" || "$job_check" != "RUNNING" ]]; then
+                echo ""
+                warn "Job ${job_id} failed during ${phase} phase (${job_check:-terminated})"
+                notify "Olivia vLLM" "Server job ${job_id} failed during startup" "Basso"
+                # Reset to waiting phase
+                phase="waiting"
+                prev_state=""
+                job_id=""
+                node_name=""
+                current_interval="$base_interval"
+                sleep "$current_interval"
+                continue
+            fi
+
             # Get GPU memory usage from node
             local gpu_info
             gpu_info=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
@@ -782,8 +858,11 @@ server_watch() {
                         echo ""
                         echo ""
                         success "Server is READY! Monitoring throughput..."
+                        notify "Olivia vLLM" "Server is READY and serving requests" "Glass"
                         echo ""
                         phase="serving"
+                        serving_iterations=0
+                        current_interval="$base_interval"
                     elif [[ "$health_checks" -ge "$max_health_checks" ]]; then
                         echo ""
                         warn "Server not responding after ${health_checks} checks"
@@ -798,6 +877,25 @@ server_watch() {
 
         # Phase 3: Monitor throughput when serving
         if [[ "$phase" == "serving" ]]; then
+            # Check if job is still running
+            local job_check
+            job_check=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+                "squeue -j ${job_id} -h -o '%T' 2>/dev/null" 2>/dev/null) || true
+
+            if [[ -z "$job_check" || "$job_check" != "RUNNING" ]]; then
+                echo ""
+                warn "Job ${job_id} is no longer running (${job_check:-terminated})"
+                notify "Olivia vLLM" "Server job ${job_id} has stopped" "Basso"
+                # Reset to waiting phase
+                phase="waiting"
+                prev_state=""
+                job_id=""
+                node_name=""
+                current_interval="$base_interval"
+                sleep "$current_interval"
+                continue
+            fi
+
             # Get GPU memory for display
             local gpu_info
             gpu_info=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
@@ -839,12 +937,27 @@ server_watch() {
                 kv_cache=$(echo "$kv_line" | grep -oE '[0-9.]+%') || kv_cache="--"
             fi
 
-            # Display serving status
-            printf "\r\033[K[SERVING] GPU: %d/%dGB | Throughput: %s tok/s | Reqs: %s | KV: %s" \
-                "$used_gb" "$total_gb" "$gen_throughput" "$running_reqs" "$kv_cache"
+            # Linear back-off: increase interval up to max when idle, reset when active
+            serving_iterations=$((serving_iterations + 1))
+            if [[ "$running_reqs" != "0" && "$running_reqs" != "--" ]]; then
+                # Activity detected - reset to base interval
+                current_interval="$base_interval"
+                serving_iterations=0
+            else
+                # No activity - apply linear back-off
+                local new_interval=$((base_interval + (serving_iterations * backoff_increment)))
+                if [[ "$new_interval" -gt "$max_interval" ]]; then
+                    new_interval="$max_interval"
+                fi
+                current_interval="$new_interval"
+            fi
+
+            # Display serving status with current poll interval
+            printf "\r\033[K[SERVING] GPU: %d/%dGB | Throughput: %s tok/s | Reqs: %s | KV: %s | Poll: %ds" \
+                "$used_gb" "$total_gb" "$gen_throughput" "$running_reqs" "$kv_cache" "$current_interval"
         fi
 
-        sleep "$interval"
+        sleep "$current_interval"
     done
 }
 

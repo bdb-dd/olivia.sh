@@ -34,7 +34,7 @@ MODEL="${MODEL:-mistralai/Devstral-2-123B-Instruct-2512}"
 
 # Server settings
 PORT="${PORT:-8000}"
-HOST="0.0.0.0"  # Always bind to 0.0.0.0, not hostname
+HOST="${HOST:-127.0.0.1}"
 
 # Batching proxy settings (reduces streaming overhead over SSH tunnels)
 # The proxy batches multiple tokens into single SSE events
@@ -71,6 +71,12 @@ ENABLE_EXPERT_PARALLEL="${ENABLE_EXPERT_PARALLEL:-auto}"  # auto, 0, or 1
 # Cache directories
 HF_CACHE="${HF_CACHE:-$PWD/cache/huggingface}"
 VLLM_CACHE="${VLLM_CACHE:-$PWD/cache/vllm}"
+
+if [[ -z "${CONTAINER_DIR}" ]]; then
+    echo "Error: CONTAINER_DIR is not set."
+    echo "Set CONTAINER_DIR to the directory containing your Singularity containers." 
+    exit 1
+fi
 
 # -----------------------------------------------------------------------------
 # Environment setup

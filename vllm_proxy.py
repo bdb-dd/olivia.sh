@@ -275,6 +275,10 @@ def main():
         description="vLLM batching proxy for high-latency connections"
     )
     parser.add_argument(
+        "--listen-host", default="127.0.0.1",
+        help="Host/interface for the proxy to bind to (default: 127.0.0.1)"
+    )
+    parser.add_argument(
         "--vllm-host", default="localhost",
         help="vLLM server host (default: localhost)"
     )
@@ -327,7 +331,7 @@ def main():
         create_app(args.vllm_host, args.vllm_port, batch_config)
     )
 
-    web.run_app(app, host="0.0.0.0", port=args.proxy_port, print=None)
+    web.run_app(app, host=args.listen_host, port=args.proxy_port, print=None)
 
 
 if __name__ == "__main__":

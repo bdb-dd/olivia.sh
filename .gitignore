@@ -1,0 +1,13 @@
+# Local caches
+cache/
+
+# Logs
+logs/
+
+# Local build artifacts
+pytorch_version_before.txt
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

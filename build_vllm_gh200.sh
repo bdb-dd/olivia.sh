@@ -128,6 +128,12 @@ NGC_IMAGE="docker://nvcr.io/nvidia/pytorch:25.12-py3"
 # Container output directory (shared location on Olivia)
 CONTAINER_DIR="${CONTAINER_DIR:-}"
 
+if [[ -z "${CONTAINER_DIR}" ]]; then
+    echo "Error: CONTAINER_DIR is not set."
+    echo "Set CONTAINER_DIR to the directory where containers should be created." 
+    exit 1
+fi
+
 # Model identifier - apply preset first
 MODEL_ID="${MODEL_ID:-}"
 apply_preset "${MODEL_ID}"

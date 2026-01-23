@@ -36,6 +36,14 @@ MODEL="${MODEL:-mistralai/Devstral-2-123B-Instruct-2512}"
 PORT="${PORT:-8000}"
 HOST="0.0.0.0"  # Always bind to 0.0.0.0, not hostname
 
+# Batching proxy settings (reduces streaming overhead over SSH tunnels)
+# The proxy batches multiple tokens into single SSE events
+ENABLE_PROXY="${ENABLE_PROXY:-0}"         # Set to 1 to enable batching proxy
+PROXY_PORT="${PROXY_PORT:-8001}"          # Port for the batching proxy
+PROXY_BATCH_TOKENS="${PROXY_BATCH_TOKENS:-15}"    # Flush after N tokens
+PROXY_BATCH_CHARS="${PROXY_BATCH_CHARS:-100}"     # Flush after N characters
+PROXY_BATCH_DELAY_MS="${PROXY_BATCH_DELAY_MS:-150}"  # Max delay before flush (ms)
+
 # GPU settings
 TP_SIZE="${TP_SIZE:-4}"                    # Tensor parallel size
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"       # GPU memory utilization
@@ -119,6 +127,14 @@ echo "  Max Model Len:    ${MAX_MODEL_LEN}"
 echo "  Port:             ${PORT}"
 echo "  Attention Backend: ${VLLM_ATTENTION_BACKEND}"
 echo "  Log Level:        ${VLLM_LOGGING_LEVEL}"
+if [[ "${ENABLE_PROXY}" == "1" ]]; then
+    echo ""
+    echo "Batching Proxy:     ENABLED"
+    echo "  Proxy Port:       ${PROXY_PORT}"
+    echo "  Batch Tokens:     ${PROXY_BATCH_TOKENS}"
+    echo "  Batch Chars:      ${PROXY_BATCH_CHARS}"
+    echo "  Batch Delay:      ${PROXY_BATCH_DELAY_MS}ms"
+fi
 echo ""
 # Detect GLM-4.7 model
 IS_GLM47=0
@@ -458,12 +474,20 @@ echo ""
 
 echo "Starting vLLM server..."
 echo "Access at: http://${HOST}:${PORT}"
+if [[ "${ENABLE_PROXY}" == "1" ]]; then
+    echo "Proxy at:  http://${HOST}:${PROXY_PORT} (use this for streaming over SSH)"
+fi
 echo ""
 echo "API endpoints:"
 echo "  POST /v1/completions      - Text completions"
 echo "  POST /v1/chat/completions - Chat completions"
 echo "  GET  /health              - Health check"
 echo "  GET  /v1/models           - List models"
+if [[ "${ENABLE_PROXY}" == "1" ]]; then
+    echo ""
+    echo "For streaming over SSH tunnels, connect to port ${PROXY_PORT} instead of ${PORT}"
+    echo "The proxy batches tokens to reduce network overhead."
+fi
 echo ""
 echo "Press Ctrl+C to stop"
 echo "=============================================="
@@ -548,6 +572,53 @@ echo "(Actual time depends on storage speed and cache status)"
 echo ""
 echo "[$(date '+%H:%M:%S')] Starting model loading..."
 echo ""
+
+# -----------------------------------------------------------------------------
+# Start batching proxy (if enabled)
+# -----------------------------------------------------------------------------
+
+PROXY_PID=""
+
+cleanup_proxy() {
+    if [[ -n "${PROXY_PID}" ]] && kill -0 "${PROXY_PID}" 2>/dev/null; then
+        echo ""
+        echo "[$(date '+%H:%M:%S')] Stopping batching proxy (PID ${PROXY_PID})..."
+        kill "${PROXY_PID}" 2>/dev/null || true
+        wait "${PROXY_PID}" 2>/dev/null || true
+    fi
+}
+
+if [[ "${ENABLE_PROXY}" == "1" ]]; then
+    # Find the proxy script (same directory as this script)
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    PROXY_SCRIPT="${SCRIPT_DIR}/vllm_proxy.py"
+
+    if [[ ! -f "${PROXY_SCRIPT}" ]]; then
+        echo "WARNING: Proxy script not found at ${PROXY_SCRIPT}"
+        echo "         Proxy will not be started. Continuing with vLLM only."
+        ENABLE_PROXY=0
+    else
+        echo "[$(date '+%H:%M:%S')] Starting batching proxy on port ${PROXY_PORT}..."
+
+        # Start proxy in background
+        python3 "${PROXY_SCRIPT}" \
+            --vllm-host localhost \
+            --vllm-port "${PORT}" \
+            --proxy-port "${PROXY_PORT}" \
+            --batch-tokens "${PROXY_BATCH_TOKENS}" \
+            --batch-chars "${PROXY_BATCH_CHARS}" \
+            --batch-delay-ms "${PROXY_BATCH_DELAY_MS}" \
+            > "${WORKDIR:-$PWD}/logs/proxy_${SLURM_JOB_ID:-$$}.log" 2>&1 &
+
+        PROXY_PID=$!
+        echo "[$(date '+%H:%M:%S')] Proxy started (PID ${PROXY_PID})"
+        echo "         Log: ${WORKDIR:-$PWD}/logs/proxy_${SLURM_JOB_ID:-$$}.log"
+        echo ""
+
+        # Set up cleanup trap
+        trap cleanup_proxy EXIT INT TERM
+    fi
+fi
 
 singularity exec --nv \
     --env "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}" \

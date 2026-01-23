@@ -233,6 +233,13 @@ Runs vLLM server with GH200-optimized settings:
 **MoE (Mixture of Experts) / AWQ Settings:**
 - `ENABLE_EXPERT_PARALLEL`: Enable expert parallel sharding (default: `auto` - auto-enables for AWQ MoE models)
 
+**Batching Proxy (for SSH tunnel streaming):**
+- `ENABLE_PROXY`: Enable the batching proxy (default: `0`)
+- `PROXY_PORT`: Port for the proxy server (default: `8001`)
+- `PROXY_BATCH_TOKENS`: Flush after N tokens (default: `15`)
+- `PROXY_BATCH_CHARS`: Flush after N characters (default: `100`)
+- `PROXY_BATCH_DELAY_MS`: Max delay before flush in milliseconds (default: `150`)
+
 ### GLM-4.7 Quantization Options
 
 | Model | Size | GH200 Compatible | Notes |
@@ -269,6 +276,39 @@ CONTAINER=vllm-glm47-1-sandbox MODEL=QuantTrio/GLM-4.7-AWQ ENABLE_AUTO_TOOL_CHOI
 | AWQ 4-bit | ~181GB | ~200GB free for KV cache | Recommended |
 | FP8 | ~358GB | ~26GB free | Reduce MAX_MODEL_LEN |
 | BF16 | ~716GB | Won't fit | Needs 8+ GPUs |
+
+### Batching Proxy for SSH Tunnels
+
+When accessing vLLM over SSH tunnels, streaming responses can be slow due to per-token network overhead. The batching proxy aggregates multiple tokens into single SSE events, reducing network round-trips by ~70%.
+
+**Architecture:**
+```
+Client <--[batched SSE]--> Proxy:8001 <--[per-token SSE]--> vLLM:8000
+         (SSH tunnel)                    (localhost, fast)
+```
+
+**Usage:**
+```bash
+# Enable proxy when starting server
+ENABLE_PROXY=1 CONTAINER=vllm-glm47-1-sandbox MODEL=QuantTrio/GLM-4.7-AWQ ./run_vllm_server.sh
+
+# Then tunnel to proxy port instead of vLLM port
+ssh -L 8001:localhost:8001 user@olivia...
+
+# Connect chat client to proxy port
+python chat_devstral.py localhost --port 8001 --stream
+```
+
+**Performance comparison:**
+| Mode | Without Proxy | With Proxy |
+|------|---------------|------------|
+| Non-streaming | 17 tok/s | 17 tok/s |
+| Streaming | ~5 tok/s | ~15 tok/s |
+
+The proxy can also be run standalone:
+```bash
+python vllm_proxy.py --vllm-port 8000 --proxy-port 8001 --batch-tokens 15 --batch-delay-ms 150
+```
 
 ### Container/Cache Structure
 

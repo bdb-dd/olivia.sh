@@ -88,6 +88,35 @@ require_remote_config() {
     return 0
 }
 
+# Capture git provenance for the current worktree.
+# Output is a single line, e.g.:
+#   branch=add-glm-5.1 commit=62cd320 dirty=3
+#   branch=main commit=abc1234 clean
+#   no-git  (if SCRIPT_DIR isn't a git checkout)
+#
+# This is used at deploy time (for visibility) and at sbatch submission time
+# (via --comment=, so the provenance lives in SLURM metadata). Uncommitted
+# testing is explicitly supported — this is audit, not a gate.
+get_git_context() {
+    local dir="${1:-${SCRIPT_DIR}}"
+    (
+        cd "$dir" 2>/dev/null || { echo "no-git"; exit 0; }
+        if ! git rev-parse --git-dir >/dev/null 2>&1; then
+            echo "no-git"
+            exit 0
+        fi
+        local branch commit dirty
+        branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+        commit=$(git rev-parse --short HEAD 2>/dev/null || echo "?")
+        dirty=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+        if [[ "$dirty" == "0" ]]; then
+            echo "branch=${branch} commit=${commit} clean"
+        else
+            echo "branch=${branch} commit=${commit} dirty=${dirty}"
+        fi
+    )
+}
+
 # Desktop notification helper (macOS/Linux)
 # On macOS, prefers terminal-notifier if installed (brew install terminal-notifier)
 notify() {
@@ -217,8 +246,11 @@ find_vllm_node() {
         return 1
     fi
 
+    # Anchor to the start of the job-name field ($1) so "vllm" doesn't
+    # accidentally match "build-vllm-gh200" (substring match was the bug).
     local job_line
-    job_line=$(echo "$squeue_output" | grep -i "${JOB_NAME_PATTERN}" | grep "RUNNING" | head -n1) || true
+    job_line=$(echo "$squeue_output" | awk -v pat="${JOB_NAME_PATTERN}" \
+        'tolower($1) ~ ("^" tolower(pat)) && $NF == "RUNNING" {print; exit}') || true
 
     if [[ -z "$job_line" ]]; then
         return 1
@@ -275,8 +307,11 @@ find_job_id() {
         return 1
     fi
 
+    # Anchor to the start of the job-name field ($1) so pattern "vllm"
+    # matches "vllm-server" but not "build-vllm-gh200".
     local job_line
-    job_line=$(echo "$squeue_output" | grep -i "${pattern}" | grep "RUNNING" | head -n1) || true
+    job_line=$(echo "$squeue_output" | awk -v pat="$pattern" \
+        'tolower($1) ~ ("^" tolower(pat)) && $NF == "RUNNING" {print; exit}') || true
 
     if [[ -z "$job_line" ]]; then
         return 1
@@ -389,6 +424,8 @@ deploy_build_script() {
     fi
 
     info "Uploading build_vllm_gh200.sh to ${REMOTE_HOST}:${REMOTE_CONTAINER_DIR}/"
+    echo "    Source:  ${SCRIPT_DIR}" >&2
+    echo "    Git:     $(get_git_context)" >&2
 
     if ! scp_run "${LOCAL_BUILD_SCRIPT}" \
         "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_CONTAINER_DIR}/build_vllm_gh200.sh"; then
@@ -426,13 +463,16 @@ cmd_build() {
                 info "To build a new container:"
                 echo "    ./olivia.sh build <preset>" >&2
                 echo "" >&2
-                echo "Available presets: glm47, devstral, llama, qwen, generic" >&2
+                echo "Available presets: glm47, gemma4, devstral, llama, qwen, generic" >&2
                 exit 0
                 ;;
             --presets|-p)
                 header "Available Model Presets"
                 echo "  glm47      GLM-4.7 (358B) flagship model"
                 echo "             vLLM: main, transformers>=5.0.0rc0"
+                echo ""
+                echo "  gemma4     Gemma 4 31B (dense, multimodal text+image)"
+                echo "             vLLM: v0.19.0, transformers>=5.5.0"
                 echo ""
                 echo "  devstral   Devstral/Mistral models"
                 echo "             vLLM: main, transformers>=4.45.0"
@@ -529,18 +569,34 @@ cmd_build() {
     fi
 
     # Build environment variables
-    local env_vars="MODEL_ID=${model_id}"
+    # CONTAINER_DIR must be forwarded explicitly — sbatch does not inherit it
+    # from our `cd` alone (see commit 62cd320 which made it a hard requirement).
+    local env_vars="CONTAINER_DIR=${REMOTE_CONTAINER_DIR} MODEL_ID=${model_id}"
     [[ -n "$build_index" ]] && env_vars="${env_vars} BUILD_INDEX=${build_index}"
     [[ -n "$vllm_version" ]] && env_vars="${env_vars} VLLM_VERSION=${vllm_version}"
     [[ -n "$create_sif" ]] && env_vars="${env_vars} CREATE_SIF=${create_sif}"
     [[ -n "$force_overwrite" ]] && env_vars="${env_vars} OVERWRITE=${force_overwrite}"
 
-    info "Submitting build job for '${model_id}'..."
+    # Distinct job name so concurrent builds are distinguishable in squeue
+    # and so `cancel_job` / `find_job_id` can target a specific build.
+    # Format: build-vllm-<preset>-<index>  (e.g. build-vllm-gemma4-1)
+    # The "build-" prefix keeps these from matching JOB_NAME_PATTERN="vllm"
+    # (which is anchored to ^vllm), so server operations never touch builds.
+    local idx="${build_index:-1}"
+    local job_name="build-vllm-${model_id}-${idx}"
+
+    # Git provenance → sbatch --comment, so `scontrol show job` / `sacct -o Comment`
+    # can tell you which worktree / commit a given job came from.
+    local git_ctx
+    git_ctx=$(get_git_context)
+
+    info "Submitting build job '${job_name}' for '${model_id}'..."
     echo "    Environment: ${env_vars}" >&2
+    echo "    Git:         ${git_ctx}" >&2
 
     local submit_output
     if ! submit_output=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
-        "cd ${REMOTE_CONTAINER_DIR} && ${env_vars} sbatch build_vllm_gh200.sh" 2>&1); then
+        "cd ${REMOTE_CONTAINER_DIR} && ${env_vars} sbatch --job-name=${job_name} --comment='${git_ctx}' build_vllm_gh200.sh" 2>&1); then
         error "Failed to submit build job"
         echo "$submit_output" >&2
         return 1
@@ -550,8 +606,7 @@ cmd_build() {
     job_id=$(echo "$submit_output" | grep -oE '[0-9]+' | tail -1)
     success "Submitted build job ${job_id}"
 
-    # Determine expected sandbox name
-    local idx="${build_index:-1}"
+    # Expected sandbox name (idx was set above when computing job_name)
     local sandbox_name="vllm-${model_id}-${idx}-sandbox"
     echo "    Container: ${sandbox_name}" >&2
 
@@ -575,7 +630,7 @@ Usage: ./olivia.sh build [preset] [options]
 Build vLLM containers on Olivia HPC cluster.
 
 Arguments:
-    preset              Model preset (glm47, devstral, llama, qwen, generic)
+    preset              Model preset (glm47, gemma4, devstral, llama, qwen, generic)
 
 Options:
     --list, -l          List existing containers
@@ -618,6 +673,9 @@ get_default_model() {
         glm47|glm-4.7)
             echo "QuantTrio/GLM-4.7-AWQ"
             ;;
+        gemma4|gemma-4)
+            echo "QuantTrio/gemma-4-31B-it-AWQ"
+            ;;
         devstral|mistral)
             echo "mistralai/Devstral-2-123B-Instruct-2512"
             ;;
@@ -629,6 +687,20 @@ get_default_model() {
             ;;
         *)
             echo ""
+            ;;
+    esac
+}
+
+# Default GPU count per preset (matches TP_SIZE defaults in run_vllm_server.sh).
+# sbatch CLI flags override the #SBATCH --gpus=4 directive baked into the script.
+get_default_gpus() {
+    local preset="$1"
+    case "${preset}" in
+        gemma4|gemma-4)
+            echo "2"
+            ;;
+        *)
+            echo "4"
             ;;
     esac
 }
@@ -647,6 +719,8 @@ deploy_server_script() {
     fi
 
     info "Uploading run_vllm_server.sh to ${REMOTE_HOST}:${REMOTE_CONTAINER_DIR}/"
+    echo "    Source:  ${SCRIPT_DIR}" >&2
+    echo "    Git:     $(get_git_context)" >&2
 
     if ! scp_run "${LOCAL_SERVER_SCRIPT}" \
         "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_CONTAINER_DIR}/run_vllm_server.sh"; then
@@ -669,16 +743,38 @@ list_server_containers() {
 start_server_job() {
     local container="$1"
     local model="$2"
+    local gpus="${3:-4}"
+    local cpus=$((gpus * 8))
+
+    # Derive a distinct, identifiable job name from the container.
+    #   vllm-gemma4-1-sandbox → vllm-gemma4-1
+    #   vllm-glm47-2.sif      → vllm-glm47-2
+    # Falls back to prefixing with "vllm-" if the container name doesn't already
+    # start with it (custom containers via `-c`). Must start with "vllm" to match
+    # the anchored JOB_NAME_PATTERN used by find_job_id / cancel_job.
+    local job_name="$(basename "$container")"
+    job_name="${job_name%-sandbox}"
+    job_name="${job_name%.sif}"
+    [[ "$job_name" == vllm-* ]] || job_name="vllm-${job_name}"
+
+    # Git provenance → sbatch --comment for auditability across worktrees
+    local git_ctx
+    git_ctx=$(get_git_context)
 
     info "Starting vLLM server..."
     echo "    Container: ${container}" >&2
     echo "    Model:     ${model}" >&2
+    echo "    GPUs:      ${gpus} (CPUs: ${cpus})" >&2
+    echo "    Job name:  ${job_name}" >&2
+    echo "    Git:       ${git_ctx}" >&2
 
-    local env_vars="CONTAINER=${container} MODEL=${model}"
+    # CONTAINER_DIR must be forwarded explicitly (see commit 62cd320)
+    local env_vars="CONTAINER_DIR=${REMOTE_CONTAINER_DIR} CONTAINER=${container} MODEL=${model}"
 
+    # sbatch CLI flags override the #SBATCH directives baked into run_vllm_server.sh
     local submit_output
     if ! submit_output=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
-        "cd ${REMOTE_CONTAINER_DIR} && ${env_vars} sbatch run_vllm_server.sh" 2>&1); then
+        "cd ${REMOTE_CONTAINER_DIR} && ${env_vars} sbatch --job-name=${job_name} --comment='${git_ctx}' --gpus=${gpus} --cpus-per-task=${cpus} run_vllm_server.sh" 2>&1); then
         error "Failed to submit job"
         echo "$submit_output" >&2
         return 1
@@ -1125,7 +1221,7 @@ cmd_server() {
                 error "No container specified"
                 echo "" >&2
                 echo "Usage:" >&2
-                echo "    ./olivia.sh server start <preset>              # e.g., glm47, devstral" >&2
+                echo "    ./olivia.sh server start <preset>              # e.g., glm47, gemma4, devstral" >&2
                 echo "    ./olivia.sh server start --container <name>    # explicit container" >&2
                 echo "" >&2
                 list_server_containers
@@ -1169,9 +1265,13 @@ cmd_server() {
                 kill_tunnel
             fi
 
+            # Determine GPU count for this preset (Gemma 4 uses 2, others use 4)
+            local gpus
+            gpus=$(get_default_gpus "$preset")
+
             # Start server
             local job_id
-            if ! job_id=$(start_server_job "$container" "$model"); then
+            if ! job_id=$(start_server_job "$container" "$model" "$gpus"); then
                 exit 1
             fi
 
@@ -1202,7 +1302,7 @@ cmd_server() {
                 error "No container specified for restart"
                 echo "" >&2
                 echo "Usage:" >&2
-                echo "    ./olivia.sh server restart <preset>              # e.g., glm47, devstral" >&2
+                echo "    ./olivia.sh server restart <preset>              # e.g., glm47, gemma4, devstral" >&2
                 echo "    ./olivia.sh server restart --container <name> --model <model>" >&2
                 exit 1
             fi
@@ -1237,9 +1337,13 @@ cmd_server() {
             fi
             echo ""
 
+            # Determine GPU count for this preset (Gemma 4 uses 2, others use 4)
+            local gpus
+            gpus=$(get_default_gpus "$preset")
+
             # Start server
             local job_id
-            if ! job_id=$(start_server_job "$container" "$model"); then
+            if ! job_id=$(start_server_job "$container" "$model" "$gpus"); then
                 exit 1
             fi
 
@@ -1302,7 +1406,8 @@ Actions:
     deploy              Upload run_vllm_server.sh to cluster
 
 Presets (with default models):
-    glm47               GLM-4.7-AWQ (QuantTrio/GLM-4.7-AWQ)
+    glm47               GLM-4.7-AWQ (QuantTrio/GLM-4.7-AWQ)             [4 GPUs]
+    gemma4              Gemma 4 31B AWQ (QuantTrio/gemma-4-31B-it-AWQ)  [2 GPUs]
     devstral            Devstral 123B (mistralai/Devstral-2-123B-Instruct-2512)
     llama               Llama 3.3 70B (meta-llama/Llama-3.3-70B-Instruct)
     qwen                Qwen 2.5 72B (Qwen/Qwen2.5-72B-Instruct)
@@ -1467,6 +1572,7 @@ cmd_chat() {
         echo "" >&2
         info "To start a server:"
         echo "    ./olivia.sh server start glm47      # Start GLM-4.7" >&2
+        echo "    ./olivia.sh server start gemma4     # Start Gemma 4 31B (2 GPUs)" >&2
         echo "    ./olivia.sh server start devstral   # Start Devstral" >&2
         echo "    ./olivia.sh server list             # List available containers" >&2
         exit 1
@@ -1632,6 +1738,7 @@ Global Options:
 Examples:
     $(basename "$0") chat               Connect to vLLM and chat
     $(basename "$0") build glm47        Build GLM-4.7 container
+    $(basename "$0") build gemma4       Build Gemma 4 container
     $(basename "$0") server restart     Restart vLLM server
     $(basename "$0") status             Check status
 

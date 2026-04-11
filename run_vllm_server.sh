@@ -32,9 +32,34 @@ CONTAINER="${CONTAINER:-}"
 # Model (default: Devstral 123B)
 MODEL="${MODEL:-mistralai/Devstral-2-123B-Instruct-2512}"
 
+# -----------------------------------------------------------------------------
+# Model-family detection (used throughout this script for defaults and args)
+# -----------------------------------------------------------------------------
+IS_GLM47=0
+IS_GEMMA4=0
+if [[ "${MODEL}" == *"GLM-4.7"* ]] || [[ "${MODEL}" == *"glm-4.7"* ]]; then
+    IS_GLM47=1
+fi
+if [[ "${MODEL,,}" == *"gemma-4"* ]]; then
+    IS_GEMMA4=1
+fi
+
 # Server settings
 PORT="${PORT:-8000}"
-HOST="${HOST:-127.0.0.1}"
+# Listen on all interfaces by default so that olivia.sh's SSH tunnel
+# (`ssh -L 8000:<gpu-node>:8000 <login>`) can actually reach us: the
+# forwarder makes a fresh TCP connection from the login node to the compute
+# node's external IP, not to the compute node's loopback, so binding to
+# 127.0.0.1 would leave the port unreachable through the tunnel. The
+# compute-node network in HPC clusters is already isolated to SLURM jobs.
+#
+# NOTE: we deliberately do NOT read from $HOST here. Many shells (bash on
+# most HPC login nodes included) set HOST automatically to the local
+# hostname (e.g. HOST=uan02), which would leak through sbatch --export=ALL
+# to the compute node and cause errno 99 "Cannot assign requested address".
+# Use VLLM_LISTEN_HOST if you need to override (e.g. 127.0.0.1 for a pure
+# on-node tunnel via `ssh -J login gpu-node`).
+VLLM_LISTEN_HOST="${VLLM_LISTEN_HOST:-0.0.0.0}"
 
 # Batching proxy settings (reduces streaming overhead over SSH tunnels)
 # The proxy batches multiple tokens into single SSE events
@@ -44,10 +69,17 @@ PROXY_BATCH_TOKENS="${PROXY_BATCH_TOKENS:-15}"    # Flush after N tokens
 PROXY_BATCH_CHARS="${PROXY_BATCH_CHARS:-100}"     # Flush after N characters
 PROXY_BATCH_DELAY_MS="${PROXY_BATCH_DELAY_MS:-150}"  # Max delay before flush (ms)
 
-# GPU settings
-TP_SIZE="${TP_SIZE:-4}"                    # Tensor parallel size
+# GPU settings (family-specific defaults — olivia.sh also passes --gpus/--cpus-per-task
+# overrides to sbatch so the SLURM allocation matches TP_SIZE)
+if [[ "${IS_GEMMA4}" == "1" ]]; then
+    # Gemma 4 31B AWQ is ~20 GiB — 2 GPUs leaves room for the 256K context window
+    TP_SIZE="${TP_SIZE:-2}"
+    MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}"
+else
+    TP_SIZE="${TP_SIZE:-4}"                # Tensor parallel size
+    MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}" # Max context length
+fi
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"       # GPU memory utilization
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"    # Max context length
 
 # Speculative decoding settings
 # - "auto": Enable MTP for GLM-4.7, disabled for other models
@@ -60,9 +92,19 @@ PROMPT_LOOKUP_MAX="${PROMPT_LOOKUP_MAX:-4}"  # Max n-gram window size
 # GLM-4.7 specific settings (auto-detected when MODEL contains "GLM-4.7")
 GLM_TOOL_PARSER="${GLM_TOOL_PARSER:-glm47}"
 GLM_REASONING_PARSER="${GLM_REASONING_PARSER:-glm45}"
-ENABLE_AUTO_TOOL_CHOICE="${ENABLE_AUTO_TOOL_CHOICE:-0}"
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
 MTP_SPECULATIVE_TOKENS="${MTP_SPECULATIVE_TOKENS:-3}"  # MTP speculative tokens for GLM-4.7
+
+# Gemma 4 specific settings (auto-detected when MODEL contains "gemma-4")
+GEMMA_TOOL_PARSER="${GEMMA_TOOL_PARSER:-gemma4}"
+GEMMA_REASONING_PARSER="${GEMMA_REASONING_PARSER:-gemma4}"
+
+# Auto-tool-choice: default ON for Gemma (per upstream recipe), OFF for others
+if [[ "${IS_GEMMA4}" == "1" ]]; then
+    ENABLE_AUTO_TOOL_CHOICE="${ENABLE_AUTO_TOOL_CHOICE:-1}"
+else
+    ENABLE_AUTO_TOOL_CHOICE="${ENABLE_AUTO_TOOL_CHOICE:-0}"
+fi
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
 
 # MoE (Mixture of Experts) settings
 # Expert parallel is required for AWQ-quantized MoE models to shard experts across GPUs
@@ -110,13 +152,26 @@ VLLM_CONFIGURE_LOGGING="${VLLM_CONFIGURE_LOGGING:-1}"
 # Cache quantized weights (MARLIN, AWQ, etc.) to speed up subsequent loads
 VLLM_CACHE_QUANTIZED_WEIGHTS="${VLLM_CACHE_QUANTIZED_WEIGHTS:-1}"
 
-# vLLM attention backend (now set via CLI arg instead of env var)
-VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
+# vLLM attention backend. Set to "auto" to let vLLM pick based on model config
+# (recommended for Gemma 4, whose head_size isn't supported by FLASH_ATTN 2).
+# Pinning to FLASH_ATTN is still the default for other presets where we know it
+# works and where the pin avoids a cold-start FlashInfer import cost.
+if [[ "${IS_GEMMA4}" == "1" ]]; then
+    VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-auto}"
+else
+    VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
+fi
 
 # AWQ-specific optimizations (recommended by QuantTrio/GLM-4.7-AWQ)
-# These help with AWQ-quantized MoE models on Hopper GPUs
+# These help with AWQ-quantized MoE models on Hopper GPUs.
+# Dense models (e.g. Gemma 4) don't benefit from MoE flashinfer, so disable it.
+if [[ "${IS_GEMMA4}" == "1" ]]; then
+    VLLM_USE_FLASHINFER_MOE_FP8_DEFAULT="0"
+else
+    VLLM_USE_FLASHINFER_MOE_FP8_DEFAULT="1"
+fi
 export VLLM_USE_DEEP_GEMM="${VLLM_USE_DEEP_GEMM:-0}"
-export VLLM_USE_FLASHINFER_MOE_FP8="${VLLM_USE_FLASHINFER_MOE_FP8:-1}"
+export VLLM_USE_FLASHINFER_MOE_FP8="${VLLM_USE_FLASHINFER_MOE_FP8:-${VLLM_USE_FLASHINFER_MOE_FP8_DEFAULT}}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 
@@ -142,11 +197,7 @@ if [[ "${ENABLE_PROXY}" == "1" ]]; then
     echo "  Batch Delay:      ${PROXY_BATCH_DELAY_MS}ms"
 fi
 echo ""
-# Detect GLM-4.7 model
-IS_GLM47=0
-if [[ "${MODEL}" == *"GLM-4.7"* ]] || [[ "${MODEL}" == *"glm-4.7"* ]]; then
-    IS_GLM47=1
-fi
+# (IS_GLM47 and IS_GEMMA4 are set earlier, right after MODEL is read.)
 
 # Detect AWQ quantized model
 IS_AWQ=0
@@ -204,6 +255,16 @@ if [[ "${IS_GLM47}" == "1" ]]; then
     if [[ "${IS_AWQ}" == "1" ]]; then
         echo "  Quantization:     AWQ (Hopper-compatible)"
         echo "  Expert Parallel:  ${USE_EXPERT_PARALLEL}"
+    fi
+elif [[ "${IS_GEMMA4}" == "1" ]]; then
+    echo ""
+    echo "Gemma 4 Settings:"
+    echo "  Tool Parser:      ${GEMMA_TOOL_PARSER}"
+    echo "  Reasoning Parser: ${GEMMA_REASONING_PARSER}"
+    echo "  Auto Tool Choice: ${ENABLE_AUTO_TOOL_CHOICE}"
+    echo "  Architecture:     Dense (MoE flags disabled)"
+    if [[ "${IS_AWQ}" == "1" ]]; then
+        echo "  Quantization:     AWQ (Hopper-compatible)"
     fi
 fi
 echo ""
@@ -417,11 +478,17 @@ VLLM_ARGS=(
     "--tensor-parallel-size" "${TP_SIZE}"
     "--gpu-memory-utilization" "${GPU_MEM_UTIL}"
     "--max-model-len" "${MAX_MODEL_LEN}"
-    "--host" "${HOST}"
+    "--host" "${VLLM_LISTEN_HOST}"
     "--port" "${PORT}"
-    "--attention-config.backend" "${VLLM_ATTENTION_BACKEND}"
     "--compilation-config" '{"mode": "NONE"}'
 )
+
+# Attention backend: only pin it when explicitly set. "auto" means let vLLM
+# auto-select based on model config (required for Gemma 4 whose head_size
+# isn't supported by FLASH_ATTN 2).
+if [[ "${VLLM_ATTENTION_BACKEND}" != "auto" ]]; then
+    VLLM_ARGS+=("--attention-config.backend" "${VLLM_ATTENTION_BACKEND}")
+fi
 
 # Optional: Enable chunked prefill for long contexts
 if [[ "${ENABLE_CHUNKED_PREFILL:-1}" == "1" ]]; then
@@ -440,16 +507,22 @@ if [[ "${USE_SPECULATIVE}" == "1" ]]; then
     VLLM_ARGS+=("--speculative-config" "${SPEC_CONFIG}")
 fi
 
-# GLM-4.7 specific arguments
+# Model-family specific tool/reasoning parsers
 if [[ "${IS_GLM47}" == "1" ]]; then
     VLLM_ARGS+=("--tool-call-parser" "${GLM_TOOL_PARSER}")
     VLLM_ARGS+=("--reasoning-parser" "${GLM_REASONING_PARSER}")
-    if [[ "${ENABLE_AUTO_TOOL_CHOICE}" == "1" ]]; then
-        VLLM_ARGS+=("--enable-auto-tool-choice")
-    fi
-    if [[ -n "${SERVED_MODEL_NAME}" ]]; then
-        VLLM_ARGS+=("--served-model-name" "${SERVED_MODEL_NAME}")
-    fi
+elif [[ "${IS_GEMMA4}" == "1" ]]; then
+    VLLM_ARGS+=("--tool-call-parser" "${GEMMA_TOOL_PARSER}")
+    VLLM_ARGS+=("--reasoning-parser" "${GEMMA_REASONING_PARSER}")
+    VLLM_ARGS+=("--trust-remote-code")
+fi
+
+# Common optional args (apply to any model that sets these)
+if [[ "${ENABLE_AUTO_TOOL_CHOICE}" == "1" ]]; then
+    VLLM_ARGS+=("--enable-auto-tool-choice")
+fi
+if [[ -n "${SERVED_MODEL_NAME}" ]]; then
+    VLLM_ARGS+=("--served-model-name" "${SERVED_MODEL_NAME}")
 fi
 
 # Expert parallel for MoE models (required for AWQ-quantized MoE like GLM-4.7-AWQ)
@@ -479,9 +552,9 @@ echo ""
 # -----------------------------------------------------------------------------
 
 echo "Starting vLLM server..."
-echo "Access at: http://${HOST}:${PORT}"
+echo "Access at: http://${VLLM_LISTEN_HOST}:${PORT}"
 if [[ "${ENABLE_PROXY}" == "1" ]]; then
-    echo "Proxy at:  http://${HOST}:${PROXY_PORT} (use this for streaming over SSH)"
+    echo "Proxy at:  http://${VLLM_LISTEN_HOST}:${PROXY_PORT} (use this for streaming over SSH)"
 fi
 echo ""
 echo "API endpoints:"
@@ -520,6 +593,18 @@ estimate_loading_time() {
             else
                 estimate="30-45 minutes"
                 size_hint="358B params @ BF16 (~716GB weights)"
+            fi
+            ;;
+        *gemma-4*|*gemma4*)
+            if [[ "${model,,}" == *awq* ]]; then
+                estimate="1-2 minutes"
+                size_hint="31B params @ AWQ 4-bit (~20GiB weights)"
+            elif [[ "${model,,}" == *fp8* ]]; then
+                estimate="1-3 minutes"
+                size_hint="31B params @ FP8 (~33GB weights)"
+            else
+                estimate="2-5 minutes"
+                size_hint="31B params @ BF16 (~62GB weights)"
             fi
             ;;
         *405b*|*400b*)

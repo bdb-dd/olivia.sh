@@ -37,6 +37,7 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 
 # Build containers (deploys script and submits SLURM job)
 ./olivia.sh build glm47        # Build GLM-4.7 container
+./olivia.sh build gemma4       # Build Gemma 4 31B container
 ./olivia.sh build devstral     # Build Devstral container
 ./olivia.sh build llama        # Build Llama container
 
@@ -57,7 +58,8 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 ./olivia.sh server status            # Show running server status
 
 # Start a server (uses preset with default model)
-./olivia.sh server start glm47       # Start GLM-4.7 server
+./olivia.sh server start glm47       # Start GLM-4.7 server (4 GPUs)
+./olivia.sh server start gemma4      # Start Gemma 4 31B server (2 GPUs)
 ./olivia.sh server start devstral    # Start Devstral server
 ./olivia.sh server start llama       # Start Llama server
 ./olivia.sh server start qwen        # Start Qwen server
@@ -95,12 +97,15 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 - **Linear back-off** - Poll interval starts at 3s, increases by 3s per iteration when idle, caps at 60s. Resets to 3s when activity is detected
 
 **Server presets** (with default models):
-| Preset | Default Model |
-|--------|---------------|
-| `glm47` | `QuantTrio/GLM-4.7-AWQ` |
-| `devstral` | `mistralai/Devstral-2-123B-Instruct-2512` |
-| `llama` | `meta-llama/Llama-3.3-70B-Instruct` |
-| `qwen` | `Qwen/Qwen2.5-72B-Instruct` |
+| Preset | Default Model | GPUs | Notes |
+|--------|---------------|------|-------|
+| `glm47` | `QuantTrio/GLM-4.7-AWQ` | 4 | TP=4, MTP speculative |
+| `gemma4` | `QuantTrio/gemma-4-31B-it-AWQ` | 2 | TP=2, dense, multimodal |
+| `devstral` | `mistralai/Devstral-2-123B-Instruct-2512` | 4 | TP=4 |
+| `llama` | `meta-llama/Llama-3.3-70B-Instruct` | 4 | TP=4 |
+| `qwen` | `Qwen/Qwen2.5-72B-Instruct` | 4 | TP=4 |
+
+**Per-preset GPU allocation:** `olivia.sh server start` passes `--gpus=N --cpus-per-task=N*8` to `sbatch`, overriding the `#SBATCH --gpus=4` directive baked into `run_vllm_server.sh`. Gemma 4 31B AWQ is small enough that TP=4 would waste GPUs and add needless all-reduces, so the preset runs on 2 GPUs.
 
 #### Tunnel Module
 ```bash
@@ -186,6 +191,7 @@ The build script includes predefined configurations for common models. Run witho
 | Preset | Description | vLLM | Transformers |
 |--------|-------------|------|--------------|
 | `glm47` | GLM-4.7 (358B) flagship model | main | >=5.0.0rc0 |
+| `gemma4` | Gemma 4 31B (dense, multimodal text+image) | v0.19.0 | >=5.5.0 |
 | `devstral` | Devstral/Mistral models | main | >=4.45.0 |
 | `llama` | Llama 3.x models | main | >=4.45.0 |
 | `qwen` | Qwen 2.5 models | main | >=4.45.0 |
@@ -233,9 +239,14 @@ Runs vLLM server with GH200-optimized settings:
 **GLM-4.7 Specific (auto-detected when MODEL contains "GLM-4.7"):**
 - `GLM_TOOL_PARSER`: Tool call parser (default: `glm47`)
 - `GLM_REASONING_PARSER`: Reasoning parser (default: `glm45`)
-- `ENABLE_AUTO_TOOL_CHOICE`: Enable automatic tool selection (default: `0`)
+- `ENABLE_AUTO_TOOL_CHOICE`: Enable automatic tool selection (default: `0` for GLM, `1` for Gemma)
 - `SERVED_MODEL_NAME`: Custom model name for API (default: empty, uses model ID)
 - `MTP_SPECULATIVE_TOKENS`: MTP speculative tokens for GLM-4.7 (default: `1`)
+
+**Gemma 4 Specific (auto-detected when MODEL contains "gemma-4"):**
+- `GEMMA_TOOL_PARSER`: Tool call parser (default: `gemma4`)
+- `GEMMA_REASONING_PARSER`: Reasoning parser (default: `gemma4`)
+- When Gemma 4 is detected, `TP_SIZE` defaults to `2` (not `4`), `MAX_MODEL_LEN` defaults to `65536`, `ENABLE_AUTO_TOOL_CHOICE` defaults to `1`, `--trust-remote-code` is added, and `VLLM_USE_FLASHINFER_MOE_FP8` is disabled (dense architecture)
 
 **MoE (Mixture of Experts) / AWQ Settings:**
 - `ENABLE_EXPERT_PARALLEL`: Enable expert parallel sharding (default: `auto` - auto-enables for AWQ MoE models)
@@ -284,6 +295,51 @@ CONTAINER=vllm-glm47-1-sandbox MODEL=QuantTrio/GLM-4.7-AWQ ENABLE_AUTO_TOOL_CHOI
 | FP8 | ~358GB | ~26GB free | Reduce MAX_MODEL_LEN |
 | BF16 | ~716GB | Won't fit | Needs 8+ GPUs |
 
+### Gemma 4 Quantization Options
+
+| Model | Size | GH200 Compatible | Notes |
+|-------|------|------------------|-------|
+| `QuantTrio/gemma-4-31B-it-AWQ` | ~20 GiB | **Yes (Recommended)** | AWQ 4-bit, fits on 1×GH200, TP=2 gives long-context headroom |
+| `google/gemma-4-31B-it` | ~62 GB | Yes | BF16, fits tightly on 1×GH200 |
+| `RedHatAI/gemma-4-31B-it-FP8-Dynamic` | ~33 GB | **Avoid** | Known vLLM bug: produces gibberish (vllm-project/vllm#39049) |
+| `RedHatAI/gemma-4-31B-it-FP8-block` | ~33 GB | **Avoid** | Known vLLM bug: logit softcap interaction (vllm-project/vllm#39407) |
+| `nvidia/Gemma-4-31B-IT-NVFP4` | ~15 GB | **No** | Requires Blackwell FP4 tensor cores |
+
+**Important:**
+- **Avoid Gemma 4 FP8 variants for now.** Two active vLLM bugs make both the FP8-Dynamic and FP8-Block checkpoints unusable — the softcap/scale interaction produces garbage output. Stick with AWQ until these land.
+- Gemma 4 31B is a **dense** model (not MoE), so expert-parallel flags and MoE flashinfer optimizations don't apply. The server script auto-disables them when `gemma-4` is detected in the model ID.
+- Gemma 4 has its own `gemma4` tool/reasoning parser in vLLM — the server script sets `--tool-call-parser gemma4 --reasoning-parser gemma4 --enable-auto-tool-choice --trust-remote-code` automatically.
+- Gemma 4 has a native **256K context window**. The preset sets `MAX_MODEL_LEN=65536` as a safe default; increase at your own risk (KV cache scales linearly).
+
+### Gemma 4 Usage
+
+```bash
+# Build Gemma 4 container
+MODEL_ID=gemma4 ./build_vllm_gh200.sh
+
+# Run Gemma 4 with AWQ (RECOMMENDED for GH200)
+# Uses TP=2 by default, fits easily with room for long context
+CONTAINER=vllm-gemma4-1-sandbox MODEL=QuantTrio/gemma-4-31B-it-AWQ ./run_vllm_server.sh
+
+# Via olivia.sh (automatically allocates 2 GPUs, TP=2)
+./olivia.sh server start gemma4
+
+# Run with longer context (up to 256K)
+CONTAINER=vllm-gemma4-1-sandbox MODEL=QuantTrio/gemma-4-31B-it-AWQ \
+    MAX_MODEL_LEN=131072 ./run_vllm_server.sh
+
+# Override to single GPU (tighter fit, ~32K context)
+CONTAINER=vllm-gemma4-1-sandbox MODEL=QuantTrio/gemma-4-31B-it-AWQ \
+    TP_SIZE=1 MAX_MODEL_LEN=32768 ./run_vllm_server.sh
+```
+
+**Memory requirements for Gemma 4 31B (30.7B parameters, dense):**
+| Quantization | Model Size | 1×GH200 (96GB) | 2×GH200 (192GB) | Notes |
+|--------------|------------|----------------|------------------|-------|
+| AWQ 4-bit | ~20 GiB | Yes | Recommended | TP=2, headroom for 256K context |
+| BF16 | ~62 GB | Yes, tight | Yes | No quant bugs |
+| FP8 | ~33 GB | N/A | N/A | **Broken in vLLM right now** |
+
 ### Batching Proxy for SSH Tunnels
 
 When accessing vLLM over SSH tunnels, streaming responses can be slow due to per-token network overhead. The batching proxy aggregates multiple tokens into single SSE events, reducing network round-trips by ~70%.
@@ -325,6 +381,7 @@ python vllm_proxy.py --vllm-port 8000 --proxy-port 8001 --batch-tokens 15 --batc
 
 Naming examples:
 - `vllm-glm47-1-sandbox` - GLM-4.7 build #1
+- `vllm-gemma4-1-sandbox` - Gemma 4 31B build #1
 - `vllm-devstral-1-sandbox` - Devstral build #1
 - `vllm-generic-1-sandbox` - Generic build #1
 

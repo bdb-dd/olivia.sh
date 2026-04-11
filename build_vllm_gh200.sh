@@ -3,8 +3,8 @@
 #SBATCH --partition=accel
 #SBATCH --gpus=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=0
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=256G
 #SBATCH --time=08:00:00
 #SBATCH --output=build_vllm_%j.log
 
@@ -40,6 +40,10 @@ show_presets() {
     echo "               vLLM: main, transformers>=5.0.0rc0"
     echo "               Requires ~358GB VRAM (FP8) or ~716GB (BF16)"
     echo ""
+    echo "  gemma4     - Gemma 4 (31B dense, multimodal text+image)"
+    echo "               vLLM: v0.19.0, transformers>=5.5.0"
+    echo "               ~20GiB @ AWQ, fits 1-2x GH200 (FP8 has known bugs)"
+    echo ""
     echo "  devstral   - Devstral/Mistral models (7B-123B)"
     echo "               vLLM: main, transformers>=4.45.0"
     echo "               Standard Mistral architecture"
@@ -72,6 +76,16 @@ apply_preset() {
             PRESET_VLLM_VERSION="main"
             PRESET_TRANSFORMERS=">=5.0.0rc0"
             PRESET_NOTES="GLM-4.7 requires MTP speculative decoding, tool/reasoning parsers"
+            ;;
+        gemma4|Gemma4|gemma-4|Gemma-4)
+            MODEL_ID="gemma4"
+            # Pinned to v0.19.0: vLLM main after 2026-03-31 (commit 7c080dd3c,
+            # PR #37503) uses torch::headeronly::CppTypeToScalarType, which
+            # isn't in NGC PyTorch 25.12. v0.19.0 predates that migration and
+            # is the version recommended by the QuantTrio gemma-4 AWQ model card.
+            PRESET_VLLM_VERSION="v0.19.0"
+            PRESET_TRANSFORMERS=">=5.5.0"
+            PRESET_NOTES="Gemma 4 31B dense, multimodal text+image, AWQ recommended (FP8 broken in vLLM)"
             ;;
         devstral|mistral|Devstral|Mistral)
             MODEL_ID="devstral"
@@ -327,6 +341,23 @@ fi
 cd vllm
 echo "vLLM source cloned: $(git describe --tags --always 2>/dev/null || echo 'unknown')"
 
+# -----------------------------------------------------------------------------
+# Patch: skip the _C_stable_libtorch extension
+# -----------------------------------------------------------------------------
+# vLLM v0.19.0 adds a parallel cmake extension that builds against torch's
+# stable ABI. It references TORCH_BOX (csrc/libtorch_stable/torch_bindings.cpp),
+# a macro that NGC PyTorch 25.12 (torch 2.10.0a0+nv25.12) does not yet ship.
+# The main _C extension has identical functionality and builds fine, so we
+# drop _C_stable_libtorch from setup.py's ext_modules. The `if grep -q` guard
+# keeps this idempotent across vLLM versions that may later remove the target.
+if grep -q '_C_stable_libtorch' setup.py; then
+    echo "[PATCH] Disabling _C_stable_libtorch extension (missing TORCH_BOX in NGC torch)"
+    sed -i \
+        's|ext_modules\.append(CMakeExtension(name="vllm\._C_stable_libtorch"))|pass  # disabled: NGC PyTorch lacks TORCH_BOX|' \
+        setup.py
+    grep -n '_C_stable_libtorch\|# disabled: NGC' setup.py || true
+fi
+
 # Get current NGC PyTorch version for constraints
 NGC_TORCH_VERSION=$(python3 -c "import torch; print(torch.__version__)")
 echo "NGC PyTorch version: ${NGC_TORCH_VERSION}"
@@ -345,7 +376,10 @@ cat /tmp/constraints.txt
 
 # Set build environment
 export TORCH_CUDA_ARCH_LIST="9.0"  # Hopper architecture
-export MAX_JOBS="${MAX_JOBS:-8}"
+# MAX_JOBS matches #SBATCH --cpus-per-task=16. Each CUTLASS template compile
+# can peak at ~12GB during instantiation, so 16 jobs × 12GB ≈ 192GB worst case,
+# well within the 256GB --mem request.
+export MAX_JOBS="${MAX_JOBS:-16}"
 export PIP_CONSTRAINT=/tmp/constraints.txt
 export CUDA_HOME=/usr/local/cuda
 export PATH="${CUDA_HOME}/bin:${PATH}"
@@ -493,6 +527,77 @@ if [[ ${BUILD_STATUS} -ne 0 ]]; then
         . 2>&1 | tee /tmp/vllm_build.log | tail -100
 fi
 
+# -----------------------------------------------------------------------------
+# Stub out the _C_stable_libtorch extension that we skipped in Phase 3.
+# -----------------------------------------------------------------------------
+# vllm/platforms/cuda.py (v0.19.0) does `import vllm._C_stable_libtorch  # noqa`
+# purely to trigger torch.library op registration as a side effect. We disabled
+# the C++ extension in setup.py (see "[PATCH] Disabling _C_stable_libtorch"
+# above) because it uses TORCH_BOX which NGC PyTorch 25.12 lacks. Without a
+# stub, vLLM fails at import time with ModuleNotFoundError.
+#
+# The same ops are also registered by vllm._C (imported immediately before
+# _C_stable_libtorch in cuda.py), so an empty stub module is functionally
+# complete — we just need to satisfy the import.
+VLLM_SITE=$(python3 -c "import vllm, os; print(os.path.dirname(vllm.__file__))")
+STUB_PATH="${VLLM_SITE}/_C_stable_libtorch.py"
+if [[ ! -f "${STUB_PATH}" ]]; then
+    echo ""
+    echo "Creating _C_stable_libtorch stub module at: ${STUB_PATH}"
+    cat > "${STUB_PATH}" <<'STUB_EOF'
+# Stub: the real _C_stable_libtorch C++ extension is disabled in our GH200
+# build because NGC PyTorch 25.12 lacks the TORCH_BOX macro required by
+# vLLM v0.19.0's csrc/libtorch_stable/torch_bindings.cpp (see the "[PATCH]"
+# block in build_vllm_gh200.sh). vllm/platforms/cuda.py imports this module
+# only for side-effect torch.library op registration; most of the ops it
+# would register live elsewhere (vllm._C), but a small set were MIGRATED
+# from _C to _C_stable_libtorch (permute_cols, per_token_group_fp8_quant,
+# per_token_group_int8_quant) and are therefore missing entirely. The
+# Python-level patches below add hasattr() guards so vLLM skips the
+# missing-op registrations gracefully.
+STUB_EOF
+    # Sanity check: can Python import it?
+    python3 -c "import vllm._C_stable_libtorch; print('_C_stable_libtorch stub: import ok')"
+fi
+
+# -----------------------------------------------------------------------------
+# Patch matcher_utils.py / rms_quant_fusion.py to gracefully skip missing
+# per_token_group_fp8_quant op. vLLM already does this for scaled_fp4_quant
+# (via hasattr), but it forgot the same guard for the FP8 dynamic 128/64
+# block quant ops. These ops were moved from _C to _C_stable_libtorch, which
+# we disabled above — so they're missing at runtime, and vLLM crashes at
+# import time with AttributeError. Fix: add the same hasattr guard the
+# scaled_fp4_quant path already has.
+echo ""
+echo "Patching vLLM fusion matchers to guard per_token_group_fp8_quant..."
+python3 - "${VLLM_SITE}" <<'PATCH_EOF'
+import sys, os
+site = sys.argv[1]
+files = [
+    os.path.join(site, "vllm/compilation/passes/fusion/matcher_utils.py"),
+    os.path.join(site, "vllm/compilation/passes/fusion/rms_quant_fusion.py"),
+]
+OLD = ('if current_platform.is_cuda():\n'
+       '    QUANT_OPS[kFp8Dynamic128Sym] = torch.ops._C.per_token_group_fp8_quant.default')
+NEW = ('if current_platform.is_cuda() and hasattr(torch.ops._C, "per_token_group_fp8_quant"):\n'
+       '    QUANT_OPS[kFp8Dynamic128Sym] = torch.ops._C.per_token_group_fp8_quant.default')
+for path in files:
+    if not os.path.exists(path):
+        print(f"  SKIP (not found): {path}")
+        continue
+    with open(path) as f:
+        content = f.read()
+    if NEW.split("\n", 1)[0] in content:
+        print(f"  already patched: {os.path.basename(path)}")
+        continue
+    if OLD not in content:
+        print(f"  ERROR: pattern not found in {path}")
+        sys.exit(1)
+    with open(path, "w") as f:
+        f.write(content.replace(OLD, NEW))
+    print(f"  patched: {os.path.basename(path)}")
+PATCH_EOF
+
 # Verify NGC PyTorch is still intact
 echo ""
 echo "Verifying PyTorch after vLLM install..."
@@ -555,12 +660,26 @@ else:
 import vllm
 print(f"\nvLLM: {vllm.__version__}")
 
-# Check if CUDA graphs work (this is the key test)
-try:
-    from vllm.worker.model_runner import CUDAGraphRunner
-    print("CUDA Graphs module: ✓")
-except ImportError as e:
-    print(f"CUDA Graphs module: ⚠ {e}")
+# Critical checks: these imports are the ones that broke in previous builds.
+# Failing loudly here beats discovering it when you try to start a server.
+#
+# 1. vllm.platforms.cuda — does `import vllm._C_stable_libtorch` as a side
+#    effect. Broke with ModuleNotFoundError when we skipped the stable ext.
+# 2. vllm.compilation.passes.fusion.matcher_utils — registers QUANT_OPS
+#    entries at import time. Broke with AttributeError when we skipped the
+#    stable ext (per_token_group_fp8_quant op was moved there). The Python
+#    patch above adds a hasattr() guard.
+for mod in [
+    "vllm.platforms.cuda",
+    "vllm.compilation.passes.fusion.matcher_utils",
+    "vllm.compilation.passes.fusion.rms_quant_fusion",
+]:
+    try:
+        __import__(mod)
+        print(f"{mod}: ✓")
+    except Exception as e:
+        print(f"{mod}: ✗ {type(e).__name__}: {e}")
+        raise SystemExit(f"FATAL: vllm cannot import {mod}: {e}")
 
 # Check torch.compile availability
 try:

@@ -34,8 +34,10 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 ./olivia.sh build              # Show build help
 ./olivia.sh build --presets    # List available model presets
 ./olivia.sh build --list       # List existing containers on cluster
+./olivia.sh build logs         # Tail logs of a currently running build job
 
 # Build containers (deploys script and submits SLURM job)
+./olivia.sh build glm51        # Build GLM-5.1 container (vLLM v0.19.0)
 ./olivia.sh build glm47        # Build GLM-4.7 container
 ./olivia.sh build devstral     # Build Devstral container
 ./olivia.sh build llama        # Build Llama container
@@ -57,6 +59,7 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 ./olivia.sh server status            # Show running server status
 
 # Start a server (uses preset with default model)
+./olivia.sh server start glm51       # Start GLM-5.1 server (8 GPUs across 2 nodes, TP=4 + PP=2)
 ./olivia.sh server start glm47       # Start GLM-4.7 server
 ./olivia.sh server start devstral    # Start Devstral server
 ./olivia.sh server start llama       # Start Llama server
@@ -95,12 +98,15 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 - **Linear back-off** - Poll interval starts at 3s, increases by 3s per iteration when idle, caps at 60s. Resets to 3s when activity is detected
 
 **Server presets** (with default models):
-| Preset | Default Model |
-|--------|---------------|
-| `glm47` | `QuantTrio/GLM-4.7-AWQ` |
-| `devstral` | `mistralai/Devstral-2-123B-Instruct-2512` |
-| `llama` | `meta-llama/Llama-3.3-70B-Instruct` |
-| `qwen` | `Qwen/Qwen2.5-72B-Instruct` |
+| Preset | Default Model | GPUs | Notes |
+|--------|---------------|------|-------|
+| `glm51` | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | TP=4 + PP=2, MTP speculative, Ray cluster |
+| `glm47` | `QuantTrio/GLM-4.7-AWQ` | 4 | TP=4, MTP speculative |
+| `devstral` | `mistralai/Devstral-2-123B-Instruct-2512` | 4 | TP=4 |
+| `llama` | `meta-llama/Llama-3.3-70B-Instruct` | 4 | TP=4 |
+| `qwen` | `Qwen/Qwen2.5-72B-Instruct` | 4 | TP=4 |
+
+**Per-preset GPU allocation:** `olivia.sh server start` reads resources from `get_preset_resources()` in `olivia.sh` and passes corresponding `--nodes`, `--gpus-per-node`, `--cpus-per-task` overrides to `sbatch`. The `glm51` preset is the only one today that crosses a node boundary (2 nodes × 4 GPUs); everything else runs single-node 4 GPUs.
 
 #### Tunnel Module
 ```bash
@@ -185,6 +191,7 @@ The build script includes predefined configurations for common models. Run witho
 
 | Preset | Description | vLLM | Transformers |
 |--------|-------------|------|--------------|
+| `glm51` | GLM-5.1 (744B / 40B active) MoE+DSA flagship | v0.19.0 | >=5.3.0.dev0 |
 | `glm47` | GLM-4.7 (358B) flagship model | main | >=5.0.0rc0 |
 | `devstral` | Devstral/Mistral models | main | >=4.45.0 |
 | `llama` | Llama 3.x models | main | >=4.45.0 |
@@ -230,15 +237,24 @@ Runs vLLM server with GH200-optimized settings:
 - `NUM_SPECULATIVE_TOKENS`: Number of tokens to speculate (default: 5)
 - `PROMPT_LOOKUP_MAX`: Max n-gram window size (default: 4)
 
-**GLM-4.7 Specific (auto-detected when MODEL contains "GLM-4.7"):**
-- `GLM_TOOL_PARSER`: Tool call parser (default: `glm47`)
+**GLM-4.7 / GLM-5.1 Specific (auto-detected when MODEL contains "GLM-4.7" or "GLM-5.1"):**
+- `GLM_TOOL_PARSER`: Tool call parser (default: `glm47` — GLM-5.1 reuses the GLM-4.7 parser per the official vLLM recipe)
 - `GLM_REASONING_PARSER`: Reasoning parser (default: `glm45`)
 - `ENABLE_AUTO_TOOL_CHOICE`: Enable automatic tool selection (default: `0`)
 - `SERVED_MODEL_NAME`: Custom model name for API (default: empty, uses model ID)
-- `MTP_SPECULATIVE_TOKENS`: MTP speculative tokens for GLM-4.7 (default: `1`)
+- `MTP_SPECULATIVE_TOKENS`: MTP speculative tokens (default: `3`)
+- GLM-5.1 additionally passes `--trust-remote-code` and flips the MoE flashinfer kernel from `VLLM_USE_FLASHINFER_MOE_FP8=1` to `VLLM_USE_FLASHINFER_MOE_FP16=1` (matches the QuantTrio GLM-5-AWQ recipe)
+
+**Multi-node Distributed Inference (GLM-5.1):**
+- `NUM_NODES`: Number of nodes to use (default: `1`). When `>1`, `run_vllm_server.sh` bootstraps a Ray cluster via `srun`, starts head on node 0, workers on remaining nodes, waits for the cluster to register the expected GPU count, then launches vLLM with `--distributed-executor-backend ray`
+- `PP_SIZE`: Pipeline parallel size (default: `1`). For 2-node glm51 jobs this is `2`
+- `TP_SIZE`: Tensor parallel size (default: `4`). For multi-node jobs, this is the *intra-node* tensor parallel size (per node)
+- `RAY_PORT`: Ray GCS port (default: `6379`)
+- Head node IP is auto-discovered via `ip -4 -o addr show hsn0` (Slingshot interface); falls back to `hostname -I`
+- Ray temp dir is per-job: `${WORKDIR}/cache/ray_tmp_${SLURM_JOB_ID}`
 
 **MoE (Mixture of Experts) / AWQ Settings:**
-- `ENABLE_EXPERT_PARALLEL`: Enable expert parallel sharding (default: `auto` - auto-enables for AWQ MoE models)
+- `ENABLE_EXPERT_PARALLEL`: Enable expert parallel sharding (default: `auto` - auto-enables for AWQ MoE models including GLM-4.7-AWQ and GLM-5.1-AWQ)
 
 **Batching Proxy (for SSH tunnel streaming):**
 - `ENABLE_PROXY`: Enable the batching proxy (default: `0`)
@@ -284,6 +300,70 @@ CONTAINER=vllm-glm47-1-sandbox MODEL=QuantTrio/GLM-4.7-AWQ ENABLE_AUTO_TOOL_CHOI
 | FP8 | ~358GB | ~26GB free | Reduce MAX_MODEL_LEN |
 | BF16 | ~716GB | Won't fit | Needs 8+ GPUs |
 
+### GLM-5.1 Quantization Options
+
+GLM-5.1 is a 744B-parameter MoE model with DeepSeek Sparse Attention (DSA), activating ~40–44B parameters per token. It is the successor to GLM-5 and shares the same architecture scale. GLM-5.1 does **not** fit on 4×GH200 in any useful quantization — this preset is designed for **8 GPUs across 2 nodes** on Olivia.
+
+| Model | Size | Olivia Compatible | Notes |
+|-------|------|-------------------|-------|
+| `cyankiwi/GLM-5.1-AWQ-4bit` | ~430 GB | **Yes (Recommended)** | AWQ 4-bit, fits on 8×GH200 with ~260 GB free for KV cache |
+| `zai-org/GLM-5.1-FP8` | ~744 GB | Tight fit on 8 GPUs | Needs DeepGEMM and aggressive context reduction |
+| `zai-org/GLM-5.1` (BF16) | ~1.5 TB | **No** | Would need 16+ GPUs |
+| `QuantTrio/GLM-5.1-AWQ` | — | **Does not exist (yet)** | Community-requested; not yet released |
+
+**Important:** On Olivia, glm51 is the only preset that crosses a node boundary today. Internode bandwidth is **HPE Slingshot at 200 Gbit/s (~25 GB/s)**, ~36× slower than intra-node NVLink C2C (900 GB/s). Naive TP=8 across 2 nodes would bottleneck on cross-node all-reduce for every transformer layer. The preset therefore uses **TP=4 intra-node + PP=2 cross-node**: pipeline parallelism only transfers hidden states between stages (not per-layer), so it degrades gracefully on Slingshot-class links.
+
+### GLM-5.1 Usage
+
+```bash
+# Build GLM-5.1 container
+./olivia.sh build glm51
+# or direct:
+MODEL_ID=glm51 sbatch build_vllm_gh200.sh
+
+# Start GLM-5.1 server (preset auto-allocates 2 nodes × 4 GPUs)
+./olivia.sh server start glm51
+
+# Watch loading progress (handles multi-node GPU aggregation automatically)
+./olivia.sh server watch
+
+# Direct sbatch invocation for glm51 (multi-node overrides required)
+CONTAINER=vllm-glm51-1-sandbox MODEL=cyankiwi/GLM-5.1-AWQ-4bit \
+    NUM_NODES=2 TP_SIZE=4 PP_SIZE=2 \
+    sbatch --nodes=2 --ntasks-per-node=1 --gpus-per-node=4 --cpus-per-task=32 \
+    run_vllm_server.sh
+
+# Override context length (GLM-5.1 has native 205K context window)
+./olivia.sh server start glm51
+# or direct: MAX_MODEL_LEN=65536 ... run_vllm_server.sh
+```
+
+**Memory requirements for GLM-5.1 (744B params, ~40B active):**
+| Quantization | Model Size | 8×GH200 (768 GB HBM) | Notes |
+|--------------|------------|----------------------|-------|
+| AWQ 4-bit (cyankiwi) | ~430 GB | ~260 GB free (@0.90 util) | Recommended, plenty of KV cache room |
+| FP8 (zai-org) | ~744 GB | ~25 GB free | Tight, reduce MAX_MODEL_LEN |
+| BF16 | ~1.5 TB | Won't fit | — |
+
+**Multi-node architecture (glm51):**
+```
+                      ┌─────────────────────────────┐
+                      │  SLURM allocation (2 nodes) │
+                      └──────────────┬──────────────┘
+                                     │
+                ┌────────────────────┴────────────────────┐
+                │                                         │
+      Node 0 (head)                                Node 1 (worker)
+      ┌──────────────────┐                        ┌──────────────────┐
+      │ Ray head (6379)  │ ◄─── Slingshot ───►    │ Ray worker       │
+      │ vllm serve       │      200 Gbit/s        │ (Ray only)       │
+      │ TP=4 (NVLink)    │      PP activations    │ TP=4 (NVLink)    │
+      │ GPUs 0-3         │                        │ GPUs 0-3         │
+      └──────────────────┘                        └──────────────────┘
+```
+
+The Ray cluster is bootstrapped at job start via `srun`, torn down on exit via a trap. vLLM discovers GPUs across both nodes through Ray and assigns the pipeline stages accordingly.
+
 ### Batching Proxy for SSH Tunnels
 
 When accessing vLLM over SSH tunnels, streaming responses can be slow due to per-token network overhead. The batching proxy aggregates multiple tokens into single SSE events, reducing network round-trips by ~70%.
@@ -324,6 +404,7 @@ python vllm_proxy.py --vllm-port 8000 --proxy-port 8001 --batch-tokens 15 --batc
 - `vllm-{model}-{index}.sif`: Compressed Singularity image (optional)
 
 Naming examples:
+- `vllm-glm51-1-sandbox` - GLM-5.1 build #1
 - `vllm-glm47-1-sandbox` - GLM-4.7 build #1
 - `vllm-devstral-1-sandbox` - Devstral build #1
 - `vllm-generic-1-sandbox` - Generic build #1

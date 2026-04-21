@@ -29,7 +29,12 @@ REMOTE_USER="${REMOTE_USER:-$USER}"
 REMOTE_HOST="${REMOTE_HOST:-}"
 REMOTE_PORT=8000
 LOCAL_PORT="${LOCAL_PORT:-8000}"
-JOB_NAME_PATTERN="vllm"
+# Match the SLURM job name that run_vllm_server.sh's #SBATCH --job-name sets.
+# Using the full `vllm-server` here (not just `vllm`) keeps us from picking up
+# in-flight build jobs, whose name is `build-vllm-gh200` and also contains
+# "vllm" — matching them would make `server logs` tail non-existent files and,
+# worse, make `server cancel` kill a running build.
+JOB_NAME_PATTERN="vllm-server"
 
 # Remote paths
 REMOTE_CONTAINER_DIR="${REMOTE_CONTAINER_DIR:-}"
@@ -224,7 +229,24 @@ find_vllm_node() {
         return 1
     fi
 
-    echo "$job_line" | awk '{print $2}'
+    local raw_nodelist
+    raw_nodelist=$(echo "$job_line" | awk '{print $2}')
+
+    # Multi-node jobs report a SLURM-compressed nodelist (e.g. gpu-1-[90-91])
+    # that's not a valid SSH tunnel target. Expand it and return just the
+    # head node — that's where run_vllm_server.sh launches `vllm serve`,
+    # so it's the only node listening on ${REMOTE_PORT}.
+    if [[ "$raw_nodelist" == *"["* || "$raw_nodelist" == *","* ]]; then
+        local expanded
+        expanded=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+            "scontrol show hostnames '${raw_nodelist}' 2>/dev/null | head -n1" 2>/dev/null) || expanded=""
+        if [[ -n "$expanded" ]]; then
+            echo "$expanded"
+            return 0
+        fi
+    fi
+
+    echo "$raw_nodelist"
 }
 
 setup_tunnel() {
@@ -305,6 +327,39 @@ cancel_job() {
     return 0
 }
 
+# Canonical log paths for a vLLM server job.
+#
+# run_vllm_server.sh writes SLURM wrapper output to
+# `vllm_server_<jobid>.log` on *every* job. For multi-node jobs it *additionally*
+# starts `vllm serve` under an `srun --output=...<jobid>_head.log`, so all
+# useful post-bootstrap output lives in the head log. Single-node jobs never
+# create the head log.
+#
+# Callers should tail *both* files with `tail -F` (which retries files that
+# don't exist yet) so they capture Ray-bootstrap output from the wrapper log
+# and vLLM output from the head log as each appears. For one-shot reads
+# (grep, etc.) use `resolve_server_log` to pick the most informative single
+# file.
+server_log_wrapper() {
+    echo "${REMOTE_CONTAINER_DIR}/logs/vllm_server_${1}.log"
+}
+
+server_log_head() {
+    echo "${REMOTE_CONTAINER_DIR}/logs/vllm_server_${1}_head.log"
+}
+
+resolve_server_log() {
+    local job_id="$1"
+    local head_log wrap_log
+    head_log="$(server_log_head "$job_id")"
+    wrap_log="$(server_log_wrapper "$job_id")"
+    if ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "test -s '${head_log}'" 2>/dev/null; then
+        echo "$head_log"
+    else
+        echo "$wrap_log"
+    fi
+}
+
 tail_job_logs() {
     local log_file="$1"
     local job_id="${2:-}"
@@ -368,11 +423,17 @@ tail_job_logs() {
 
     echo "" >&2
     success "Job started - tailing logs"
-    echo "    Log file: ${log_file}" >&2
+    echo "    Log files: ${log_file} + _head.log (multi-node jobs)" >&2
     echo "" >&2
     echo "==========================================="
 
-    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "tail -f '${log_file}'" || true
+    # Tail both wrapper and head log. `tail -F` retries files that don't exist
+    # yet, so it naturally picks up the head log once vLLM starts writing to
+    # it. Stderr is suppressed to silence "cannot open" / "has appeared"
+    # transitions during the wait.
+    local head_log
+    head_log="$(server_log_head "$job_id")"
+    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "tail -F '${log_file}' '${head_log}' 2>/dev/null" || true
 
     echo "" >&2
     info "Log tailing stopped. Job continues running."
@@ -408,7 +469,37 @@ list_containers() {
     echo ""
 }
 
+cmd_build_logs() {
+    ensure_master_connection || exit 1
+
+    local job_id
+    if job_id=$(find_job_id "build-vllm-gh200"); then
+        local log_file="${REMOTE_CONTAINER_DIR}/build_vllm_${job_id}.log"
+        info "Tailing logs for build job ${job_id}..."
+        echo "    (Press Ctrl+C to stop watching - build will continue running)" >&2
+        echo "" >&2
+        ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "tail -F '${log_file}' 2>/dev/null" || true
+    else
+        error "No running build job found"
+        local latest_log
+        latest_log=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+            "ls -t ${REMOTE_CONTAINER_DIR}/build_vllm_*.log 2>/dev/null | head -n1") || true
+        if [[ -n "$latest_log" ]]; then
+            echo "    Most recent build log: ${latest_log}" >&2
+            echo "    View with: ssh ${REMOTE_HOST} 'tail ${latest_log}'" >&2
+        fi
+        exit 1
+    fi
+}
+
 cmd_build() {
+    # Subcommand: logs — tail the currently running build job's log
+    if [[ "${1:-}" == "logs" ]]; then
+        shift
+        cmd_build_logs "$@"
+        return $?
+    fi
+
     local model_id=""
     local build_index=""
     local do_deploy=true
@@ -426,11 +517,15 @@ cmd_build() {
                 info "To build a new container:"
                 echo "    ./olivia.sh build <preset>" >&2
                 echo "" >&2
-                echo "Available presets: glm47, devstral, llama, qwen, generic" >&2
+                echo "Available presets: glm51, glm47, devstral, llama, qwen, generic" >&2
                 exit 0
                 ;;
             --presets|-p)
                 header "Available Model Presets"
+                echo "  glm51      GLM-5.1 (744B/40B active) MoE+DSA flagship"
+                echo "             vLLM: v0.19.0, transformers>=5.3.0.dev0"
+                echo "             AWQ ~430GB, needs 8 GPUs (2×4-GPU nodes, TP=4 + PP=2)"
+                echo ""
                 echo "  glm47      GLM-4.7 (358B) flagship model"
                 echo "             vLLM: main, transformers>=5.0.0rc0"
                 echo ""
@@ -504,6 +599,7 @@ cmd_build() {
         echo "Quick commands:"
         echo "    ./olivia.sh build --presets     Show available presets"
         echo "    ./olivia.sh build --list        List existing containers"
+        echo "    ./olivia.sh build logs          Tail logs of a running build"
         echo ""
         echo "Build examples:"
         echo "    ./olivia.sh build glm47            Build GLM-4.7 container"
@@ -528,8 +624,10 @@ cmd_build() {
         echo ""
     fi
 
-    # Build environment variables
-    local env_vars="MODEL_ID=${model_id}"
+    # Build environment variables.
+    # CONTAINER_DIR must be exported to the SLURM job — `cd` alone doesn't
+    # propagate it as an env var (build_vllm_gh200.sh requires it explicitly).
+    local env_vars="CONTAINER_DIR=${REMOTE_CONTAINER_DIR} MODEL_ID=${model_id}"
     [[ -n "$build_index" ]] && env_vars="${env_vars} BUILD_INDEX=${build_index}"
     [[ -n "$vllm_version" ]] && env_vars="${env_vars} VLLM_VERSION=${vllm_version}"
     [[ -n "$create_sif" ]] && env_vars="${env_vars} CREATE_SIF=${create_sif}"
@@ -570,12 +668,13 @@ cmd_build() {
 
 cmd_build_help() {
     cat <<EOF
-Usage: ./olivia.sh build [preset] [options]
+Usage: ./olivia.sh build [preset|logs] [options]
 
 Build vLLM containers on Olivia HPC cluster.
 
 Arguments:
-    preset              Model preset (glm47, devstral, llama, qwen, generic)
+    preset              Model preset (glm51, glm47, devstral, llama, qwen, generic)
+    logs                Tail logs of the currently running build job
 
 Options:
     --list, -l          List existing containers
@@ -604,6 +703,7 @@ Examples:
     ./olivia.sh build glm47 --force     Rebuild existing container
     ./olivia.sh build devstral --sif    Build Devstral and create SIF
     ./olivia.sh build --list            List existing containers
+    ./olivia.sh build logs              Tail running build job logs
 EOF
 }
 
@@ -615,6 +715,9 @@ EOF
 get_default_model() {
     local preset="$1"
     case "${preset}" in
+        glm51|glm-5.1)
+            echo "cyankiwi/GLM-5.1-AWQ-4bit"
+            ;;
         glm47|glm-4.7)
             echo "QuantTrio/GLM-4.7-AWQ"
             ;;
@@ -629,6 +732,26 @@ get_default_model() {
             ;;
         *)
             echo ""
+            ;;
+    esac
+}
+
+# Resource allocation per preset.
+# Emits "num_nodes gpus_per_node pp_size" for use by start_server_job.
+# Defaults to single-node 4 GPUs if the preset is unknown.
+get_preset_resources() {
+    local preset="$1"
+    case "${preset}" in
+        glm51|glm-5.1)
+            # 744B MoE AWQ — ~430GB, needs 8 GPUs.
+            # TP=4 intra-node (NVLink) + PP=2 cross-node (Slingshot) is the
+            # sweet spot: PP tolerates the ~25 GB/s cross-node fabric far better
+            # than naive TP=8 would.
+            echo "2 4 2"
+            ;;
+        *)
+            # Single-node 4-GPU default (matches run_vllm_server.sh #SBATCH directives)
+            echo "1 4 1"
             ;;
     esac
 }
@@ -669,16 +792,59 @@ list_server_containers() {
 start_server_job() {
     local container="$1"
     local model="$2"
+    local num_nodes="${3:-1}"
+    local gpus_per_node="${4:-4}"
+    local pp_size="${5:-1}"
 
     info "Starting vLLM server..."
     echo "    Container: ${container}" >&2
     echo "    Model:     ${model}" >&2
+    if [[ "${num_nodes}" -gt 1 ]]; then
+        echo "    Nodes:     ${num_nodes}" >&2
+        echo "    GPUs/node: ${gpus_per_node}" >&2
+        echo "    Total GPUs: $((num_nodes * gpus_per_node))" >&2
+        echo "    TP=${gpus_per_node} + PP=${pp_size} (multi-node over Slingshot)" >&2
+    fi
 
-    local env_vars="CONTAINER=${container} MODEL=${model}"
+    # Environment variables passed into the SLURM job.
+    # CONTAINER_DIR must be exported — run_vllm_server.sh requires it explicitly;
+    # `cd` alone doesn't propagate it as an env var into sbatch's job environment.
+    local env_vars="CONTAINER_DIR=${REMOTE_CONTAINER_DIR}"
+    env_vars+=" CONTAINER=${container} MODEL=${model}"
+    env_vars+=" NUM_NODES=${num_nodes}"
+    env_vars+=" TP_SIZE=${gpus_per_node}"
+    env_vars+=" PP_SIZE=${pp_size}"
+
+    # Forward selected debug/tuning env vars if the caller set them. Useful for
+    # diagnosing startup hangs: `VERBOSE=1 ./olivia.sh server start glm51`
+    # flips vLLM, Ray, and NCCL to verbose logging inside the SLURM job.
+    for forward_var in VERBOSE VLLM_LOGGING_LEVEL RAY_BACKEND_LOG_LEVEL RAY_DEDUP_LOGS NCCL_DEBUG; do
+        if [[ -n "${!forward_var:-}" ]]; then
+            env_vars+=" ${forward_var}=${!forward_var}"
+        fi
+    done
+
+    # sbatch directive overrides (override the #SBATCH lines in run_vllm_server.sh).
+    # For multi-node jobs we MUST pass --ntasks=N explicitly. Without it, SLURM's
+    # task-count resolution collapses the allocation to 1 node even when --nodes=N
+    # is specified, because a single task needs only a single node.
+    local sbatch_opts=""
+    if [[ "${num_nodes}" -gt 1 ]]; then
+        sbatch_opts="--nodes=${num_nodes} --ntasks=${num_nodes} --ntasks-per-node=1 --gpus-per-node=${gpus_per_node} --cpus-per-task=$((gpus_per_node * 8))"
+    else
+        # Single-node: keep backward-compatible behavior but still pass --gpus and
+        # --cpus-per-task so per-preset overrides work.
+        sbatch_opts="--gpus=${gpus_per_node} --cpus-per-task=$((gpus_per_node * 8))"
+    fi
+
+    # Debug: echo the exact command being submitted so regressions like
+    # "didn't request 2 nodes" are visible at submission time.
+    echo "    sbatch opts: ${sbatch_opts}" >&2
+    echo "    env vars:    ${env_vars}" >&2
 
     local submit_output
     if ! submit_output=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
-        "cd ${REMOTE_CONTAINER_DIR} && ${env_vars} sbatch run_vllm_server.sh" 2>&1); then
+        "cd ${REMOTE_CONTAINER_DIR} && ${env_vars} sbatch ${sbatch_opts} run_vllm_server.sh" 2>&1); then
         error "Failed to submit job"
         echo "$submit_output" >&2
         return 1
@@ -716,7 +882,9 @@ server_watch() {
     local stable_count=0
     local health_checks=0
     local max_health_checks=60  # Give up after ~3 minutes of health checks
-    local node_name=""
+    local node_name=""         # Head node (for health check / SSH)
+    local node_list=""         # Space-separated list of all allocated nodes (multi-node)
+    local num_nodes_in_job=1
     local job_id=""
     local log_file=""
     local prev_state=""        # Track previous job state for notifications
@@ -737,9 +905,21 @@ server_watch() {
                 prev_state=""
             else
                 local state
+                local raw_nodelist
                 state=$(echo "$job_info" | awk '{print $4}' | head -1)
                 job_id=$(echo "$job_info" | awk '{print $2}' | head -1)
-                node_name=$(echo "$job_info" | awk '{print $3}' | head -1)
+                raw_nodelist=$(echo "$job_info" | awk '{print $3}' | head -1)
+
+                # Expand SLURM compressed nodelist (e.g., "c1-[1-2]" → "c1-1 c1-2").
+                # For single-node jobs this is a no-op pass-through.
+                if [[ "$raw_nodelist" == *"["* || "$raw_nodelist" == *","* ]]; then
+                    node_list=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+                        "scontrol show hostnames '${raw_nodelist}' 2>/dev/null | paste -sd ' '" 2>/dev/null) || node_list="$raw_nodelist"
+                else
+                    node_list="$raw_nodelist"
+                fi
+                node_name=$(echo "$node_list" | awk '{print $1}')
+                num_nodes_in_job=$(echo "$node_list" | wc -w | tr -d ' ')
 
                 # Notify on state transitions
                 if [[ "$state" == "RUNNING" && "$prev_state" == "PENDING" ]]; then
@@ -748,8 +928,15 @@ server_watch() {
 
                 if [[ "$state" == "RUNNING" && -n "$node_name" ]]; then
                     echo ""
-                    success "Job ${job_id} running on ${node_name}"
-                    log_file="${REMOTE_CONTAINER_DIR}/logs/vllm_server_${job_id}.log"
+                    if [[ "$num_nodes_in_job" -gt 1 ]]; then
+                        success "Job ${job_id} running on ${num_nodes_in_job} nodes: ${node_list}"
+                    else
+                        success "Job ${job_id} running on ${node_name}"
+                    fi
+                    # Start with the wrapper log; promote to _head.log once it
+                    # has content (multi-node jobs only — single-node leaves
+                    # log_file on the wrapper for the entire run).
+                    log_file="$(server_log_wrapper "$job_id")"
                     phase="loading"
                     current_interval="$base_interval"  # Reset interval
                     prev_state="$state"
@@ -768,6 +955,20 @@ server_watch() {
 
         # Phase 2: Monitor GPU memory loading
         if [[ "$phase" == "loading" || "$phase" == "initializing" ]]; then
+            # Promote log_file to the head log once vLLM starts writing there.
+            # On multi-node jobs the wrapper log stops at the Ray-bootstrap
+            # handoff; all post-bootstrap output (loading progress, KV cache,
+            # throughput) lives in _head.log. Once we've promoted, stop
+            # checking.
+            if [[ "$log_file" != *"_head.log" ]]; then
+                local _head_candidate
+                _head_candidate="$(server_log_head "$job_id")"
+                if ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+                    "test -s '${_head_candidate}'" 2>/dev/null; then
+                    log_file="$_head_candidate"
+                fi
+            fi
+
             # Check if job is still running
             local job_check
             job_check=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
@@ -787,10 +988,10 @@ server_watch() {
                 continue
             fi
 
-            # Get GPU memory usage from node
+            # Get GPU memory usage across all allocated nodes (single SSH, loop on remote)
             local gpu_info
             gpu_info=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
-                "ssh ${node_name} 'nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits' 2>/dev/null" 2>/dev/null) || true
+                "for n in ${node_list}; do ssh \$n 'nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits' 2>/dev/null; done" 2>/dev/null) || true
 
             if [[ -n "$gpu_info" ]]; then
                 # Parse GPU info (format: "used, total, util" per GPU)
@@ -1106,19 +1307,23 @@ cmd_server() {
             deploy_server_script
             ;;
         cancel)
-            cancel_job "vllm"
+            cancel_job
             if is_tunnel_alive; then
                 info "Closing tunnel (node will change)..."
                 kill_tunnel
             fi
             ;;
         start)
-            # Resolve container name
+            # Resolve container name and resources
+            local num_nodes=1
+            local gpus_per_node=4
+            local pp_size=1
             if [[ -n "$preset" ]]; then
                 container=$(resolve_container_name "$preset" "$index")
                 if [[ -z "$model" ]]; then
                     model=$(get_default_model "$preset")
                 fi
+                read -r num_nodes gpus_per_node pp_size < <(get_preset_resources "$preset")
             fi
 
             if [[ -z "$container" ]]; then
@@ -1156,7 +1361,7 @@ cmd_server() {
             fi
 
             # Check if server already running
-            if find_job_id "vllm" >/dev/null 2>&1; then
+            if find_job_id >/dev/null 2>&1; then
                 warn "A vLLM server is already running"
                 echo "    Cancel it first with: ./olivia.sh server cancel" >&2
                 echo "    Or use 'restart' to replace it" >&2
@@ -1171,7 +1376,7 @@ cmd_server() {
 
             # Start server
             local job_id
-            if ! job_id=$(start_server_job "$container" "$model"); then
+            if ! job_id=$(start_server_job "$container" "$model" "$num_nodes" "$gpus_per_node" "$pp_size"); then
                 exit 1
             fi
 
@@ -1190,11 +1395,15 @@ cmd_server() {
             ;;
         restart)
             # For restart, we need container and model
+            local num_nodes=1
+            local gpus_per_node=4
+            local pp_size=1
             if [[ -n "$preset" ]]; then
                 container=$(resolve_container_name "$preset" "$index")
                 if [[ -z "$model" ]]; then
                     model=$(get_default_model "$preset")
                 fi
+                read -r num_nodes gpus_per_node pp_size < <(get_preset_resources "$preset")
             fi
 
             # If no container specified, try to get from running job or show error
@@ -1230,7 +1439,7 @@ cmd_server() {
             fi
 
             # Cancel existing job
-            cancel_job "vllm"
+            cancel_job
             if is_tunnel_alive; then
                 info "Closing tunnel (node will change)..."
                 kill_tunnel
@@ -1239,7 +1448,7 @@ cmd_server() {
 
             # Start server
             local job_id
-            if ! job_id=$(start_server_job "$container" "$model"); then
+            if ! job_id=$(start_server_job "$container" "$model" "$num_nodes" "$gpus_per_node" "$pp_size"); then
                 exit 1
             fi
 
@@ -1252,10 +1461,20 @@ cmd_server() {
             ;;
         logs)
             local job_id
-            if job_id=$(find_job_id "vllm"); then
-                local log_file="${REMOTE_CONTAINER_DIR}/logs/vllm_server_${job_id}.log"
+            if job_id=$(find_job_id); then
+                local wrap_log head_log
+                wrap_log="$(server_log_wrapper "$job_id")"
+                head_log="$(server_log_head "$job_id")"
                 info "Tailing logs for job ${job_id}..."
-                ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "tail -f '${log_file}'" || true
+                # Tail both wrapper and head log. `tail -F` retries files that
+                # don't exist yet (single-node jobs never create the head log;
+                # multi-node jobs write post-bootstrap output only to the head).
+                # Stderr is suppressed to silence the `cannot open ... No such
+                # file or directory` / `has appeared; following new file`
+                # chatter that tail -F emits during the wait — legitimate
+                # process errors (ssh connection loss, etc.) still surface via
+                # ssh_run's exit status.
+                ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "tail -F '${wrap_log}' '${head_log}' 2>/dev/null" || true
             else
                 error "No running vLLM server found"
                 exit 1
@@ -1302,6 +1521,7 @@ Actions:
     deploy              Upload run_vllm_server.sh to cluster
 
 Presets (with default models):
+    glm51               GLM-5.1-AWQ (cyankiwi/GLM-5.1-AWQ-4bit) — 2 nodes × 4 GPUs, TP=4 + PP=2
     glm47               GLM-4.7-AWQ (QuantTrio/GLM-4.7-AWQ)
     devstral            Devstral 123B (mistralai/Devstral-2-123B-Instruct-2512)
     llama               Llama 3.3 70B (meta-llama/Llama-3.3-70B-Instruct)

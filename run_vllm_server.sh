@@ -1,13 +1,19 @@
 #!/bin/bash
 #SBATCH --job-name=vllm-server
 #SBATCH --partition=accel
-#SBATCH --gpus=4
-#SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=0
 #SBATCH --time=08:00:00
 #SBATCH --output=logs/vllm_server_%j.log
 #SBATCH --error=logs/vllm_server_%j.log
+# NOTE: Neither --ntasks nor --gpus/--gpus-per-node are set here as #SBATCH
+# directives. olivia.sh always passes the right spec on the sbatch command line:
+#   Single-node: --gpus=N
+#   Multi-node:  --nodes=N --ntasks=N --ntasks-per-node=1 --gpus-per-node=M
+# Setting #SBATCH --ntasks=1 would silently downgrade multi-node submissions to
+# 1 node (SLURM reasons: "1 task needs only 1 node"). Setting #SBATCH --gpus=4
+# conflicts with --gpus-per-node (SLURM: "4 GPUs fits on 1 node"). If you sbatch
+# this script directly (not via olivia.sh), remember to pass --gpus=N yourself.
 
 # =============================================================================
 # Run vLLM Server on GH200
@@ -34,7 +40,14 @@ MODEL="${MODEL:-mistralai/Devstral-2-123B-Instruct-2512}"
 
 # Server settings
 PORT="${PORT:-8000}"
-HOST="${HOST:-127.0.0.1}"
+# HOST: bind address for vLLM's HTTP server.
+# Force 0.0.0.0 (all interfaces) so the SSH tunnel — which connects to
+# ${gpu_node}:${port} via the login node — can reach us. We DON'T default to
+# ${HOST:-...} because bash commonly auto-sets $HOST to the login-shell
+# hostname (e.g., "uan02"), which leaks into the sbatch environment and causes
+# vLLM to try binding a non-local address: OSError [Errno 99] EADDRNOTAVAIL.
+# If you need to restrict to a specific interface, set VLLM_BIND_HOST instead.
+HOST="${VLLM_BIND_HOST:-0.0.0.0}"
 
 # Batching proxy settings (reduces streaming overhead over SSH tunnels)
 # The proxy batches multiple tokens into single SSE events
@@ -45,32 +58,44 @@ PROXY_BATCH_CHARS="${PROXY_BATCH_CHARS:-100}"     # Flush after N characters
 PROXY_BATCH_DELAY_MS="${PROXY_BATCH_DELAY_MS:-150}"  # Max delay before flush (ms)
 
 # GPU settings
-TP_SIZE="${TP_SIZE:-4}"                    # Tensor parallel size
+TP_SIZE="${TP_SIZE:-4}"                    # Tensor parallel size (per-node for multi-node)
+PP_SIZE="${PP_SIZE:-1}"                    # Pipeline parallel size (1=single-node, 2=across nodes)
+NUM_NODES="${NUM_NODES:-1}"                # Number of nodes to use (1 or 2)
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"       # GPU memory utilization
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"    # Max context length
 
 # Speculative decoding settings
-# - "auto": Enable MTP for GLM-4.7, disabled for other models
-# - "1": Force enable (MTP for GLM-4.7, ngram for others)
+# - "auto": Enable MTP for GLM-4.7/GLM-5.1, disabled for other models
+# - "1": Force enable (MTP for GLM-4.7/GLM-5.1, ngram for others)
 # - "0": Force disable
 ENABLE_SPECULATIVE="${ENABLE_SPECULATIVE:-auto}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-5}"
 PROMPT_LOOKUP_MAX="${PROMPT_LOOKUP_MAX:-4}"  # Max n-gram window size
 
-# GLM-4.7 specific settings (auto-detected when MODEL contains "GLM-4.7")
+# GLM-4.7/GLM-5.1 specific settings (auto-detected from MODEL)
+# GLM-5.1 reuses the GLM-4.7 tool/reasoning parsers per the official vLLM recipe
 GLM_TOOL_PARSER="${GLM_TOOL_PARSER:-glm47}"
 GLM_REASONING_PARSER="${GLM_REASONING_PARSER:-glm45}"
 ENABLE_AUTO_TOOL_CHOICE="${ENABLE_AUTO_TOOL_CHOICE:-0}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
-MTP_SPECULATIVE_TOKENS="${MTP_SPECULATIVE_TOKENS:-3}"  # MTP speculative tokens for GLM-4.7
+MTP_SPECULATIVE_TOKENS="${MTP_SPECULATIVE_TOKENS:-3}"  # MTP speculative tokens (GLM-4.7 and GLM-5.1)
 
 # MoE (Mixture of Experts) settings
 # Expert parallel is required for AWQ-quantized MoE models to shard experts across GPUs
 ENABLE_EXPERT_PARALLEL="${ENABLE_EXPERT_PARALLEL:-auto}"  # auto, 0, or 1
 
-# Cache directories
+# Cache directories. All cache paths must live on the project filesystem
+# (CONTAINER_DIR is under /cluster/work/... on Olivia, which has generous
+# quota). Defaulting Triton / DeepGEMM JIT caches to user home causes jobs
+# to fail mid-profile with `OSError: [Errno 122] Disk quota exceeded` once
+# the small home quota fills with compiled kernels — especially for models
+# with MoE + many experts + many shapes (GLM-5.1 hit this on first profile
+# pass when cache landed under ~/.triton).
 HF_CACHE="${HF_CACHE:-$PWD/cache/huggingface}"
 VLLM_CACHE="${VLLM_CACHE:-$PWD/cache/vllm}"
+TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$PWD/cache/triton}"
+DG_JIT_CACHE_DIR="${DG_JIT_CACHE_DIR:-$PWD/cache/deep_gemm}"
+TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$PWD/cache/torchinductor}"
 
 if [[ -z "${CONTAINER_DIR}" ]]; then
     echo "Error: CONTAINER_DIR is not set."
@@ -82,7 +107,7 @@ fi
 # Environment setup
 # -----------------------------------------------------------------------------
 
-mkdir -p "${HF_CACHE}" "${VLLM_CACHE}"
+mkdir -p "${HF_CACHE}" "${VLLM_CACHE}" "${TRITON_CACHE_DIR}" "${DG_JIT_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}"
 
 # GPU ordering: Put slowest GPU (usually GPU 0) last
 # This improves tensor parallel performance on GH200
@@ -97,12 +122,21 @@ export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"         # Enable InfiniBand if av
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 # Logging configuration
-# Set VERBOSE=1 for detailed vLLM logging (shows weight loading progress, etc.)
+# Set VERBOSE=1 for detailed vLLM + Ray + NCCL logging. Useful when debugging
+# startup hangs: `VERBOSE=1` flips vLLM to DEBUG, disables Ray log-dedup (so
+# repeated errors are visible), raises Ray's C++ backend log level, and turns
+# on NCCL debug output. Every variable can also be overridden individually.
 VERBOSE="${VERBOSE:-0}"
 if [[ "${VERBOSE}" == "1" ]]; then
     VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-DEBUG}"
+    RAY_BACKEND_LOG_LEVEL="${RAY_BACKEND_LOG_LEVEL:-debug}"
+    RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
+    NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
 else
     VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}"
+    RAY_BACKEND_LOG_LEVEL="${RAY_BACKEND_LOG_LEVEL:-info}"
+    RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-1}"
+    NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 fi
 # Enable vLLM's internal logging configuration
 VLLM_CONFIGURE_LOGGING="${VLLM_CONFIGURE_LOGGING:-1}"
@@ -110,13 +144,21 @@ VLLM_CONFIGURE_LOGGING="${VLLM_CONFIGURE_LOGGING:-1}"
 # Cache quantized weights (MARLIN, AWQ, etc.) to speed up subsequent loads
 VLLM_CACHE_QUANTIZED_WEIGHTS="${VLLM_CACHE_QUANTIZED_WEIGHTS:-1}"
 
-# vLLM attention backend (now set via CLI arg instead of env var)
-VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
+# vLLM attention backend (now set via CLI arg instead of env var).
+# Left empty here so we can tell an explicit override from our default: GLM-5.1
+# uses DeepSeek-style MLA (multi-head latent attention) and FLASH_ATTN rejects
+# it at startup with `['head_size not supported', 'MLA not supported', ...]`.
+# The final value is chosen below after model detection — TRITON_MLA for
+# GLM-5.1, FLASH_ATTN for everyone else. User-set values pass through.
+VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-}"
 
-# AWQ-specific optimizations (recommended by QuantTrio/GLM-4.7-AWQ)
-# These help with AWQ-quantized MoE models on Hopper GPUs
+# AWQ-specific optimizations (recommended by QuantTrio for GLM-4.7-AWQ / GLM-5.1-AWQ)
+# These help with AWQ-quantized MoE models on Hopper GPUs.
+# Note: GLM-4.7-AWQ uses FLASHINFER_MOE_FP8=1; GLM-5.1-AWQ uses FLASHINFER_MOE_FP16=1
+# instead. We adjust these below after detecting GLM-5.1.
 export VLLM_USE_DEEP_GEMM="${VLLM_USE_DEEP_GEMM:-0}"
 export VLLM_USE_FLASHINFER_MOE_FP8="${VLLM_USE_FLASHINFER_MOE_FP8:-1}"
+export VLLM_USE_FLASHINFER_MOE_FP16="${VLLM_USE_FLASHINFER_MOE_FP16:-0}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 
@@ -131,8 +173,10 @@ echo "  Tensor Parallel:  ${TP_SIZE}"
 echo "  GPU Memory:       ${GPU_MEM_UTIL}"
 echo "  Max Model Len:    ${MAX_MODEL_LEN}"
 echo "  Port:             ${PORT}"
-echo "  Attention Backend: ${VLLM_ATTENTION_BACKEND}"
 echo "  Log Level:        ${VLLM_LOGGING_LEVEL}"
+if [[ "${VERBOSE}" == "1" ]]; then
+    echo "  VERBOSE mode:     ON (Ray backend=${RAY_BACKEND_LOG_LEVEL}, dedup=${RAY_DEDUP_LOGS}, NCCL=${NCCL_DEBUG})"
+fi
 if [[ "${ENABLE_PROXY}" == "1" ]]; then
     echo ""
     echo "Batching Proxy:     ENABLED"
@@ -148,20 +192,56 @@ if [[ "${MODEL}" == *"GLM-4.7"* ]] || [[ "${MODEL}" == *"glm-4.7"* ]]; then
     IS_GLM47=1
 fi
 
+# Detect GLM-5.1 model
+IS_GLM51=0
+if [[ "${MODEL}" == *"GLM-5.1"* ]] || [[ "${MODEL}" == *"glm-5.1"* ]]; then
+    IS_GLM51=1
+fi
+
+# Any GLM MoE model that uses the glm47/glm45 parser family
+IS_GLM_MOE=0
+if [[ "${IS_GLM47}" == "1" || "${IS_GLM51}" == "1" ]]; then
+    IS_GLM_MOE=1
+fi
+
 # Detect AWQ quantized model
 IS_AWQ=0
 if [[ "${MODEL,,}" == *"-awq"* ]] || [[ "${MODEL,,}" == *"awq"* ]]; then
     IS_AWQ=1
 fi
 
+# GLM-5.1 AWQ: swap the MoE flashinfer kernel variant
+# (QuantTrio recipe uses MOE_FP16 for GLM-5-AWQ, not MOE_FP8 like GLM-4.7-AWQ)
+if [[ "${IS_GLM51}" == "1" && "${IS_AWQ}" == "1" ]]; then
+    export VLLM_USE_FLASHINFER_MOE_FP8=0
+    export VLLM_USE_FLASHINFER_MOE_FP16=1
+fi
+
+# Resolve attention backend default. FLASH_ATTN is the right choice for
+# everything except MLA models. GLM-5.1's GlmMoeDsaForCausalLM uses DeepSeek
+# *sparse* MLA (DSA): FLASH_ATTN rejects it (`['MLA not supported']`) AND
+# TRITON_MLA rejects it too (`['sparse not supported']`). A sparse-MLA
+# backend like FLASHMLA_SPARSE/FLASHINFER_MLA is needed and typically requires
+# extra packages. Leave the backend empty for GLM-5.1 so vLLM auto-selects
+# from whatever is installed — if nothing works, the error will tell us what
+# to install.
+if [[ -z "${VLLM_ATTENTION_BACKEND}" ]]; then
+    if [[ "${IS_GLM51}" == "1" ]]; then
+        VLLM_ATTENTION_BACKEND=""   # auto-select
+    else
+        VLLM_ATTENTION_BACKEND="FLASH_ATTN"
+    fi
+fi
+echo "  Attention Backend: ${VLLM_ATTENTION_BACKEND:-<auto-select>}"
+
 # Determine if expert parallel should be enabled
-# Auto-enable for AWQ-quantized MoE models (GLM-4.7-AWQ)
+# Auto-enable for AWQ-quantized MoE models (GLM-4.7-AWQ, GLM-5.1-AWQ)
 USE_EXPERT_PARALLEL=0
 if [[ "${ENABLE_EXPERT_PARALLEL}" == "1" ]]; then
     USE_EXPERT_PARALLEL=1
 elif [[ "${ENABLE_EXPERT_PARALLEL}" == "auto" ]]; then
-    # Auto-enable for AWQ MoE models
-    if [[ "${IS_AWQ}" == "1" ]] && [[ "${IS_GLM47}" == "1" ]]; then
+    # Auto-enable for AWQ GLM MoE models
+    if [[ "${IS_AWQ}" == "1" && "${IS_GLM_MOE}" == "1" ]]; then
         USE_EXPERT_PARALLEL=1
         echo "[INFO] Auto-enabling expert parallel for AWQ MoE model"
     fi
@@ -172,16 +252,29 @@ USE_SPECULATIVE=0
 if [[ "${ENABLE_SPECULATIVE}" == "1" ]]; then
     USE_SPECULATIVE=1
 elif [[ "${ENABLE_SPECULATIVE}" == "auto" ]]; then
-    # Auto-enable MTP for GLM-4.7 (improves throughput significantly)
-    if [[ "${IS_GLM47}" == "1" ]]; then
+    # Auto-enable MTP for GLM-4.7/GLM-5.1 (improves throughput significantly)
+    if [[ "${IS_GLM_MOE}" == "1" ]]; then
         USE_SPECULATIVE=1
-        echo "[INFO] Auto-enabling MTP speculative decoding for GLM-4.7"
+        echo "[INFO] Auto-enabling MTP speculative decoding for GLM MoE model"
     fi
+fi
+
+# vLLM v0.19.x limitation: the MTP draft model (DeepSeekMTPModel) does not
+# implement the SupportsPP interface. Combining --speculative-config with
+# --pipeline-parallel-size > 1 raises:
+#   NotImplementedError: Pipeline parallelism is not supported for this model.
+# When PP > 1 we MUST disable MTP. The throughput loss (~15-25%) is much
+# smaller than the alternative (TP=N across the cross-node fabric instead
+# of PP, which bottlenecks on all-reduce every layer). Revisit when the
+# upstream SupportsPP interface lands for MTP draft models.
+if [[ "${USE_SPECULATIVE}" == "1" && "${PP_SIZE}" -gt 1 ]]; then
+    echo "[WARN] Disabling MTP speculative decoding: incompatible with pipeline parallelism (PP_SIZE=${PP_SIZE}) in vLLM v0.19.x"
+    USE_SPECULATIVE=0
 fi
 
 echo "Speculative Decoding:"
 if [[ "${USE_SPECULATIVE}" == "1" ]]; then
-    if [[ "${IS_GLM47}" == "1" ]]; then
+    if [[ "${IS_GLM_MOE}" == "1" ]]; then
         echo "  Enabled:          yes"
         echo "  Method:           MTP (Multi-Token Prediction)"
         echo "  Spec Tokens:      ${MTP_SPECULATIVE_TOKENS}"
@@ -195,9 +288,13 @@ else
     echo "  Enabled:          no"
 fi
 
-if [[ "${IS_GLM47}" == "1" ]]; then
+if [[ "${IS_GLM_MOE}" == "1" ]]; then
     echo ""
-    echo "GLM-4.7 Settings:"
+    if [[ "${IS_GLM51}" == "1" ]]; then
+        echo "GLM-5.1 Settings:"
+    else
+        echo "GLM-4.7 Settings:"
+    fi
     echo "  Tool Parser:      ${GLM_TOOL_PARSER}"
     echo "  Reasoning Parser: ${GLM_REASONING_PARSER}"
     echo "  Auto Tool Choice: ${ENABLE_AUTO_TOOL_CHOICE}"
@@ -205,6 +302,15 @@ if [[ "${IS_GLM47}" == "1" ]]; then
         echo "  Quantization:     AWQ (Hopper-compatible)"
         echo "  Expert Parallel:  ${USE_EXPERT_PARALLEL}"
     fi
+fi
+
+if [[ "${NUM_NODES}" -gt 1 ]]; then
+    echo ""
+    echo "Multi-Node Distributed Inference:"
+    echo "  Num Nodes:        ${NUM_NODES}"
+    echo "  Tensor Parallel:  ${TP_SIZE}  (intra-node, NVLink)"
+    echo "  Pipeline Parallel: ${PP_SIZE}  (inter-node, Slingshot)"
+    echo "  Total GPUs:       $((TP_SIZE * PP_SIZE))"
 fi
 echo ""
 echo "GPU Configuration:"
@@ -419,9 +525,19 @@ VLLM_ARGS=(
     "--max-model-len" "${MAX_MODEL_LEN}"
     "--host" "${HOST}"
     "--port" "${PORT}"
-    "--attention-config.backend" "${VLLM_ATTENTION_BACKEND}"
     "--compilation-config" '{"mode": "NONE"}'
 )
+
+# Only pin the attention backend when we have an explicit choice. For GLM-5.1
+# (sparse MLA) we leave this empty so vLLM auto-selects a compatible backend.
+if [[ -n "${VLLM_ATTENTION_BACKEND}" ]]; then
+    VLLM_ARGS+=("--attention-config.backend" "${VLLM_ATTENTION_BACKEND}")
+fi
+
+# Pipeline parallelism (multi-node)
+if [[ "${PP_SIZE}" -gt 1 ]]; then
+    VLLM_ARGS+=("--pipeline-parallel-size" "${PP_SIZE}")
+fi
 
 # Optional: Enable chunked prefill for long contexts
 if [[ "${ENABLE_CHUNKED_PREFILL:-1}" == "1" ]]; then
@@ -430,8 +546,8 @@ fi
 
 # Speculative decoding (method depends on model)
 if [[ "${USE_SPECULATIVE}" == "1" ]]; then
-    if [[ "${IS_GLM47}" == "1" ]]; then
-        # GLM-4.7 uses MTP (Multi-Token Prediction) speculative decoding
+    if [[ "${IS_GLM_MOE}" == "1" ]]; then
+        # GLM-4.7/GLM-5.1 use MTP (Multi-Token Prediction) speculative decoding
         SPEC_CONFIG='{"method": "mtp", "num_speculative_tokens": '${MTP_SPECULATIVE_TOKENS}'}'
     else
         # Default: ngram speculative decoding
@@ -440,8 +556,8 @@ if [[ "${USE_SPECULATIVE}" == "1" ]]; then
     VLLM_ARGS+=("--speculative-config" "${SPEC_CONFIG}")
 fi
 
-# GLM-4.7 specific arguments
-if [[ "${IS_GLM47}" == "1" ]]; then
+# GLM-4.7 / GLM-5.1 shared arguments (same parser family)
+if [[ "${IS_GLM_MOE}" == "1" ]]; then
     VLLM_ARGS+=("--tool-call-parser" "${GLM_TOOL_PARSER}")
     VLLM_ARGS+=("--reasoning-parser" "${GLM_REASONING_PARSER}")
     if [[ "${ENABLE_AUTO_TOOL_CHOICE}" == "1" ]]; then
@@ -449,6 +565,10 @@ if [[ "${IS_GLM47}" == "1" ]]; then
     fi
     if [[ -n "${SERVED_MODEL_NAME}" ]]; then
         VLLM_ARGS+=("--served-model-name" "${SERVED_MODEL_NAME}")
+    fi
+    # GLM-5.1 requires trust-remote-code for its custom attention config
+    if [[ "${IS_GLM51}" == "1" ]]; then
+        VLLM_ARGS+=("--trust-remote-code")
     fi
 fi
 
@@ -626,18 +746,260 @@ if [[ "${ENABLE_PROXY}" == "1" ]]; then
     fi
 fi
 
-singularity exec --nv \
-    --env "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}" \
-    --env "NCCL_P2P_LEVEL=${NCCL_P2P_LEVEL}" \
-    --env "NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL}" \
-    --env "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}" \
-    --env "VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL}" \
-    --env "VLLM_CONFIGURE_LOGGING=${VLLM_CONFIGURE_LOGGING}" \
-    --env "VLLM_CACHE_QUANTIZED_WEIGHTS=${VLLM_CACHE_QUANTIZED_WEIGHTS}" \
-    --env "HF_HOME=${HF_CACHE}" \
-    --env "HF_TOKEN=${HF_TOKEN:-}" \
-    --env "HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-${HF_TOKEN:-}}" \
-    --bind "${HF_CACHE}:${HF_CACHE}" \
-    --bind "${VLLM_CACHE}:/root/.cache/vllm" \
-    "${CONTAINER_PATH}" \
-    "${VLLM_ARGS[@]}"
+# Build shared singularity command array (used by both single-node and multi-node paths)
+SING_CMD=(
+    singularity exec --nv
+    --env "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+    --env "NCCL_P2P_LEVEL=${NCCL_P2P_LEVEL}"
+    --env "NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL}"
+    --env "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
+    --env "VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL}"
+    --env "VLLM_CONFIGURE_LOGGING=${VLLM_CONFIGURE_LOGGING}"
+    --env "RAY_BACKEND_LOG_LEVEL=${RAY_BACKEND_LOG_LEVEL}"
+    --env "RAY_DEDUP_LOGS=${RAY_DEDUP_LOGS}"
+    --env "NCCL_DEBUG=${NCCL_DEBUG}"
+    --env "VLLM_CACHE_QUANTIZED_WEIGHTS=${VLLM_CACHE_QUANTIZED_WEIGHTS}"
+    --env "VLLM_USE_DEEP_GEMM=${VLLM_USE_DEEP_GEMM}"
+    --env "VLLM_USE_FLASHINFER_MOE_FP8=${VLLM_USE_FLASHINFER_MOE_FP8}"
+    --env "VLLM_USE_FLASHINFER_MOE_FP16=${VLLM_USE_FLASHINFER_MOE_FP16}"
+    --env "VLLM_USE_FLASHINFER_SAMPLER=${VLLM_USE_FLASHINFER_SAMPLER}"
+    --env "OMP_NUM_THREADS=${OMP_NUM_THREADS}"
+    --env "HF_HOME=${HF_CACHE}"
+    --env "HF_TOKEN=${HF_TOKEN:-}"
+    --env "HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-${HF_TOKEN:-}}"
+    --env "TRITON_CACHE_DIR=${TRITON_CACHE_DIR}"
+    --env "DG_JIT_CACHE_DIR=${DG_JIT_CACHE_DIR}"
+    --env "TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR}"
+    --bind "${HF_CACHE}:${HF_CACHE}"
+    --bind "${VLLM_CACHE}:/root/.cache/vllm"
+    --bind "${TRITON_CACHE_DIR}:${TRITON_CACHE_DIR}"
+    --bind "${DG_JIT_CACHE_DIR}:${DG_JIT_CACHE_DIR}"
+    --bind "${TORCHINDUCTOR_CACHE_DIR}:${TORCHINDUCTOR_CACHE_DIR}"
+)
+
+if [[ "${NUM_NODES}" -le 1 ]]; then
+    # -------------------------------------------------------------------------
+    # Single-node launch (existing behavior)
+    # -------------------------------------------------------------------------
+    "${SING_CMD[@]}" "${CONTAINER_PATH}" "${VLLM_ARGS[@]}"
+else
+    # -------------------------------------------------------------------------
+    # Multi-node launch: bootstrap Ray cluster via srun, then launch vLLM on head
+    # -------------------------------------------------------------------------
+    if [[ -z "${SLURM_JOB_ID:-}" ]]; then
+        echo "ERROR: NUM_NODES > 1 requires running inside a SLURM allocation."
+        echo "       Submit with: sbatch --nodes=${NUM_NODES} --ntasks-per-node=1 \\"
+        echo "                           --gpus-per-node=${TP_SIZE} run_vllm_server.sh"
+        exit 1
+    fi
+
+    # Discover allocated nodes from SLURM
+    mapfile -t NODES < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
+    NUM_ALLOCATED="${#NODES[@]}"
+
+    if [[ "${NUM_ALLOCATED}" -ne "${NUM_NODES}" ]]; then
+        echo "ERROR: SLURM allocated ${NUM_ALLOCATED} nodes but NUM_NODES=${NUM_NODES}."
+        echo "       Ensure --nodes=${NUM_NODES} was passed to sbatch."
+        exit 1
+    fi
+
+    HEAD_NODE="${NODES[0]}"
+    WORKER_NODES=("${NODES[@]:1}")
+
+    # Get head node IP on the high-speed fabric.
+    # On Olivia (HPE Cray EX with Slingshot), the Slingshot interface is typically hsn0.
+    # Fall back to the first non-loopback IP if hsn0 isn't present.
+    HEAD_NODE_IP=$(srun --nodes=1 --ntasks=1 -w "${HEAD_NODE}" \
+        bash -c "ip -4 -o addr show hsn0 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -1 || hostname -I | awk '{print \$1}'")
+
+    if [[ -z "${HEAD_NODE_IP}" ]]; then
+        echo "ERROR: Failed to resolve head node IP for ${HEAD_NODE}"
+        exit 1
+    fi
+
+    # Per-job Ray temp dir. Must be SHORT — Ray creates AF_UNIX sockets at
+    # ${temp_dir}/session_TIMESTAMP_PID/sockets/plasma_store, and AF_UNIX paths
+    # are capped at 107 bytes. Anything under /cluster/work/... immediately
+    # blows past the limit. Use /tmp per-node; Ray doesn't need a shared temp
+    # dir across nodes — each Ray process uses its local one.
+    RAY_TEMP_DIR="/tmp/ray_${SLURM_JOB_ID}"
+
+    RAY_PORT="${RAY_PORT:-6379}"
+
+    echo ""
+    echo "=============================================="
+    echo "Multi-Node Ray Bootstrap"
+    echo "=============================================="
+    echo "Head node:      ${HEAD_NODE} (${HEAD_NODE_IP}:${RAY_PORT})"
+    echo "Worker nodes:   ${WORKER_NODES[*]}"
+    echo "Ray temp dir:   ${RAY_TEMP_DIR}"
+    echo "GPUs per node:  ${TP_SIZE}"
+    echo "=============================================="
+    echo ""
+
+    # Signal handler: tear down Ray on all nodes at exit.
+    # --overlap lets this srun share the allocation with already-running steps
+    # (the Ray head/worker sruns still hold task slots even when backgrounded).
+    cleanup_ray() {
+        echo ""
+        echo "[$(date '+%H:%M:%S')] Tearing down Ray cluster..."
+        srun --overlap --nodes="${NUM_NODES}" --ntasks="${NUM_NODES}" --ntasks-per-node=1 \
+            "${SING_CMD[@]}" "${CONTAINER_PATH}" ray stop 2>/dev/null || true
+        cleanup_proxy 2>/dev/null || true
+    }
+    trap cleanup_ray EXIT INT TERM
+
+    # Create the Ray temp dir on EVERY allocated node. Singularity --bind requires
+    # the source path to exist on the host before the container launches.
+    echo "[$(date '+%H:%M:%S')] Creating ${RAY_TEMP_DIR} on all ${NUM_NODES} nodes..."
+    srun --overlap --nodes="${NUM_NODES}" --ntasks="${NUM_NODES}" --ntasks-per-node=1 \
+        mkdir -p "${RAY_TEMP_DIR}"
+
+    # NOTE on --overlap: the Ray head/worker srun commands below use & to run in
+    # the background but still HOLD their SLURM task allocations until killed.
+    # Without --overlap, any subsequent srun (ray status poll, vLLM launch,
+    # cleanup) blocks forever waiting for a task slot that's already consumed.
+    # --overlap tells SLURM "run this step alongside existing ones, share the
+    # resources". This is the standard pattern for SLURM multi-step scripts.
+
+    # Match Ray's CPU view to the SLURM allocation. Without --num-cpus, Ray
+    # auto-detects the host's logical CPU count (on GH200 that's 288), and its
+    # worker_pool starts pre-warming ~288 idle python workers. Most of them
+    # fail to register within the timeout and the raylet spews
+    # "Some workers... have not registered within the timeout" at high rate,
+    # which stalls legitimate actor placement. SLURM_CPUS_PER_TASK reflects
+    # what we actually got from sbatch; fall back to TP_SIZE*8 (our sbatch
+    # opts default) if the env var isn't set.
+    RAY_NUM_CPUS="${RAY_NUM_CPUS:-${SLURM_CPUS_PER_TASK:-$((TP_SIZE * 8))}}"
+
+    # Pin Ray + vLLM to the Slingshot interface on EVERY node. Two problems
+    # get solved together here:
+    #
+    # 1. `ray start` on workers without --node-ip-address auto-detects via
+    #    socket.gethostbyname(), which returns the ethernet IP (10.168.x.x).
+    #    Ray then registers the worker under the ethernet IP even though the
+    #    cluster was bootstrapped on Slingshot.
+    #
+    # 2. vLLM's RayExecutor validates "every node must have a unique IP" and
+    #    also uses each actor's node IP to build its placement-group spec.
+    #    If actors on the head see Slingshot and actors on workers see
+    #    ethernet, vLLM gets 3+ unique IPs for 2 nodes and hard-fails with:
+    #      RuntimeError: Every node should have a unique IP address.
+    #
+    # Fix: resolve each worker's Slingshot IP up front (same srun-from-login
+    # approach used for HEAD_NODE_IP; doing it inside the container has been
+    # flaky — hsn0 sometimes isn't visible from inside apptainer), then pass
+    # the IP into the worker srun as --node-ip-address + VLLM_HOST_IP +
+    # RAY_node_ip_address. Ray actors forked from that raylet inherit the
+    # env vars and all report the Slingshot IP consistently.
+    declare -A WORKER_IPS
+    for worker in "${WORKER_NODES[@]}"; do
+        WORKER_IPS[$worker]=$(srun --nodes=1 --ntasks=1 -w "$worker" \
+            bash -c "ip -4 -o addr show hsn0 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -1 || hostname -I | awk '{print \$1}'")
+        if [[ -z "${WORKER_IPS[$worker]}" ]]; then
+            echo "ERROR: Failed to resolve worker IP for ${worker}"
+            exit 1
+        fi
+        echo "  worker: ${worker} -> ${WORKER_IPS[$worker]}"
+    done
+
+    # Start Ray head on the first node (backgrounded, --block keeps it alive)
+    echo "[$(date '+%H:%M:%S')] Starting Ray head on ${HEAD_NODE} (num-cpus=${RAY_NUM_CPUS} num-gpus=${TP_SIZE})..."
+    srun --overlap --nodes=1 --ntasks=1 -w "${HEAD_NODE}" \
+        --output="${WORKDIR:-$PWD}/logs/ray_head_${SLURM_JOB_ID}.log" \
+        "${SING_CMD[@]}" \
+        --env "RAY_TMPDIR=${RAY_TEMP_DIR}" \
+        --env "VLLM_HOST_IP=${HEAD_NODE_IP}" \
+        --env "RAY_node_ip_address=${HEAD_NODE_IP}" \
+        --bind "${RAY_TEMP_DIR}:${RAY_TEMP_DIR}" \
+        "${CONTAINER_PATH}" \
+        ray start --head \
+            --node-ip-address="${HEAD_NODE_IP}" \
+            --port="${RAY_PORT}" \
+            --num-cpus="${RAY_NUM_CPUS}" \
+            --num-gpus="${TP_SIZE}" \
+            --temp-dir="${RAY_TEMP_DIR}" \
+            --block &
+    RAY_HEAD_SRUN_PID=$!
+
+    # Give the head time to become reachable
+    sleep 15
+
+    # Start one Ray worker per remaining node. We launch each worker in its
+    # own srun step so we can pass node-specific env (VLLM_HOST_IP,
+    # RAY_node_ip_address) and a node-specific --node-ip-address. See the
+    # WORKER_IPS preamble above for why we resolve each IP on the login node
+    # rather than inside the container.
+    RAY_WORKER_SRUN_PIDS=()
+    for worker in "${WORKER_NODES[@]}"; do
+        WIP="${WORKER_IPS[$worker]}"
+        echo "[$(date '+%H:%M:%S')] Starting Ray worker on ${worker} (node-ip=${WIP})..."
+        srun --overlap --nodes=1 --ntasks=1 -w "${worker}" \
+            --output="${WORKDIR:-$PWD}/logs/ray_worker_${SLURM_JOB_ID}_${worker}.log" \
+            "${SING_CMD[@]}" \
+            --env "RAY_TMPDIR=${RAY_TEMP_DIR}" \
+            --env "VLLM_HOST_IP=${WIP}" \
+            --env "RAY_node_ip_address=${WIP}" \
+            --bind "${RAY_TEMP_DIR}:${RAY_TEMP_DIR}" \
+            "${CONTAINER_PATH}" \
+            ray start \
+                --address="${HEAD_NODE_IP}:${RAY_PORT}" \
+                --node-ip-address="${WIP}" \
+                --num-cpus="${RAY_NUM_CPUS}" \
+                --num-gpus="${TP_SIZE}" \
+                --temp-dir="${RAY_TEMP_DIR}" \
+                --block &
+        RAY_WORKER_SRUN_PIDS+=($!)
+    done
+
+    # Wait for the Ray cluster to show the expected GPU count.
+    EXPECTED_GPUS=$((TP_SIZE * NUM_NODES))
+    echo "[$(date '+%H:%M:%S')] Waiting for Ray cluster to register ${EXPECTED_GPUS} GPUs..."
+    WAIT_MAX=60
+    WAIT_COUNT=0
+    while [[ "${WAIT_COUNT}" -lt "${WAIT_MAX}" ]]; do
+        RAY_STATUS=$(srun --overlap --nodes=1 --ntasks=1 -w "${HEAD_NODE}" \
+            "${SING_CMD[@]}" \
+            --env "RAY_TMPDIR=${RAY_TEMP_DIR}" \
+            --bind "${RAY_TEMP_DIR}:${RAY_TEMP_DIR}" \
+            "${CONTAINER_PATH}" \
+            ray status --address="${HEAD_NODE_IP}:${RAY_PORT}" 2>/dev/null || echo "")
+        ACTIVE_GPUS=$(echo "${RAY_STATUS}" | grep -oE '[0-9]+\.?[0-9]*/[0-9]+\.?[0-9]* GPU' | grep -oE '/[0-9]+' | tr -d '/' | head -1 || echo "0")
+        if [[ "${ACTIVE_GPUS}" -ge "${EXPECTED_GPUS}" ]]; then
+            echo "[$(date '+%H:%M:%S')] Ray cluster ready with ${ACTIVE_GPUS} GPUs."
+            break
+        fi
+        WAIT_COUNT=$((WAIT_COUNT + 1))
+        sleep 2
+    done
+
+    if [[ "${WAIT_COUNT}" -ge "${WAIT_MAX}" ]]; then
+        echo "WARNING: Ray cluster did not reach expected ${EXPECTED_GPUS} GPUs within $((WAIT_MAX * 2))s."
+        echo "         Continuing anyway; vLLM will fail fast if the cluster is incomplete."
+    fi
+
+    # Launch vLLM on the head node. It will discover and use the Ray cluster.
+    echo ""
+    echo "[$(date '+%H:%M:%S')] Launching vLLM on ${HEAD_NODE} with TP=${TP_SIZE} PP=${PP_SIZE}..."
+    echo ""
+    VLLM_ARGS+=("--distributed-executor-backend" "ray")
+
+    # Force vLLM's host-IP detection to use the Slingshot IP we bootstrapped
+    # Ray with. Without this, vLLM's placement group spec pins bundle 0 to
+    # `node:<ethernet_ip>` (e.g. 10.168.0.50), which Ray has never heard of
+    # — Ray was started with --node-ip-address=<slingshot_ip> (10.63.x.x).
+    # The symptom is an infinite
+    #   "No available node types can fulfill resource request
+    #    {'node:10.168.x.x': 0.001, 'GPU': 1.0}"
+    # loop after "Connected to Ray cluster".
+    srun --overlap --nodes=1 --ntasks=1 -w "${HEAD_NODE}" \
+        --output="${WORKDIR:-$PWD}/logs/vllm_server_${SLURM_JOB_ID}_head.log" \
+        "${SING_CMD[@]}" \
+        --env "RAY_TMPDIR=${RAY_TEMP_DIR}" \
+        --env "RAY_ADDRESS=${HEAD_NODE_IP}:${RAY_PORT}" \
+        --env "VLLM_HOST_IP=${HEAD_NODE_IP}" \
+        --env "RAY_node_ip_address=${HEAD_NODE_IP}" \
+        --bind "${RAY_TEMP_DIR}:${RAY_TEMP_DIR}" \
+        "${CONTAINER_PATH}" \
+        "${VLLM_ARGS[@]}"
+fi

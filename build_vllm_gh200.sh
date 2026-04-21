@@ -36,6 +36,11 @@ mkdir -p "${WORKDIR:-$PWD}/logs"
 show_presets() {
     echo "Available model presets:"
     echo ""
+    echo "  glm51      - GLM-5.1 (744B, 40B active) MoE with DeepSeek Sparse Attention"
+    echo "               vLLM: v0.19.0, transformers>=5.3.0.dev0"
+    echo "               AWQ ~430GB, requires 8 GPUs (2 nodes × 4× GH200 on Olivia)"
+    echo "               Uses TP=4 + PP=2 across nodes (Slingshot-friendly)"
+    echo ""
     echo "  glm47      - GLM-4.7 (358B) - Latest flagship model from THUDM"
     echo "               vLLM: main, transformers>=5.0.0rc0"
     echo "               Requires ~358GB VRAM (FP8) or ~716GB (BF16)"
@@ -67,6 +72,16 @@ apply_preset() {
     local preset="$1"
 
     case "${preset}" in
+        glm51|GLM51|glm-5.1|GLM-5.1)
+            MODEL_ID="glm51"
+            # Pinned per the official vLLM GLM-5 recipe
+            # (https://github.com/vllm-project/recipes/blob/main/GLM/GLM5.md):
+            #   uv pip install "vllm==0.19.0" --torch-backend=auto
+            #   uv pip install "transformers>=5.4.0"
+            PRESET_VLLM_VERSION="v0.19.0"
+            PRESET_TRANSFORMERS=">=5.4.0"
+            PRESET_NOTES="GLM-5.1 (744B MoE+DSA): AWQ, multi-node TP=4 + PP=2, MTP speculative, glm47/glm45 parsers"
+            ;;
         glm47|GLM47|glm-4.7|GLM-4.7)
             MODEL_ID="glm47"
             PRESET_VLLM_VERSION="main"
@@ -123,7 +138,25 @@ apply_preset() {
 # =============================================================================
 
 WORKDIR="${WORKDIR:-$PWD}"
-NGC_IMAGE="docker://nvcr.io/nvidia/pytorch:25.12-py3"
+
+# NGC PyTorch base image tag. We need one new enough to:
+#
+#   1. Ship the TORCH_BOX macro (landed upstream 2025-11-11, pytorch v2.10.0).
+#      NGC 25.12 (Dec 2025) shipped the 2025-11-04 alpha which predates it by
+#      a week, so `_C_stable_libtorch` fails to compile.
+#
+#   2. Ship the stable-ABI converter that accepts reference op signatures.
+#      NGC 26.01 (Jan 2026) has TORCH_BOX but rejects vLLM v0.19.0's
+#      `const torch::stable::Tensor&` parameters with
+#      `static assertion failed` / `reference type ... in a union`.
+#
+# NGC 26.03 (Mar 2026) is the first tag late enough to satisfy both.
+#
+# vLLM v0.19.0 (Apr 2026) is the pinned version per the official recipe
+# (https://github.com/vllm-project/recipes/blob/main/GLM/GLM5.md). If you pin
+# a newer vLLM, you may need NGC_PYTORCH_TAG=26.04-py3 or later.
+NGC_PYTORCH_TAG="${NGC_PYTORCH_TAG:-26.03-py3}"
+NGC_IMAGE="${NGC_IMAGE:-docker://nvcr.io/nvidia/pytorch:${NGC_PYTORCH_TAG}}"
 
 # Container output directory (shared location on Olivia)
 CONTAINER_DIR="${CONTAINER_DIR:-}"
@@ -148,6 +181,13 @@ BUILD_INDEX="${BUILD_INDEX:-1}"
 SANDBOX_NAME="vllm-${MODEL_ID}-${BUILD_INDEX}-sandbox"
 SANDBOX_PATH="${CONTAINER_DIR}/${SANDBOX_NAME}"
 FINAL_IMAGE="${CONTAINER_DIR}/vllm-${MODEL_ID}-${BUILD_INDEX}.sif"
+
+# Path the finished sandbox should end up at. `SANDBOX_PATH` may be rewritten
+# to a temporary `.new.JOBID` path during the build so a failed run doesn't
+# corrupt the working container (see Phase 1 below). At the end of the build
+# we atomically rename the new sandbox into `FINAL_SANDBOX_PATH` and preserve
+# the previous one as `.prev.TIMESTAMP` for rollback.
+FINAL_SANDBOX_PATH="${SANDBOX_PATH}"
 
 # Cache directories (bind mount these to avoid filling container)
 CACHE_DIR="${WORKDIR}/cache"
@@ -203,8 +243,32 @@ echo "[Phase 1] Creating sandbox from NGC base image..."
 if [[ -d "${SANDBOX_PATH}" ]]; then
     if [[ "${BATCH_MODE}" == "1" ]]; then
         if [[ "${OVERWRITE}" == "1" ]]; then
-            echo "WARNING: Sandbox already exists. OVERWRITE=1 set, will rebuild."
-            echo "         Existing container: ${SANDBOX_PATH}"
+            # Build into a temporary sandbox path and swap atomically at the
+            # end. Previously this branch only printed a warning — the
+            # `if [[ ! -d "${SANDBOX_PATH}" ]]` guard below then short-circuited
+            # the `singularity build` call, so every "rebuild" silently reused
+            # the existing sandbox. Phase 3 still ran pip install on top, so
+            # the artifact looked plausible, but the base image layers
+            # (NGC PyTorch version, CUDA, etc.) never changed.
+            #
+            # Using a `.new.JOBID` path gives us two safety properties:
+            #   1. If any phase fails, the working sandbox is untouched.
+            #   2. On success, we preserve the previous sandbox as
+            #      `.prev.TIMESTAMP` so the user can manually roll back if
+            #      the new container has a latent runtime issue.
+            SWAP_TOKEN="${SLURM_JOB_ID:-$$}"
+            SANDBOX_PATH="${FINAL_SANDBOX_PATH}.new.${SWAP_TOKEN}"
+            echo "OVERWRITE=1: building into temporary sandbox path."
+            echo "  Existing (will be preserved until swap): ${FINAL_SANDBOX_PATH}"
+            echo "  Build target (temp):                     ${SANDBOX_PATH}"
+            # Clean up any orphan .new.* from a previous failed run — same
+            # build index, but different job ids would just pile up.
+            for stale in "${FINAL_SANDBOX_PATH}".new.*; do
+                if [[ -d "$stale" && "$stale" != "${SANDBOX_PATH}" ]]; then
+                    echo "  Removing stale build attempt: ${stale}"
+                    rm -rf "${stale}"
+                fi
+            done
             echo ""
         else
             echo ""
@@ -266,7 +330,7 @@ if torch.cuda.is_available():
         print(f'  GPU {i}: {torch.cuda.get_device_name(i)}')
 
 # Verify this is the NGC build
-assert 'nv25' in torch.__version__ or 'nv24' in torch.__version__, \
+assert any(m in torch.__version__ for m in ('nv24', 'nv25', 'nv26', 'nv27')), \
     f'Expected NGC PyTorch, got: {torch.__version__}'
 print('\\n✓ NGC PyTorch verified')
 "
@@ -316,16 +380,88 @@ if [[ -d vllm ]]; then
     rm -rf vllm
 fi
 
-# Clone vLLM (use specific version or main)
+# Clone vLLM (use specific version or main).
+#
+# We avoid `--depth 1` for tagged versions: setuptools_scm reads tag history to
+# derive the package version, and a shallow clone truncates history such that
+# even an exact tag checkout gets labeled `<next>.dev0+g<sha>.d<date>` instead
+# of the tag itself. That matters because vLLM's CMakeLists conditionally adds
+# targets based on the detected version, and the wrong version label can
+# silently activate code paths the pinned tag shouldn't include.
 VLLM_VERSION="${VLLM_VERSION:-main}"
 if [[ "$VLLM_VERSION" == "main" ]]; then
     git clone --depth 1 https://github.com/vllm-project/vllm.git
 else
-    git clone --depth 1 --branch "${VLLM_VERSION}" https://github.com/vllm-project/vllm.git
+    git clone --branch "${VLLM_VERSION}" https://github.com/vllm-project/vllm.git
 fi
 
 cd vllm
 echo "vLLM source cloned: $(git describe --tags --always 2>/dev/null || echo 'unknown')"
+
+# Safety check: if we're pinning a version older than the libtorch-stable
+# migration, the csrc/libtorch_stable directory won't exist and the disable
+# patch below is a no-op (which is what we want). If the directory DOES exist
+# on a pinned tag, our patch will silently drop ops like
+# `per_token_group_fp8_quant` that runtime code (deepseek_v2.py,
+# fp8_utils.py) unconditionally calls — producing a forward-pass AttributeError
+# later. Warn loudly so the operator can decide whether to proceed.
+if [[ -d "csrc/libtorch_stable" && "$VLLM_VERSION" != "main" ]]; then
+    echo ""
+    echo "================================================================"
+    echo "WARNING: vLLM ${VLLM_VERSION} ships csrc/libtorch_stable/."
+    echo "         Our NGC 25.12 patch disables that extension, which drops"
+    echo "         ops like per_token_group_fp8_quant (used by DeepSeek/GLM-"
+    echo "         family models at forward-pass time). The build will"
+    echo "         succeed but the resulting container will fail to load"
+    echo "         models that depend on those ops."
+    echo ""
+    echo "         Pin an older VLLM_VERSION that predates the stable-ABI"
+    echo "         migration, or switch to a build strategy that compiles"
+    echo "         _C_stable_libtorch (requires a newer NGC PyTorch with"
+    echo "         TORCH_BOX)."
+    echo "================================================================"
+    echo ""
+fi
+
+# NOTE: we previously patched out `_C_stable_libtorch` here because NGC 25.12's
+# PyTorch alpha (2025-11-04) predated the upstream TORCH_BOX macro (2025-11-11,
+# released in PyTorch 2.10.0). That workaround silently dropped ops like
+# per_token_group_fp8_quant from the _C namespace, which GLM-5.1's DSA indexer
+# calls unconditionally at forward-pass time. NGC 26.01+ ships a torch cut
+# from after TORCH_BOX landed, so the stable-ABI target compiles cleanly and
+# we want it built.
+
+# Patch: drop the `hoist=True` kwarg from register_opaque_type calls.
+# vLLM v0.19.0 calls `register_opaque_type(ModuleName, typ="value", hoist=True)`
+# at import time in vllm/utils/torch_utils.py. The `hoist=` kwarg was added
+# to PyTorch after NGC 26.03 (Feb 2026) was cut and NGC 26.04 isn't published
+# yet (as of Apr 2026), so `import vllm` fails with:
+#   TypeError: register_opaque_type() got an unexpected keyword argument 'hoist'
+# `hoist=True` only affects torch.compile graph hoisting; we run vLLM with
+# `--compilation-config {"mode": "NONE"}`, which means no dynamo/inductor
+# graphs get built and the feature is unused. Dropping the kwarg is safe
+# under that assumption. Revisit when we bump to an NGC with newer torch.
+echo "Patching vllm/utils/torch_utils.py: drop hoist= from register_opaque_type..."
+python3 << 'PYPATCH_HOIST'
+import re
+from pathlib import Path
+fp = Path('vllm/utils/torch_utils.py')
+if fp.exists():
+    src = fp.read_text()
+    # Narrow match: only strip `, hoist=<value>` inside a register_opaque_type(...) call.
+    new_src, n = re.subn(
+        r'(register_opaque_type\([^)]*?),\s*hoist\s*=\s*[A-Za-z0-9_]+',
+        r'\1',
+        src,
+    )
+    if n:
+        fp.write_text(new_src)
+        print(f"Patched {n} register_opaque_type call(s): dropped hoist= kwarg")
+    else:
+        print("No register_opaque_type(..., hoist=...) call found (OK, may be a newer vLLM)")
+else:
+    print(f"{fp} not found (OK, may be a newer vLLM layout)")
+PYPATCH_HOIST
 
 # Get current NGC PyTorch version for constraints
 NGC_TORCH_VERSION=$(python3 -c "import torch; print(torch.__version__)")
@@ -400,7 +536,7 @@ pip install --no-cache-dir \
     aiohttp \
     einops \
     protobuf \
-    ray \
+    "ray[default]" \
     psutil \
     cbor2 \
     cachetools \
@@ -437,6 +573,34 @@ pip install --no-cache-dir --no-deps --root-user-action=ignore flash-attn --no-b
     pip install --no-cache-dir --no-deps --root-user-action=ignore git+https://github.com/Dao-AILab/flash-attention.git --no-build-isolation 2>&1 | tail -20 || {
         echo "Warning: FlashAttention installation failed (may affect performance)"
     }
+}
+
+# Install DeepGEMM - required by GLM-5.1's DeepSeek Sparse Attention (DSA)
+# indexer and by the FP8 MoE kernel on Hopper. vLLM imports this at
+# model-init time when the architecture is GlmMoeDsaForCausalLM; without it
+# the engine refuses to start with:
+#   RuntimeError: Sparse Attention Indexer CUDA op requires DeepGEMM to be installed.
+#
+# DeepGEMM JIT-compiles its kernels at first use, so install itself is fast
+# (no CUDA compilation here). --no-deps keeps NGC PyTorch intact; failure is
+# tolerated so non-DSA presets (glm47, devstral, llama, qwen) still build.
+#
+# Pinned commit: 59f2c07 (2025-09-29, "Add SM100 kernels"). Rationale:
+# commit 38f8ef7 (2025-11-21) introduced an API break that now requires a
+# 2D `context_lens` tensor in fp8_mqa_logits(), but vLLM v0.19.0's wrapper
+# at `vllm/utils/deep_gemm.py` still passes a 1D `[B]` tensor. Newer
+# DeepGEMM versions (including main at the time of writing) fail every
+# request with:
+#   RuntimeError: Assertion error (csrc/apis/attention.hpp:195): context_lens.dim() == 2
+# 59f2c07 is the last commit that touches attention.hpp before that API
+# change landed, so it matches vLLM v0.19.0's call convention.
+echo ""
+DEEPGEMM_REF="${DEEPGEMM_REF:-59f2c07}"
+echo "Installing DeepGEMM @ ${DEEPGEMM_REF} (required for GLM-5.1 DSA indexer and FP8 MoE)..."
+pip install --no-cache-dir --no-deps --root-user-action=ignore --no-build-isolation \
+    "git+https://github.com/deepseek-ai/DeepGEMM.git@${DEEPGEMM_REF}" 2>&1 | tail -30 || {
+    echo "Warning: DeepGEMM install failed. GLM-5.1 (DSA) will not be able to load;"
+    echo "         other presets are unaffected. Override DEEPGEMM_REF to pin a commit."
 }
 
 # Build and install vLLM
@@ -500,7 +664,7 @@ python3 -c "
 import torch
 print(f'PyTorch version: {torch.__version__}')
 print(f'CUDA available: {torch.cuda.is_available()}')
-assert 'nv25' in torch.__version__ or 'nv24' in torch.__version__, \
+assert any(m in torch.__version__ for m in ('nv24', 'nv25', 'nv26', 'nv27')), \
     f'ERROR: NGC PyTorch was replaced! Got: {torch.__version__}'
 print('✓ NGC PyTorch preserved!')
 "
@@ -513,6 +677,19 @@ import vllm
 print(f'vLLM version: {vllm.__version__}')
 print('✓ vLLM imported successfully!')
 "
+
+# Verify DeepGEMM (GLM-5.1 DSA dependency). Non-fatal — if a preset doesn't
+# need DSA, this being missing is fine.
+echo ""
+echo "Verifying DeepGEMM..."
+python3 -c "
+try:
+    import deep_gemm
+    print(f'DeepGEMM: OK ({getattr(deep_gemm, \"__version__\", \"unknown\")})')
+except ImportError as e:
+    print(f'DeepGEMM: NOT INSTALLED ({e})')
+    print('  GLM-5.1 will not be able to load DSA indexer; other presets unaffected.')
+" || true
 
 echo ""
 echo "Build complete!"
@@ -545,9 +722,9 @@ if torch.cuda.is_available():
     print(f"GPU matmul test: ✓")
 
 # Verify NGC build
-if 'nv25' not in torch.__version__ and 'nv24' not in torch.__version__:
+if not any(m in torch.__version__ for m in ('nv24', 'nv25', 'nv26', 'nv27')):
     print(f"\n⚠ WARNING: This may not be NGC PyTorch!")
-    print(f"  Expected 'nv25' or 'nv24' in version string")
+    print(f"  Expected 'nv24'..'nv27' marker in version string")
 else:
     print(f"\n✓ NGC PyTorch confirmed")
 
@@ -588,6 +765,35 @@ if [[ "${BEFORE}" == "${AFTER}" ]]; then
 else
     echo "⚠ WARNING: PyTorch version changed!"
     echo "  The build may have replaced NGC PyTorch."
+fi
+
+# -----------------------------------------------------------------------------
+# Atomic sandbox swap (only when we built into a .new.JOBID temp path)
+# -----------------------------------------------------------------------------
+# If SANDBOX_PATH points somewhere other than FINAL_SANDBOX_PATH we built into
+# a temp location (OVERWRITE=1 with an existing sandbox present). Move the
+# previous sandbox aside as a rollback copy and promote the new one into
+# place. The pair of `mv`s is as atomic as the filesystem allows: there is no
+# window where FINAL_SANDBOX_PATH is missing. If the first mv succeeds but
+# the second fails (e.g. ENOSPC), the .prev.TIMESTAMP copy is still a valid
+# container — just under a different name.
+if [[ "${SANDBOX_PATH}" != "${FINAL_SANDBOX_PATH}" ]]; then
+    PREV_SUFFIX="prev.$(date +%Y%m%d-%H%M%S)"
+    PREV_PATH="${FINAL_SANDBOX_PATH}.${PREV_SUFFIX}"
+    echo ""
+    echo "=============================================="
+    echo "Swapping sandbox into place"
+    echo "=============================================="
+    echo "  Preserving old sandbox as: ${PREV_PATH}"
+    mv "${FINAL_SANDBOX_PATH}" "${PREV_PATH}"
+    echo "  Promoting new sandbox:     ${SANDBOX_PATH} -> ${FINAL_SANDBOX_PATH}"
+    mv "${SANDBOX_PATH}" "${FINAL_SANDBOX_PATH}"
+    SANDBOX_PATH="${FINAL_SANDBOX_PATH}"
+    echo ""
+    echo "Rollback: rm -rf '${FINAL_SANDBOX_PATH}' && mv '${PREV_PATH}' '${FINAL_SANDBOX_PATH}'"
+    echo "Once confirmed working, delete the backup with:"
+    echo "  rm -rf '${PREV_PATH}'"
+    echo ""
 fi
 
 # -----------------------------------------------------------------------------

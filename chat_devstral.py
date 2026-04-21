@@ -345,33 +345,47 @@ def main():
     parser.add_argument("--stream", action="store_true", help="Enable streaming responses")
     args = parser.parse_args()
     
+    # Probe the server first so the banner shows the model we're actually
+    # talking to (this client is used across multiple vLLM deployments —
+    # Devstral, GLM-4.7, GLM-5.1, etc. — so a hardcoded "Devstral" title was
+    # misleading).
+    chat = DevstralChat(args.host, args.port, args.stream)
+    connected = chat.check_server()
+
     if RICH_AVAILABLE:
-        console.print(Panel.fit(
-            "[bold cyan]Devstral Chat Client[/bold cyan]\n"
-            f"Connecting to [green]{args.host}:{args.port}[/green]",
-            border_style="cyan"
-        ))
+        if connected:
+            console.print(Panel.fit(
+                "[bold cyan]vLLM Chat Client[/bold cyan]\n"
+                f"Model:  [green]{chat.model}[/green]\n"
+                f"Server: [green]{args.host}:{args.port}[/green]",
+                border_style="cyan"
+            ))
+        else:
+            console.print(Panel.fit(
+                "[bold cyan]vLLM Chat Client[/bold cyan]\n"
+                f"Server: [green]{args.host}:{args.port}[/green]",
+                border_style="cyan"
+            ))
     else:
         print("=" * 60)
-        print("  Devstral Chat Client")
+        print("  vLLM Chat Client")
         print("=" * 60)
-        print(f"Connecting to {args.host}:{args.port}...")
-    
-    chat = DevstralChat(args.host, args.port, args.stream)
-    
-    if not chat.check_server():
+        if connected:
+            print(f"Model:  {chat.model}")
+        print(f"Server: {args.host}:{args.port}")
+
+    if not connected:
         if RICH_AVAILABLE:
             console.print(f"[bold red]Error:[/bold red] Cannot connect to server at {args.host}:{args.port}")
         else:
             print(f"Error: Cannot connect to server at {args.host}:{args.port}")
         sys.exit(1)
-    
+
     if RICH_AVAILABLE:
-        console.print(f"[green]✓[/green] Connected to model: [cyan]{chat.model}[/cyan]")
         console.print(f"[green]✓[/green] Streaming: [cyan]{'enabled' if chat.stream else 'disabled'}[/cyan]")
         console.print("\nType [cyan]/help[/cyan] for commands, [cyan]/quit[/cyan] to exit\n")
     else:
-        print(f"Connected to model: {chat.model}")
+        print(f"Streaming: {'enabled' if chat.stream else 'disabled'}")
         print(f"Streaming: {'enabled' if chat.stream else 'disabled'}")
         print("\nType /help for commands, /quit to exit\n")
     

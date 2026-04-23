@@ -29,62 +29,60 @@ from aiohttp import web
 
 @dataclass
 class BatchConfig:
-    """Token batching configuration."""
-    max_tokens: int = 15        # Flush after N tokens
-    max_chars: int = 100        # Flush after N characters
+    """SSE event batching configuration."""
+    max_tokens: int = 15        # Flush after N events (one per delta chunk)
+    max_chars: int = 100        # Flush after N bytes accumulated
     max_delay_ms: int = 150     # Flush after N milliseconds
-    flush_on_newline: bool = True  # Flush when content contains newline
+    flush_on_newline: bool = True  # Flush when any buffered chunk contains newline
 
 
 @dataclass
-class TokenBuffer:
-    """Buffer for accumulating tokens before sending."""
-    tokens: list = field(default_factory=list)
-    content: str = ""
-    first_token_time: Optional[float] = None
-    usage: Optional[dict] = None
+class EventBuffer:
+    """Buffer for accumulating raw SSE event lines before sending.
 
-    def add(self, token_content: str, usage: Optional[dict] = None):
-        if self.first_token_time is None:
-            self.first_token_time = time.time()
-        self.tokens.append(token_content)
-        self.content += token_content
-        if usage:
-            self.usage = usage
+    Format-agnostic: works equally for `delta.content` (vanilla models),
+    `delta.reasoning` (GLM-4.5/4.7/5.1 with --reasoning-parser), `delta.tool_calls`,
+    or any other delta field. The proxy used to extract `delta.content` and
+    rebuild a single batched event from it — that approach silently dropped any
+    chunk whose delta wasn't `content`, which broke completely on GLM-style
+    reasoning streams (no content tokens emitted to client).
+    """
+    events: list = field(default_factory=list)         # raw SSE lines (bytes)
+    bytes_total: int = 0
+    saw_newline: bool = False
+    first_event_time: Optional[float] = None
+
+    def add(self, sse_line: bytes, content_text: str = ""):
+        if self.first_event_time is None:
+            self.first_event_time = time.time()
+        self.events.append(sse_line)
+        self.bytes_total += len(sse_line)
+        if content_text and "\n" in content_text:
+            self.saw_newline = True
 
     def should_flush(self, config: BatchConfig) -> bool:
-        if not self.tokens:
+        if not self.events:
             return False
-
-        # Check token count
-        if len(self.tokens) >= config.max_tokens:
+        if len(self.events) >= config.max_tokens:
             return True
-
-        # Check character count
-        if len(self.content) >= config.max_chars:
+        if self.bytes_total >= config.max_chars:
             return True
-
-        # Check time elapsed
-        if self.first_token_time:
-            elapsed_ms = (time.time() - self.first_token_time) * 1000
+        if self.first_event_time:
+            elapsed_ms = (time.time() - self.first_event_time) * 1000
             if elapsed_ms >= config.max_delay_ms:
                 return True
-
-        # Check for newlines
-        if config.flush_on_newline and '\n' in self.content:
+        if config.flush_on_newline and self.saw_newline:
             return True
-
         return False
 
-    def flush(self) -> tuple[str, Optional[dict]]:
-        """Return accumulated content and reset buffer."""
-        content = self.content
-        usage = self.usage
-        self.tokens = []
-        self.content = ""
-        self.first_token_time = None
-        self.usage = None
-        return content, usage
+    def flush(self) -> bytes:
+        """Return concatenated SSE bytes and reset buffer."""
+        out = b"".join(self.events)
+        self.events = []
+        self.bytes_total = 0
+        self.saw_newline = False
+        self.first_event_time = None
+        return out
 
 
 class VLLMProxy:
@@ -121,7 +119,9 @@ class VLLMProxy:
                 data = await resp.json()
                 return web.json_response(data, status=resp.status)
 
-        # Streaming: batch tokens before forwarding
+        # Streaming: batch raw SSE bytes before forwarding. We do NOT inspect
+        # or rewrite delta payloads — that lets the proxy work for any delta
+        # field (content, reasoning, tool_calls, ...) without per-format code.
         response = web.StreamResponse(
             status=200,
             headers={
@@ -133,34 +133,11 @@ class VLLMProxy:
         )
         await response.prepare(request)
 
-        buffer = TokenBuffer()
-        chunk_id = None
-        model = None
+        buffer = EventBuffer()
 
         async def flush_buffer():
-            """Send batched tokens as single SSE event."""
-            nonlocal buffer
-            if not buffer.content:
-                return
-
-            content, usage = buffer.flush()
-
-            # Construct batched SSE event (same format as vLLM)
-            event_data = {
-                "id": chunk_id,
-                "object": "chat.completion.chunk",
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"content": content},
-                    "finish_reason": None
-                }]
-            }
-            if usage:
-                event_data["usage"] = usage
-
-            sse_line = f"data: {json.dumps(event_data)}\n\n"
-            await response.write(sse_line.encode())
+            if buffer.events:
+                await response.write(buffer.flush())
 
         try:
             async with self.session.post(
@@ -168,52 +145,81 @@ class VLLMProxy:
                 json=body,
                 headers={"Content-Type": "application/json"}
             ) as upstream:
-                async for line in upstream.content:
-                    line = line.decode('utf-8').strip()
+                # iter_chunked instead of line-by-line: reading raw bytes lets
+                # us forward exact upstream framing, and lines are
+                # newline-terminated SSE frames so we still split correctly.
+                pending = b""
+                async for chunk in upstream.content.iter_any():
+                    pending += chunk
+                    # Split into complete SSE lines (keep trailing partial line
+                    # in `pending` for the next iteration).
+                    while b"\n" in pending:
+                        line, pending = pending.split(b"\n", 1)
+                        # Re-attach the newline so downstream parsers see
+                        # framing exactly as vLLM emits it.
+                        line_with_nl = line + b"\n"
 
-                    if not line or not line.startswith("data: "):
-                        continue
+                        # Inspect the line just enough to (a) detect [DONE],
+                        # (b) detect finish events that should flush+forward
+                        # immediately, (c) sniff content/reasoning text for
+                        # newline-flush heuristic. No payload rewriting.
+                        stripped = line.strip()
+                        if not stripped or not stripped.startswith(b"data: "):
+                            # Forward blank lines / comments as-is (preserves
+                            # SSE inter-event spacing).
+                            buffer.add(line_with_nl)
+                            continue
 
-                    data_str = line[6:]  # Remove "data: " prefix
+                        data_str = stripped[6:].decode("utf-8", errors="replace")
 
-                    if data_str == "[DONE]":
-                        # Flush any remaining tokens
-                        await flush_buffer()
-                        await response.write(b"data: [DONE]\n\n")
-                        break
+                        if data_str == "[DONE]":
+                            await flush_buffer()
+                            await response.write(line_with_nl)
+                            # Drain any remaining bytes (usually empty) and
+                            # exit the outer chunk loop on next iteration.
+                            if pending.strip():
+                                await response.write(pending)
+                            pending = b""
+                            break
 
-                    try:
-                        data = json.loads(data_str)
+                        # For known JSON events: peek to extract finish flag
+                        # and content text; if parse fails, just batch as-is.
+                        text_for_newline_check = ""
+                        is_finish_event = False
+                        try:
+                            data = json.loads(data_str)
+                            choices = data.get("choices", [])
+                            if choices:
+                                delta = choices[0].get("delta") or {}
+                                # Sample any text-bearing delta field for the
+                                # newline-flush heuristic.
+                                for fld in ("content", "reasoning", "reasoning_content"):
+                                    v = delta.get(fld)
+                                    if isinstance(v, str):
+                                        text_for_newline_check += v
+                                if choices[0].get("finish_reason"):
+                                    is_finish_event = True
+                        except json.JSONDecodeError:
+                            pass
 
-                        # Capture metadata from first chunk
-                        if chunk_id is None:
-                            chunk_id = data.get("id")
-                            model = data.get("model")
+                        buffer.add(line_with_nl, text_for_newline_check)
 
-                        # Extract token content
-                        choices = data.get("choices", [])
-                        if choices:
-                            delta = choices[0].get("delta", {})
-                            content = delta.get("content", "")
-
-                            # Check for finish
-                            finish_reason = choices[0].get("finish_reason")
-                            if finish_reason:
-                                await flush_buffer()
-                                # Forward the finish event as-is
-                                await response.write(f"data: {data_str}\n\n".encode())
-                                continue
-
-                            if content:
-                                usage = data.get("usage")
-                                buffer.add(content, usage)
-
-                                if buffer.should_flush(self.batch_config):
-                                    await flush_buffer()
-
-                    except json.JSONDecodeError:
-                        # Forward malformed data as-is
-                        await response.write(f"{line}\n\n".encode())
+                        if is_finish_event:
+                            # Flush immediately so the client sees finish_reason
+                            # without waiting for the timer.
+                            await flush_buffer()
+                        elif buffer.should_flush(self.batch_config):
+                            await flush_buffer()
+                    else:
+                        # No newline yet; check if a time-based flush should
+                        # fire so we don't sit on partially-batched data while
+                        # the upstream is mid-chunk.
+                        if buffer.should_flush(self.batch_config):
+                            await flush_buffer()
+                # Final drain in case the upstream ended without [DONE].
+                if pending:
+                    buffer.add(pending)
+                await flush_buffer()
 
         except Exception as e:
             error_event = {"error": str(e)}

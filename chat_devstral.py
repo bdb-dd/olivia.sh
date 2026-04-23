@@ -257,6 +257,105 @@ class DevstralChat:
         """Clear conversation history."""
         self.conversation_history = []
         self.turn_count = 0
+
+    def _bench_one(self, prompt: str, max_tokens: int) -> Optional[Dict[str, Any]]:
+        """Single silent streaming request — TTFT + raw token counts. No history."""
+        payload = {
+            "model": self.model or "default",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_tokens": max_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        start = time.time()
+        first_token_time = None
+        completion_tokens = 0
+        prompt_tokens = 0
+        try:
+            resp = requests.post(
+                f"{self.base_url}/v1/chat/completions",
+                json=payload, stream=True, timeout=600,
+            )
+            if resp.status_code != 200:
+                return None
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                line = line.decode("utf-8")
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str == "[DONE]":
+                    break
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                if first_token_time is None and data.get("choices"):
+                    delta = data["choices"][0].get("delta", {})
+                    # GLM-5.1 with --reasoning-parser glm45 emits reasoning tokens via
+                    # `delta.reasoning`; non-reasoning models use `delta.content`.
+                    # Either counts as the first generated token for TTFT purposes.
+                    if delta.get("content") or delta.get("reasoning"):
+                        first_token_time = time.time() - start
+                usage = data.get("usage")
+                if usage:
+                    prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+                    completion_tokens = usage.get("completion_tokens", completion_tokens)
+        except Exception:
+            return None
+        total = time.time() - start
+        return {
+            "ttft": first_token_time or 0.0,
+            "total": total,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+        }
+
+    def benchmark(self, prompt: str, n: int, max_tokens: int, warmup: int = 1) -> int:
+        """Run prompt N times, report per-run and aggregate metrics. Returns exit code."""
+        if not self.model:
+            print(f"Error: not connected to {self.base_url}")
+            return 1
+        print(f"Server: {self.base_url}")
+        print(f"Model:  {self.model}")
+        print(f"Prompt ({len(prompt)} chars): {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
+        print(f"Runs:   {n}  (+ {warmup} warmup)   max_tokens={max_tokens}")
+        print()
+        # Warmup — captures prefix-cache and JIT warm states without affecting averages
+        for i in range(warmup):
+            r = self._bench_one(prompt, max_tokens)
+            if r is None:
+                print(f"warmup {i+1}: FAILED")
+                return 1
+            print(f"warmup {i+1}: ttft={r['ttft']*1000:.0f}ms  decode={(r['completion_tokens']-1)/max(r['total']-r['ttft'], 1e-9):.2f} tok/s  ({r['completion_tokens']} out)")
+        print()
+        header = f"{'run':>4}  {'prompt':>7}  {'output':>7}  {'TTFT':>9}  {'decode tok/s':>13}  {'total':>9}"
+        print(header)
+        print("-" * len(header))
+        results = []
+        for i in range(1, n + 1):
+            r = self._bench_one(prompt, max_tokens)
+            if r is None:
+                print(f"{i:>4}  FAILED")
+                continue
+            decode_toks = (r["completion_tokens"] - 1) / max(r["total"] - r["ttft"], 1e-9)
+            print(f"{i:>4}  {r['prompt_tokens']:>7}  {r['completion_tokens']:>7}  {r['ttft']*1000:>7.0f}ms  {decode_toks:>11.2f}    {r['total']:>7.2f}s")
+            results.append((r, decode_toks))
+        if not results:
+            return 1
+        n_ok = len(results)
+        avg_ttft = sum(r["ttft"] for r, _ in results) / n_ok
+        avg_decode = sum(d for _, d in results) / n_ok
+        avg_total_toks_per_s = sum(r["completion_tokens"] / r["total"] for r, _ in results if r["total"] > 0) / n_ok
+        avg_out = sum(r["completion_tokens"] for r, _ in results) / n_ok
+        print("-" * len(header))
+        print(f"avg over {n_ok} run(s):")
+        print(f"  TTFT:               {avg_ttft*1000:.0f}ms")
+        print(f"  decode (post-TTFT): {avg_decode:.2f} tok/s")
+        print(f"  end-to-end:         {avg_total_toks_per_s:.2f} tok/s  ({avg_out:.0f} out tokens avg)")
+        return 0
     
     def get_stats_table(self) -> Table:
         """Get stats as a rich table."""
@@ -343,7 +442,19 @@ def main():
     parser.add_argument("host", help="vLLM server hostname")
     parser.add_argument("--port", type=int, default=8000, help="Server port (default: 8000)")
     parser.add_argument("--stream", action="store_true", help="Enable streaming responses")
+    parser.add_argument("--bench", metavar="PROMPT", help="Run a non-interactive benchmark with PROMPT and exit")
+    parser.add_argument("-n", "--runs", type=int, default=3, help="Bench: number of measured runs (default 3)")
+    parser.add_argument("--max-tokens", type=int, default=256, help="Bench: max output tokens per run (default 256)")
+    parser.add_argument("--warmup", type=int, default=1, help="Bench: warmup runs excluded from averages (default 1)")
     args = parser.parse_args()
+
+    # Benchmark mode: non-interactive, exit when done.
+    if args.bench:
+        chat = DevstralChat(args.host, args.port, stream=True)
+        if not chat.check_server():
+            print(f"Error: Cannot connect to server at {args.host}:{args.port}")
+            sys.exit(1)
+        sys.exit(chat.benchmark(args.bench, args.runs, args.max_tokens, args.warmup))
     
     # Probe the server first so the banner shows the model we're actually
     # talking to (this client is used across multiple vLLM deployments —

@@ -146,6 +146,11 @@ DeepSeek Sparse Attention's `DEEPSEEK_V32_INDEXER` backend.
   `glm51` spent ~20 minutes of a 2-node × 4-GPU allocation just
   downloading `cyankiwi/GLM-5.1-AWQ-4bit`; subsequent launches are fast
   because the cache is warm.
-- Generation is slow because `--compilation-config {"mode": "NONE"}`
-  disables CUDAGraph capture. Turning that on is the next obvious
-  throughput win but needs a separate validation pass.
+- `CUDAGRAPH_MODE` env var now controls vLLM compilation/CUDAGraph
+  capture. Default (unset) lets vLLM auto-select, which on glm51 should
+  land on `PIECEWISE` or `FULL_AND_PIECEWISE` and unlock 2-5× decode
+  throughput vs. pure eager. Startup gains a multi-minute "Capturing
+  cudagraph" phase. If capture hangs or crashes (known hazards:
+  PP=2 cross-node collectives, DSA dynamic shapes, MoE routing), fall
+  back with `CUDAGRAPH_MODE=NONE` — no code revert needed. Previously
+  this was hardcoded to `NONE` in `VLLM_ARGS`.

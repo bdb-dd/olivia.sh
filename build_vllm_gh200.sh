@@ -437,10 +437,13 @@ fi
 # to PyTorch after NGC 26.03 (Feb 2026) was cut and NGC 26.04 isn't published
 # yet (as of Apr 2026), so `import vllm` fails with:
 #   TypeError: register_opaque_type() got an unexpected keyword argument 'hoist'
-# `hoist=True` only affects torch.compile graph hoisting; we run vLLM with
-# `--compilation-config {"mode": "NONE"}`, which means no dynamo/inductor
-# graphs get built and the feature is unused. Dropping the kwarg is safe
-# under that assumption. Revisit when we bump to an NGC with newer torch.
+# `hoist=True` only controls a torch.compile dynamo-graph hoisting optimization
+# for opaque-typed values — dropping it is safe for import, and CUDAGraph
+# capture still runs. Note: a separate NGC-26.03-vs-vLLM-v0.19.0 skew around
+# ModuleName.__fx_repr__ (set vs dict contract) is patched further below;
+# that one only trips when dynamo codegen actually runs, i.e. under
+# CUDAGRAPH_MODE != NONE. Revisit both patches when we bump to an NGC with
+# newer torch.
 echo "Patching vllm/utils/torch_utils.py: drop hoist= from register_opaque_type..."
 python3 << 'PYPATCH_HOIST'
 import re
@@ -462,6 +465,40 @@ if fp.exists():
 else:
     print(f"{fp} not found (OK, may be a newer vLLM layout)")
 PYPATCH_HOIST
+
+# Patch: fix ModuleName.__fx_repr__ to return dict instead of set.
+# vLLM v0.19.0 returns `(repr_str, {ModuleName})` (a set literal) as the second
+# element of __fx_repr__, targeting a newer torch._library.opaque_object API.
+# NGC 26.03's PyTorch enforces `(repr_str, dict[str, type])` and rejects set
+# with:
+#   TypeError: __fx_repr__ for ModuleName must return a dict as the second
+#              element, got set
+# The error only surfaces under CUDAGraph capture (dynamo fx codegen path).
+# With mode=NONE, codegen never runs, so the patch wasn't needed until we
+# flipped the default. The globals_dict is used by dynamo to resolve names in
+# the generated FX code — since the repr string is `ModuleName(...)`, we map
+# the string "ModuleName" to the class. Revisit when NGC ships a torch with
+# the set-accepting variant.
+echo "Patching vllm/utils/torch_utils.py: ModuleName.__fx_repr__ set -> dict..."
+python3 << 'PYPATCH_FXREPR'
+from pathlib import Path
+fp = Path('vllm/utils/torch_utils.py')
+if fp.exists():
+    src = fp.read_text()
+    old = '{ModuleName})'
+    new = '{"ModuleName": ModuleName})'
+    # Narrow: the set literal {ModuleName} only appears as __fx_repr__'s return.
+    count = src.count(old)
+    if count == 1:
+        fp.write_text(src.replace(old, new, 1))
+        print("Patched ModuleName.__fx_repr__: set {ModuleName} -> dict {\"ModuleName\": ModuleName}")
+    elif count == 0:
+        print("No {ModuleName} set literal found (OK, may be a newer vLLM)")
+    else:
+        print(f"WARNING: expected 1 match, found {count} — patch skipped, inspect manually")
+else:
+    print(f"{fp} not found (OK, may be a newer vLLM layout)")
+PYPATCH_FXREPR
 
 # Get current NGC PyTorch version for constraints
 NGC_TORCH_VERSION=$(python3 -c "import torch; print(torch.__version__)")

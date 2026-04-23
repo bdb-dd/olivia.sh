@@ -84,6 +84,29 @@ MTP_SPECULATIVE_TOKENS="${MTP_SPECULATIVE_TOKENS:-3}"  # MTP speculative tokens 
 # Expert parallel is required for AWQ-quantized MoE models to shard experts across GPUs
 ENABLE_EXPERT_PARALLEL="${ENABLE_EXPERT_PARALLEL:-auto}"  # auto, 0, or 1
 
+# CUDAGraph / vLLM compilation knob. Note this conflates two distinct fields
+# in vLLM's compilation-config:
+#   - `mode`: compilation backend (NONE | STOCK_TORCH_COMPILE | DYNAMO_TRACE_ONCE | VLLM_COMPILE)
+#   - `cudagraph_mode`: capture strategy (NONE | PIECEWISE | FULL_AND_PIECEWISE | ...)
+# We expose a single env var because the practical choices are:
+#   - unset (default) -> let vLLM auto-select; on glm51 this picks
+#       mode=VLLM_COMPILE + cudagraph_mode=FULL_AND_PIECEWISE.
+#   - NONE -> emit `{"mode": "NONE"}`, fully disable compilation+capture (the
+#       legacy hardcoded behavior; eager dispatch, robust, ~5× slower decode).
+#   - PIECEWISE / FULL_AND_PIECEWISE / FULL -> emit
+#       `{"cudagraph_mode": "<value>"}`, keep compilation enabled and only
+#       override the capture strategy.
+CUDAGRAPH_MODE="${CUDAGRAPH_MODE:-}"
+
+# vLLM's custom all-reduce kernel is NOT CUDAGraph-safe under TP=4+PP=2 multi-
+# node on Slingshot — it raises `cudaErrorInvalidValue` at custom_all_reduce.cuh:455
+# during the cudagraph capture phase, killing all Ray workers with SYSTEM_ERROR.
+# NCCL's all-reduce IS graph-safe; falling back to it costs a few % on small
+# reductions but unlocks the ~5× decode speedup from CUDAGraph capture.
+# auto = on whenever CUDAGRAPH_MODE != NONE (i.e. whenever capture runs).
+# Set to 0 to keep custom kernel even with capture enabled (will likely crash).
+DISABLE_CUSTOM_ALL_REDUCE="${DISABLE_CUSTOM_ALL_REDUCE:-auto}"
+
 # Cache directories. All cache paths must live on the project filesystem
 # (CONTAINER_DIR is under /cluster/work/... on Olivia, which has generous
 # quota). Defaulting Triton / DeepGEMM JIT caches to user home causes jobs
@@ -93,6 +116,13 @@ ENABLE_EXPERT_PARALLEL="${ENABLE_EXPERT_PARALLEL:-auto}"  # auto, 0, or 1
 # pass when cache landed under ~/.triton).
 HF_CACHE="${HF_CACHE:-$PWD/cache/huggingface}"
 VLLM_CACHE="${VLLM_CACHE:-$PWD/cache/vllm}"
+# VLLM_CACHE_ROOT: controls where vLLM writes torch_compile_cache, modelinfos,
+# deep_gemm warmup caches, etc. Default inside vLLM is `~/.cache/vllm`; since
+# Singularity preserves host UID, `~` resolves to the user's home dir (small
+# quota), NOT /root/.cache/vllm (which is where we bind VLLM_CACHE below). Must
+# be set explicitly for CUDAGraph capture to work — compile cache is many
+# shapes × layers and blows past home quota on GLM-5.1.
+VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${VLLM_CACHE}}"
 TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$PWD/cache/triton}"
 DG_JIT_CACHE_DIR="${DG_JIT_CACHE_DIR:-$PWD/cache/deep_gemm}"
 TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$PWD/cache/torchinductor}"
@@ -107,7 +137,7 @@ fi
 # Environment setup
 # -----------------------------------------------------------------------------
 
-mkdir -p "${HF_CACHE}" "${VLLM_CACHE}" "${TRITON_CACHE_DIR}" "${DG_JIT_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}"
+mkdir -p "${HF_CACHE}" "${VLLM_CACHE}" "${VLLM_CACHE_ROOT}" "${TRITON_CACHE_DIR}" "${DG_JIT_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}"
 
 # GPU ordering: Put slowest GPU (usually GPU 0) last
 # This improves tensor parallel performance on GH200
@@ -174,6 +204,7 @@ echo "  GPU Memory:       ${GPU_MEM_UTIL}"
 echo "  Max Model Len:    ${MAX_MODEL_LEN}"
 echo "  Port:             ${PORT}"
 echo "  Log Level:        ${VLLM_LOGGING_LEVEL}"
+echo "  CUDAGraph Mode:   ${CUDAGRAPH_MODE:-<auto-select>}"
 if [[ "${VERBOSE}" == "1" ]]; then
     echo "  VERBOSE mode:     ON (Ray backend=${RAY_BACKEND_LOG_LEVEL}, dedup=${RAY_DEDUP_LOGS}, NCCL=${NCCL_DEBUG})"
 fi
@@ -244,6 +275,19 @@ elif [[ "${ENABLE_EXPERT_PARALLEL}" == "auto" ]]; then
     if [[ "${IS_AWQ}" == "1" && "${IS_GLM_MOE}" == "1" ]]; then
         USE_EXPERT_PARALLEL=1
         echo "[INFO] Auto-enabling expert parallel for AWQ MoE model"
+    fi
+fi
+
+# Resolve DISABLE_CUSTOM_ALL_REDUCE: auto = on whenever capture is on.
+# Capture is on whenever CUDAGRAPH_MODE is unset (auto-select picks a non-NONE
+# mode) or set to anything other than NONE.
+USE_DISABLE_CUSTOM_AR=0
+if [[ "${DISABLE_CUSTOM_ALL_REDUCE}" == "1" ]]; then
+    USE_DISABLE_CUSTOM_AR=1
+elif [[ "${DISABLE_CUSTOM_ALL_REDUCE}" == "auto" ]]; then
+    if [[ "${CUDAGRAPH_MODE}" != "NONE" ]]; then
+        USE_DISABLE_CUSTOM_AR=1
+        echo "[INFO] Auto-disabling vLLM custom all-reduce: incompatible with CUDAGraph capture"
     fi
 fi
 
@@ -525,8 +569,22 @@ VLLM_ARGS=(
     "--max-model-len" "${MAX_MODEL_LEN}"
     "--host" "${HOST}"
     "--port" "${PORT}"
-    "--compilation-config" '{"mode": "NONE"}'
 )
+
+# CUDAGraph knob. NONE → disable all compilation (mode=NONE). Anything else →
+# keep compilation enabled and only override cudagraph_mode. Unset → no flag,
+# vLLM auto-selects.
+if [[ "${CUDAGRAPH_MODE}" == "NONE" ]]; then
+    VLLM_ARGS+=("--compilation-config" '{"mode": "NONE"}')
+elif [[ -n "${CUDAGRAPH_MODE}" ]]; then
+    VLLM_ARGS+=("--compilation-config" "{\"cudagraph_mode\": \"${CUDAGRAPH_MODE}\"}")
+fi
+
+# Disable vLLM's custom all-reduce when CUDAGraph capture runs (custom kernel
+# raises cudaErrorInvalidValue under graph capture; NCCL all-reduce works fine).
+if [[ "${USE_DISABLE_CUSTOM_AR}" == "1" ]]; then
+    VLLM_ARGS+=("--disable-custom-all-reduce")
+fi
 
 # Only pin the attention backend when we have an explicit choice. For GLM-5.1
 # (sparse MLA) we leave this empty so vLLM auto-selects a compatible backend.
@@ -770,8 +828,9 @@ SING_CMD=(
     --env "TRITON_CACHE_DIR=${TRITON_CACHE_DIR}"
     --env "DG_JIT_CACHE_DIR=${DG_JIT_CACHE_DIR}"
     --env "TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR}"
+    --env "VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT}"
     --bind "${HF_CACHE}:${HF_CACHE}"
-    --bind "${VLLM_CACHE}:/root/.cache/vllm"
+    --bind "${VLLM_CACHE_ROOT}:${VLLM_CACHE_ROOT}"
     --bind "${TRITON_CACHE_DIR}:${TRITON_CACHE_DIR}"
     --bind "${DG_JIT_CACHE_DIR}:${DG_JIT_CACHE_DIR}"
     --bind "${TORCHINDUCTOR_CACHE_DIR}:${TORCHINDUCTOR_CACHE_DIR}"

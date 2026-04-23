@@ -231,6 +231,7 @@ Runs vLLM server with GH200-optimized settings:
 - `VLLM_ATTENTION_BACKEND`: Attention backend (default: `FLASH_ATTN`)
 - `VERBOSE`: Set to `1` for detailed logging including weight loading progress (default: `0`)
 - `VLLM_LOGGING_LEVEL`: Logging level - `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`, or `DEBUG` if VERBOSE=1)
+- `CUDAGRAPH_MODE`: vLLM compilation / CUDAGraph mode (default: unset → vLLM auto-selects `PIECEWISE` or `FULL_AND_PIECEWISE`). Set `NONE` to disable graph capture (eager, slow — debugging escape hatch). Capture adds a multi-minute "Capturing cudagraph" phase at startup but typically yields 2-5× decode throughput.
 
 **Speculative Decoding (ngram):**
 - `ENABLE_SPECULATIVE`: Enable speculative decoding (default: `0`)

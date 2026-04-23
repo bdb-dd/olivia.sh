@@ -818,7 +818,7 @@ start_server_job() {
     # Forward selected debug/tuning env vars if the caller set them. Useful for
     # diagnosing startup hangs: `VERBOSE=1 ./olivia.sh server start glm51`
     # flips vLLM, Ray, and NCCL to verbose logging inside the SLURM job.
-    for forward_var in VERBOSE VLLM_LOGGING_LEVEL RAY_BACKEND_LOG_LEVEL RAY_DEDUP_LOGS NCCL_DEBUG; do
+    for forward_var in VERBOSE VLLM_LOGGING_LEVEL RAY_BACKEND_LOG_LEVEL RAY_DEDUP_LOGS NCCL_DEBUG CUDAGRAPH_MODE; do
         if [[ -n "${!forward_var:-}" ]]; then
             env_vars+=" ${forward_var}=${!forward_var}"
         fi

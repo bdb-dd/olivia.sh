@@ -1993,7 +1993,7 @@ sinfo_data=$(sinfo -p "$PARTITION" -h -N --Format="StateLong:20,GresUsed:40")
 total_nodes=$(echo "$sinfo_data" | grep -c .)
 total_gpus=$(( total_nodes * 4 ))   # all accel nodes are h200:4
 
-declare -A state_count
+declare -A state_count free_slot_count
 used_gpus=0; nonusable_gpus=0
 while IFS= read -r line; do
     [ -z "$line" ] && continue
@@ -2006,6 +2006,13 @@ while IFS= read -r line; do
     case "$state" in
         (draining|drained|down|reserved|maint|fail*|unknown)
             nonusable_gpus=$(( nonusable_gpus + 4 - used_n ))
+            ;;
+        (idle|mixed|allocated)
+            # Bucket schedulable nodes by how many GPUs are free on each.
+            # The bucket count at key=4 is the number of nodes that can serve
+            # a fresh single-node 4-GPU request right now.
+            free_on_node=$(( 4 - used_n ))
+            free_slot_count[$free_on_node]=$(( ${free_slot_count[$free_on_node]:-0} + 1 ))
             ;;
     esac
 done <<< "$sinfo_data"
@@ -2024,6 +2031,33 @@ for state in "${!state_count[@]}"; do
 done | sort
 echo
 
+# Fragmentation: explains why "free GPUs" can be high while pending jobs wait.
+# A 4-GPU single-node job needs one full slot; a 2-node × 4-GPU job needs two.
+# Scattered 1- or 2-GPU holes don't satisfy either, even if they sum high.
+printf "  ${BLD}Free-slot fragmentation${RST} (schedulable nodes only):\n"
+full4=${free_slot_count[4]:-0}
+any_free=0
+for k in 4 3 2 1; do
+    c=${free_slot_count[$k]:-0}
+    [ "$c" -eq 0 ] && continue
+    any_free=1
+    case "$k" in
+        (4) label="full 4-GPU nodes (each can start one single-node 4-GPU job)";;
+        (3) label="nodes with 3 free GPUs (unusable for 4-GPU shapes)";;
+        (2) label="nodes with 2 free GPUs (unusable for 4-GPU shapes)";;
+        (1) label="nodes with 1 free GPU  (unusable for 4-GPU shapes)";;
+    esac
+    printf "    %3d × %s\n" "$c" "$label"
+done
+[ "$any_free" -eq 0 ] && printf "    (no free slots on schedulable nodes)\n"
+# Multi-node feasibility callout: PP=2 shape (glm51) needs 2 full nodes.
+if [ "$full4" -ge 2 ]; then
+    printf "    ${GRN}→${RST} 2-node × 4-GPU shape can start now (%d full nodes available)\n" "$full4"
+else
+    printf "    ${YEL}→${RST} 2-node × 4-GPU shape cannot start now (%d/2 full nodes available)\n" "$full4"
+fi
+echo
+
 # --- 3. Queue summary --------------------------------------------------------
 printf "${BLU}==>${RST} ${BLD}Queue (partition=${PARTITION})${RST}\n"
 total_running=$(squeue -p "$PARTITION" -h -t RUNNING -o "%i" | wc -l)
@@ -2031,6 +2065,17 @@ total_pending=$(squeue -p "$PARTITION" -h -t PENDING -o "%i" | wc -l)
 unique_users=$(squeue -p "$PARTITION" -h -o "%u" | sort -u | wc -l)
 printf "  RUNNING: %3d jobs across %d users\n" "$total_running" "$unique_users"
 printf "  PENDING: %3d jobs in queue\n" "$total_pending"
+
+# Pending-reason histogram — SLURM's own verdict on why jobs aren't running.
+# Useful for distinguishing normal queue pressure (Priority/Resources) from
+# cluster-wide issues (ReqNodeNotAvail during maintenance, QOS ceilings).
+if [ "$total_pending" -gt 0 ]; then
+    printf "\n  ${BLD}Pending reasons${RST}:\n"
+    squeue -p "$PARTITION" -h -t PENDING -o '%R' \
+        | sed 's/^(\(.*\))$/\1/' \
+        | sort | uniq -c | sort -rn | head -8 \
+        | awk '{n=$1; $1=""; sub(/^ /,""); printf "    %3d × %s\n", n, $0}'
+fi
 
 # Your position in the pending queue (rank by submit time, oldest first).
 if [ "$pending_count" -gt 0 ]; then

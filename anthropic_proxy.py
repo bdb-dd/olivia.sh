@@ -322,6 +322,10 @@ class AnthropicStreamWriter:
         self.message_id = _msg_id()
         self.started = False
         self.closed = False
+        # Set when the client hangs up mid-stream (socket reset while we're
+        # writing). After this, every _emit becomes a no-op, and translate_stream
+        # uses it to break out of the upstream-read loop early.
+        self.client_gone = False
         self.current_block_index: Optional[int] = None
         self.current_block_type: Optional[str] = None  # "thinking" | "text" | "tool_use"
         self.current_tool_call_idx: Optional[int] = None
@@ -330,8 +334,18 @@ class AnthropicStreamWriter:
         self.completion_tokens = 0
 
     async def _emit(self, event_name: str, payload: dict) -> None:
+        if self.client_gone:
+            return
         frame = f"event: {event_name}\ndata: {json.dumps(payload)}\n\n"
-        await self.response.write(frame.encode())
+        try:
+            await self.response.write(frame.encode())
+        except (ConnectionError, aiohttp.ClientConnectionResetError):
+            # Client closed the SSE connection before we finished streaming
+            # (e.g. upstream stalled and the Anthropic SDK hit its timeout).
+            # Nothing useful to send anymore; mark and suppress so the rest
+            # of finalize() / the upstream loop can wind down cleanly.
+            self.client_gone = True
+            log.warning("client disconnected mid-stream; suppressing further emits")
 
     async def ensure_started(self) -> None:
         if self.started:
@@ -476,6 +490,11 @@ async def translate_stream(
 
     try:
         async for chunk in upstream.content.iter_any():
+            if writer.client_gone:
+                # Client hung up — stop reading upstream so the underlying
+                # connection can be released by the ``async with`` in the
+                # caller. Otherwise we'd drain the remainder into /dev/null.
+                break
             pending += chunk
             while b"\n" in pending:
                 raw, pending = pending.split(b"\n", 1)
@@ -540,19 +559,75 @@ def _error_response(status: int, err_type: str, message: str) -> web.Response:
 
 
 class AnthropicProxy:
-    def __init__(self, upstream_url: str, model: str):
+    def __init__(self, upstream_url: str, model: str,
+                 keepalive_interval: int = 180):
         self.upstream_url = upstream_url.rstrip("/")
         self.model = model
         self.session: Optional[aiohttp.ClientSession] = None
+        # Keepalive: 0 disables. Otherwise, every N seconds of idle, send a
+        # trivial completion upstream to keep vLLM's Ray compiled-DAG warm.
+        # Multi-node PP has an instability pattern where the engine wedges
+        # on idle → active transitions; a lightweight ping avoids long idle.
+        self.keepalive_interval = keepalive_interval
+        self._keepalive_task: Optional[asyncio.Task] = None
+        self._last_activity: float = 0.0
+
+    def _mark_activity(self) -> None:
+        self._last_activity = asyncio.get_event_loop().time()
+
+    async def _keepalive_loop(self) -> None:
+        log.info("keepalive: pinging upstream every %ds while idle",
+                 self.keepalive_interval)
+        while True:
+            try:
+                await asyncio.sleep(self.keepalive_interval)
+                idle_for = asyncio.get_event_loop().time() - self._last_activity
+                if idle_for < self.keepalive_interval:
+                    # Real traffic is flowing; skip this tick.
+                    continue
+                try:
+                    async with self.session.post(
+                        f"{self.upstream_url}/v1/chat/completions",
+                        json={
+                            "model": self.model,
+                            "messages": [{"role": "user", "content": "ping"}],
+                            "max_tokens": 1,
+                            "temperature": 0,
+                            "stream": False,
+                        },
+                        timeout=aiohttp.ClientTimeout(total=60),
+                    ) as resp:
+                        await resp.read()
+                        log.debug("keepalive: upstream %d after %ds idle",
+                                  resp.status, int(idle_for))
+                except asyncio.TimeoutError:
+                    log.warning("keepalive: upstream did not respond within 60s "
+                                "(engine may be wedged — consider restart)")
+                except aiohttp.ClientError as e:
+                    log.warning("keepalive: upstream unreachable: %s", e)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("keepalive: unexpected error (continuing)")
 
     async def start(self) -> None:
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
+        self._mark_activity()
+        if self.keepalive_interval > 0:
+            self._keepalive_task = asyncio.create_task(self._keepalive_loop())
 
     async def stop(self) -> None:
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
+            except asyncio.CancelledError:
+                pass
         if self.session:
             await self.session.close()
 
     async def handle_messages(self, request: web.Request) -> web.StreamResponse:
+        self._mark_activity()
         try:
             body = await request.json()
         except json.JSONDecodeError:
@@ -588,6 +663,20 @@ class AnthropicProxy:
         )
         await response.prepare(request)
 
+        async def _try_write_error(message: str) -> None:
+            """Best-effort error-event emission. The client may have already
+            hung up (if upstream stalled past its timeout), so swallow any
+            reset instead of cascading into a 500."""
+            err = {"type": "error",
+                   "error": {"type": "api_error", "message": message}}
+            try:
+                await response.write(
+                    f"event: error\ndata: {json.dumps(err)}\n\n".encode()
+                )
+            except (ConnectionError, aiohttp.ClientConnectionResetError):
+                log.warning("client already gone; dropped error event: %s",
+                            message[:120])
+
         try:
             async with self.session.post(
                 f"{self.upstream_url}/v1/chat/completions",
@@ -596,19 +685,11 @@ class AnthropicProxy:
             ) as upstream:
                 if upstream.status != 200:
                     text = await upstream.text()
-                    err = {"type": "error",
-                           "error": {"type": "api_error", "message": text}}
-                    await response.write(
-                        f"event: error\ndata: {json.dumps(err)}\n\n".encode()
-                    )
+                    await _try_write_error(text)
                     return response
                 await translate_stream(upstream, response, model_label)
         except aiohttp.ClientError as e:
-            err = {"type": "error",
-                   "error": {"type": "api_error", "message": str(e)}}
-            await response.write(
-                f"event: error\ndata: {json.dumps(err)}\n\n".encode()
-            )
+            await _try_write_error(str(e))
         return response
 
     async def handle_health(self, request: web.Request) -> web.Response:
@@ -664,8 +745,10 @@ async def _logging_middleware(request: web.Request, handler):
     return response
 
 
-def create_app(upstream_url: str, model: str) -> web.Application:
-    proxy = AnthropicProxy(upstream_url, model)
+def create_app(upstream_url: str, model: str,
+               keepalive_interval: int = 180) -> web.Application:
+    proxy = AnthropicProxy(upstream_url, model,
+                           keepalive_interval=keepalive_interval)
 
     async def on_startup(app: web.Application) -> None:
         await proxy.start()
@@ -707,6 +790,11 @@ def main() -> None:
                              "(e.g. cyankiwi/GLM-5.1-AWQ-4bit)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Log request/response bodies (noisy, but useful for debugging Claude Code handshakes)")
+    parser.add_argument("--keepalive-interval", type=int, default=180,
+                        help="Seconds of upstream idle before sending a "
+                             "trivial completion to keep the Ray compiled-DAG "
+                             "warm on multi-node PP (default: 180). "
+                             "Set to 0 to disable.")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -721,6 +809,8 @@ def main() -> None:
     print(f"Listening on   : {args.listen_host}:{args.listen_port}")
     print(f"Upstream       : {args.upstream}")
     print(f"Model override : {args.model}")
+    print(f"Keepalive      : {args.keepalive_interval}s"
+          if args.keepalive_interval > 0 else "Keepalive      : disabled")
     print()
     print("Point Claude Code at this proxy:")
     print(f"  export ANTHROPIC_BASE_URL=http://{args.listen_host}:{args.listen_port}")
@@ -728,7 +818,8 @@ def main() -> None:
     print("  claude")
     print("=" * 60)
 
-    app = create_app(args.upstream, args.model)
+    app = create_app(args.upstream, args.model,
+                     keepalive_interval=args.keepalive_interval)
     web.run_app(app, host=args.listen_host, port=args.listen_port, print=None)
 
 

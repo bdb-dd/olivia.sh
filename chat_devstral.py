@@ -20,7 +20,11 @@ import argparse
 import json
 import sys
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional, Tuple, Dict, Any
+
+from chat_storage import ConversationStore, Summarizer, default_db_path
 
 try:
     import requests
@@ -48,13 +52,32 @@ console = Console() if RICH_AVAILABLE else None
 class DevstralChat:
     def __init__(self, host: str, port: int = 8000, stream: bool = True):
         self.base_url = f"http://{host}:{port}"
+        self.host_label = f"{host}:{port}"
         self.stream = stream
         self.conversation_history: list = []
         self.model: Optional[str] = None
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.turn_count = 0
-        
+        # Storage is wired in by attach_storage() after check_server() so we
+        # know the model name; left as None when --no-store is set or the chat
+        # is invoked from --bench mode.
+        self.store: Optional[ConversationStore] = None
+        self.summarizer: Optional[Summarizer] = None
+        self.conversation_id: Optional[int] = None
+
+    def attach_storage(self, db_path: Path) -> None:
+        """Open the conversation DB and start the background summarizer.
+
+        Safe to call repeatedly; subsequent calls are no-ops.
+        """
+        if self.store is not None:
+            return
+        self.store = ConversationStore(db_path)
+        if self.model:
+            self.summarizer = Summarizer(self.store, self.base_url, self.model)
+
+
     def check_server(self) -> bool:
         """Check if server is healthy and get model info."""
         try:
@@ -94,12 +117,13 @@ class DevstralChat:
         start_time = time.time()
         first_token_time = None
         response_content = ""
+        reasoning_text = ""
         prompt_tokens = 0
         completion_tokens = 0
-        
+
         try:
             if self.stream:
-                response_content, metrics = self._stream_response(payload, start_time)
+                response_content, reasoning_text, metrics = self._stream_response(payload, start_time)
                 first_token_time = metrics.get("first_token_time")
                 prompt_tokens = metrics.get("prompt_tokens", 0)
                 completion_tokens = metrics.get("completion_tokens", 0)
@@ -120,38 +144,78 @@ class DevstralChat:
                         timeout=300
                     )
                     print("\r", end="")
-                
+
                 if resp.status_code != 200:
                     self.conversation_history.pop()
                     return None
-                
+
                 data = resp.json()
-                response_content = data["choices"][0]["message"]["content"]
-                
+                msg = data["choices"][0]["message"]
+                response_content = msg.get("content") or ""
+                # Some vLLM builds expose reasoning on non-stream responses too
+                # (e.g. GLM-5.1 with --reasoning-parser glm45). If absent, this
+                # is just the empty string.
+                reasoning_text = msg.get("reasoning_content") or msg.get("reasoning") or ""
+
                 usage = data.get("usage", {})
                 prompt_tokens = usage.get("prompt_tokens", 0)
                 completion_tokens = usage.get("completion_tokens", 0)
-        
+
         except requests.exceptions.Timeout:
             self.conversation_history.pop()
             return None
         except Exception as e:
             self.conversation_history.pop()
             return None
-        
+
         end_time = time.time()
         total_time = end_time - start_time
-        
+
+        # Only the visible answer goes back into conversation_history — the
+        # model doesn't expect its prior chain-of-thought as input on the next
+        # turn. Reasoning is persisted separately for searchability only.
         self.conversation_history.append({
             "role": "assistant",
             "content": response_content
         })
-        
+
         self.total_prompt_tokens += prompt_tokens
         self.total_completion_tokens += completion_tokens
-        
+
         tokens_per_second = completion_tokens / total_time if total_time > 0 else 0
-        
+
+        # Persist + enqueue background summarization. Failures here must not
+        # break the chat — log and move on.
+        if self.store is not None:
+            try:
+                if self.conversation_id is None:
+                    self.conversation_id = self.store.start_conversation(
+                        self.model, self.host_label
+                    )
+                self.store.append_turn(
+                    conversation_id=self.conversation_id,
+                    turn=self.turn_count,
+                    user_message=user_message,
+                    assistant_content=response_content,
+                    assistant_reasoning=reasoning_text,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                )
+                if self.summarizer is not None:
+                    if self.turn_count == 1:
+                        self.summarizer.enqueue_title(
+                            self.conversation_id, user_message, response_content
+                        )
+                    if self.turn_count >= 5 and self.turn_count % 5 == 0:
+                        # Summary worker pulls fresh state from the DB at job
+                        # execution time, so successive enqueues chain
+                        # correctly even if a prior job is still in flight.
+                        self.summarizer.enqueue_summary(
+                            self.conversation_id, self.turn_count
+                        )
+            except Exception as e:
+                sys.stderr.write(f"[storage] persist failed: {e}\n")
+
         return {
             "turn": self.turn_count,
             "response": response_content,
@@ -161,13 +225,19 @@ class DevstralChat:
             "tokens_per_second": round(tokens_per_second, 2),
             "time_to_first_token": round(first_token_time, 2) if first_token_time else None
         }
-    
-    def _stream_response(self, payload: dict, start_time: float) -> Tuple[str, dict]:
-        """Handle streaming response with token batching for improved throughput."""
+
+    def _stream_response(self, payload: dict, start_time: float) -> Tuple[str, str, dict]:
+        """Handle streaming response with token batching for improved throughput.
+
+        Returns (visible_content, reasoning_text, metrics). The two text
+        buffers are kept separate so reasoning can be persisted in its own
+        searchable column without being replayed back to the model.
+        """
         import queue
         import threading
 
-        response_content = ""
+        content_text = ""
+        reasoning_text = ""
         first_token_time = None
         prompt_tokens = 0
         completion_tokens = 0
@@ -189,7 +259,7 @@ class DevstralChat:
         )
 
         if resp.status_code != 200:
-            return "", {}
+            return "", "", {}
 
         if RICH_AVAILABLE:
             console.print("\n[bold blue]Assistant:[/bold blue] ", end="")
@@ -272,7 +342,7 @@ class DevstralChat:
                                 in_reasoning = True
                             token_buffer += reasoning
                             tokens_in_buffer += 1
-                            response_content += reasoning
+                            reasoning_text += reasoning
 
                         if content:
                             if in_reasoning:
@@ -281,7 +351,7 @@ class DevstralChat:
                                 in_reasoning = False
                             token_buffer += content
                             tokens_in_buffer += 1
-                            response_content += content
+                            content_text += content
 
                         if reasoning or content:
                             # Flush buffer if: enough tokens, enough chars, or timeout.
@@ -317,18 +387,46 @@ class DevstralChat:
         print()
 
         if completion_tokens == 0:
-            completion_tokens = int(len(response_content.split()) * 1.3)
+            # Approximate when usage wasn't included; counts both visible and
+            # reasoning tokens so the rate calc downstream isn't deflated for
+            # reasoning-heavy models.
+            completion_tokens = int(len((content_text + reasoning_text).split()) * 1.3)
 
-        return response_content, {
+        return content_text, reasoning_text, {
             "first_token_time": first_token_time,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens
         }
     
     def reset_conversation(self):
-        """Clear conversation history."""
+        """Close the current conversation; the next turn opens a new one."""
         self.conversation_history = []
         self.turn_count = 0
+        self.conversation_id = None
+
+    def load_conversation(self, conversation_id: int) -> Optional[Dict[str, Any]]:
+        """Replace in-memory state with a stored conversation. Returns metadata
+        dict on success, None if the id doesn't exist or storage isn't attached.
+        """
+        if self.store is None:
+            return None
+        meta, msgs = self.store.load_conversation(conversation_id)
+        if meta is None:
+            return None
+        # Only replay visible content back to the model — reasoning is stored
+        # for search but not part of the chat input.
+        self.conversation_history = [
+            {"role": m["role"], "content": m["content"]} for m in msgs
+        ]
+        self.conversation_id = conversation_id
+        self.turn_count = meta["turn_count"]
+        return {
+            "id": meta["id"],
+            "title": meta["title"],
+            "model": meta["model"],
+            "turn_count": meta["turn_count"],
+            "summary": meta["summary"],
+        }
 
     def _bench_one(self, prompt: str, max_tokens: int) -> Optional[Dict[str, Any]]:
         """Single silent streaming request — TTFT + raw token counts. No history."""
@@ -488,25 +586,120 @@ def print_help():
         table = Table(title="Available Commands", show_header=True)
         table.add_column("Command", style="cyan")
         table.add_column("Description", style="white")
-        
+
         table.add_row("/help", "Show this help message")
-        table.add_row("/clear", "Clear conversation history")
+        table.add_row("/new", "Start a new conversation (alias: /clear)")
+        table.add_row("/list [N]", "List N most recent stored conversations (default 20)")
+        table.add_row("/load <id>", "Resume a stored conversation by id")
+        table.add_row("/search <query> [--in answer|reasoning|both]",
+                      "Full-text search across stored messages (default: both)")
+        table.add_row("/title <text>", "Manually set the title of the active conversation")
+        table.add_row("/summary", "Show the rolling summary of the active conversation")
         table.add_row("/stats", "Show session statistics")
-        table.add_row("/history", "Show conversation history")
+        table.add_row("/history", "Show in-memory conversation history")
         table.add_row("/stream", "Toggle streaming mode")
         table.add_row("/quit", "Exit the chat")
-        
+
         console.print(table)
     else:
         print("""
 Commands:
-  /help     - Show this help message
-  /clear    - Clear conversation history
-  /stats    - Show session statistics
-  /history  - Show conversation history
-  /stream   - Toggle streaming mode
-  /quit     - Exit the chat
+  /help                                          - Show this help message
+  /new                                           - Start a new conversation (alias: /clear)
+  /list [N]                                      - List N most recent stored conversations
+  /load <id>                                     - Resume a stored conversation by id
+  /search <query> [--in answer|reasoning|both]   - Full-text search (default scope: both)
+  /title <text>                                  - Manually set conversation title
+  /summary                                       - Show rolling summary
+  /stats                                         - Show session statistics
+  /history                                       - Show in-memory history
+  /stream                                        - Toggle streaming mode
+  /quit                                          - Exit the chat
 """)
+
+
+def _human_age(iso_str: str) -> str:
+    """Render an ISO 8601 UTC timestamp as a relative '5m ago' string."""
+    try:
+        then = datetime.fromisoformat(iso_str)
+    except ValueError:
+        return iso_str
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - then
+    s = int(delta.total_seconds())
+    if s < 60:
+        return f"{s}s ago"
+    if s < 3600:
+        return f"{s // 60}m ago"
+    if s < 86400:
+        return f"{s // 3600}h ago"
+    return f"{s // 86400}d ago"
+
+
+def print_conversation_list(rows) -> None:
+    """Render /list output: one line per stored conversation."""
+    if not rows:
+        if RICH_AVAILABLE:
+            console.print("[yellow](no stored conversations yet)[/yellow]")
+        else:
+            print("(no stored conversations yet)")
+        return
+    if RICH_AVAILABLE:
+        table = Table(title="Stored Conversations", show_header=True)
+        table.add_column("ID", style="cyan", justify="right")
+        table.add_column("When", style="yellow")
+        table.add_column("Turns", justify="right")
+        table.add_column("Model", style="dim")
+        table.add_column("Title", style="white")
+        for r in rows:
+            table.add_row(
+                str(r["id"]),
+                _human_age(r["updated_at"]),
+                str(r["turn_count"]),
+                (r["model"] or "")[:32],
+                r["title"] or "[dim](untitled)[/dim]",
+            )
+        console.print(table)
+    else:
+        for r in rows:
+            print(f"#{r['id']:>4}  {_human_age(r['updated_at']):>10}  "
+                  f"turns={r['turn_count']:<3}  "
+                  f"{(r['model'] or '')[:24]:<24}  "
+                  f"{r['title'] or '(untitled)'}")
+
+
+def print_search_results(hits, query: str, scope: str) -> None:
+    if not hits:
+        msg = f"No matches for {query!r} in {scope}."
+        if RICH_AVAILABLE:
+            console.print(f"[yellow]{msg}[/yellow]")
+        else:
+            print(msg)
+        return
+    if RICH_AVAILABLE:
+        console.print(f"[bold]{len(hits)}[/bold] match(es) for "
+                      f"[cyan]{query}[/cyan] in [magenta]{scope}[/magenta]:")
+        for h in hits:
+            title = h.title or "(untitled)"
+            console.print(
+                f"\n[cyan]#{h.conversation_id}[/cyan] "
+                f"[white]{title}[/white]  "
+                f"[dim]{_human_age(h.updated_at)}  "
+                f"turn {h.turn} {h.role} ({h.matched_in})[/dim]"
+            )
+            # Snippet already contains [bold]...[/bold] markers from FTS5.
+            console.print(f"  {h.snippet}")
+    else:
+        print(f"{len(hits)} match(es) for {query!r} in {scope}:")
+        for h in hits:
+            title = h.title or "(untitled)"
+            print(f"\n#{h.conversation_id}  {title}  "
+                  f"[{_human_age(h.updated_at)}, turn {h.turn} {h.role}, "
+                  f"matched in {h.matched_in}]")
+            # Strip Rich markup for plain output
+            snippet = h.snippet.replace("[bold]", "*").replace("[/bold]", "*")
+            print(f"  {snippet}")
 
 
 def main():
@@ -518,6 +711,10 @@ def main():
     parser.add_argument("-n", "--runs", type=int, default=3, help="Bench: number of measured runs (default 3)")
     parser.add_argument("--max-tokens", type=int, default=256, help="Bench: max output tokens per run (default 256)")
     parser.add_argument("--warmup", type=int, default=1, help="Bench: warmup runs excluded from averages (default 1)")
+    parser.add_argument("--resume", nargs="?", const=-1, type=int, metavar="ID",
+                        help="Resume most recent conversation (no value), or specific id")
+    parser.add_argument("--no-store", action="store_true",
+                        help="Disable conversation persistence (storage is on by default)")
     args = parser.parse_args()
 
     # Benchmark mode: non-interactive, exit when done.
@@ -564,90 +761,216 @@ def main():
             print(f"Error: Cannot connect to server at {args.host}:{args.port}")
         sys.exit(1)
 
+    # Storage attaches after the server probe so the summarizer can use the
+    # detected model. --no-store skips this for ephemeral sessions.
+    if not args.no_store:
+        try:
+            chat.attach_storage(default_db_path())
+        except Exception as e:
+            sys.stderr.write(f"[storage] init failed, continuing without persistence: {e}\n")
+
+    if args.resume is not None:
+        if chat.store is None:
+            if RICH_AVAILABLE:
+                console.print("[red]--resume requires storage; remove --no-store to use it.[/red]")
+            else:
+                print("--resume requires storage; remove --no-store to use it.")
+        else:
+            target = args.resume if args.resume > 0 else chat.store.most_recent_id()
+            if target is None:
+                if RICH_AVAILABLE:
+                    console.print("[yellow]No stored conversations to resume.[/yellow]")
+                else:
+                    print("No stored conversations to resume.")
+            else:
+                meta = chat.load_conversation(target)
+                if meta is None:
+                    if RICH_AVAILABLE:
+                        console.print(f"[red]Conversation #{target} not found.[/red]")
+                    else:
+                        print(f"Conversation #{target} not found.")
+                else:
+                    title = meta["title"] or "(untitled)"
+                    msg = (f"Resumed conversation #{meta['id']}: {title}  "
+                           f"(turns: {meta['turn_count']})")
+                    if RICH_AVAILABLE:
+                        console.print(f"[green]✓[/green] {msg}")
+                    else:
+                        print(msg)
+
     if RICH_AVAILABLE:
         console.print(f"[green]✓[/green] Streaming: [cyan]{'enabled' if chat.stream else 'disabled'}[/cyan]")
         console.print("\nType [cyan]/help[/cyan] for commands, [cyan]/quit[/cyan] to exit\n")
     else:
         print(f"Streaming: {'enabled' if chat.stream else 'disabled'}")
-        print(f"Streaming: {'enabled' if chat.stream else 'disabled'}")
         print("\nType /help for commands, /quit to exit\n")
     
-    while True:
-        try:
-            if RICH_AVAILABLE:
-                user_input = Prompt.ask("\n[bold green]You[/bold green]")
-            else:
-                user_input = input("\nYou: ").strip()
-            
-            if not user_input:
-                continue
-            
-            # Handle commands
-            if user_input.startswith("/"):
-                cmd = user_input.lower().strip()
-                if cmd in ("/quit", "/exit", "/q"):
-                    if RICH_AVAILABLE:
-                        console.print(chat.get_stats_table())
-                        console.print("[yellow]Goodbye![/yellow]")
-                    else:
-                        print("Goodbye!")
-                    break
-                elif cmd == "/help":
-                    print_help()
-                elif cmd == "/clear":
-                    chat.reset_conversation()
-                    if RICH_AVAILABLE:
-                        console.print("[yellow]Conversation cleared.[/yellow]")
-                    else:
-                        print("Conversation cleared.")
-                elif cmd == "/stats":
-                    if RICH_AVAILABLE:
-                        console.print(chat.get_stats_table())
-                    else:
-                        print(f"\nStats: {chat.turn_count} turns, "
-                              f"{chat.total_prompt_tokens + chat.total_completion_tokens} total tokens")
-                elif cmd == "/history":
-                    if RICH_AVAILABLE:
-                        for i, msg in enumerate(chat.conversation_history):
-                            role = msg["role"].capitalize()
-                            style = "green" if role == "User" else "blue"
-                            content = msg["content"][:80] + "..." if len(msg["content"]) > 80 else msg["content"]
-                            console.print(f"[{style}]{i+1}. [{role}][/{style}]: {content}")
-                    else:
-                        for i, msg in enumerate(chat.conversation_history):
-                            content = msg["content"][:80] + "..." if len(msg["content"]) > 80 else msg["content"]
-                            print(f"{i+1}. [{msg['role']}]: {content}")
-                elif cmd == "/stream":
-                    chat.stream = not chat.stream
-                    if RICH_AVAILABLE:
-                        console.print(f"Streaming: [cyan]{'enabled' if chat.stream else 'disabled'}[/cyan]")
-                    else:
-                        print(f"Streaming: {'enabled' if chat.stream else 'disabled'}")
+    def _say(text: str) -> None:
+        if RICH_AVAILABLE:
+            console.print(text)
+        else:
+            # Strip simple [tag]...[/tag] markup for plain output
+            import re
+            print(re.sub(r"\[/?[a-zA-Z0-9 _#]+\]", "", text))
+
+    try:
+        while True:
+            try:
+                if RICH_AVAILABLE:
+                    user_input = Prompt.ask("\n[bold green]You[/bold green]")
                 else:
-                    if RICH_AVAILABLE:
-                        console.print(f"[red]Unknown command:[/red] {user_input}")
+                    user_input = input("\nYou: ").strip()
+
+                if not user_input:
+                    continue
+
+                # Handle commands
+                if user_input.startswith("/"):
+                    parts = user_input.split(None, 1)
+                    head = parts[0].lower()
+                    rest = parts[1].strip() if len(parts) > 1 else ""
+
+                    if head in ("/quit", "/exit", "/q"):
+                        if RICH_AVAILABLE:
+                            console.print(chat.get_stats_table())
+                            console.print("[yellow]Goodbye![/yellow]")
+                        else:
+                            print("Goodbye!")
+                        break
+                    elif head == "/help":
+                        print_help()
+                    elif head in ("/clear", "/new"):
+                        chat.reset_conversation()
+                        _say("[yellow]Started a new conversation.[/yellow]")
+                    elif head == "/stats":
+                        if RICH_AVAILABLE:
+                            console.print(chat.get_stats_table())
+                        else:
+                            print(f"\nStats: {chat.turn_count} turns, "
+                                  f"{chat.total_prompt_tokens + chat.total_completion_tokens} total tokens")
+                    elif head == "/history":
+                        if RICH_AVAILABLE:
+                            for i, msg in enumerate(chat.conversation_history):
+                                role = msg["role"].capitalize()
+                                style = "green" if role == "User" else "blue"
+                                content = msg["content"][:80] + "..." if len(msg["content"]) > 80 else msg["content"]
+                                console.print(f"[{style}]{i+1}. [{role}][/{style}]: {content}")
+                        else:
+                            for i, msg in enumerate(chat.conversation_history):
+                                content = msg["content"][:80] + "..." if len(msg["content"]) > 80 else msg["content"]
+                                print(f"{i+1}. [{msg['role']}]: {content}")
+                    elif head == "/stream":
+                        chat.stream = not chat.stream
+                        _say(f"Streaming: [cyan]{'enabled' if chat.stream else 'disabled'}[/cyan]")
+                    elif head == "/list":
+                        if chat.store is None:
+                            _say("[red]Storage is disabled (--no-store).[/red]")
+                            continue
+                        try:
+                            n = int(rest) if rest else 20
+                        except ValueError:
+                            _say("[red]Usage: /list [N][/red]")
+                            continue
+                        print_conversation_list(chat.store.list_conversations(n))
+                    elif head == "/load":
+                        if chat.store is None:
+                            _say("[red]Storage is disabled (--no-store).[/red]")
+                            continue
+                        try:
+                            cid = int(rest)
+                        except ValueError:
+                            _say("[red]Usage: /load <conversation-id>[/red]")
+                            continue
+                        meta = chat.load_conversation(cid)
+                        if meta is None:
+                            _say(f"[red]Conversation #{cid} not found.[/red]")
+                        else:
+                            title = meta["title"] or "(untitled)"
+                            _say(f"[green]✓[/green] Resumed #{meta['id']}: {title}  "
+                                 f"(turns: {meta['turn_count']})")
+                            if meta["model"] and chat.model and meta["model"] != chat.model:
+                                _say(f"[yellow]Note: stored model was "
+                                     f"{meta['model']!r}, current is {chat.model!r}.[/yellow]")
+                    elif head == "/search":
+                        if chat.store is None:
+                            _say("[red]Storage is disabled (--no-store).[/red]")
+                            continue
+                        if not rest:
+                            _say("[red]Usage: /search <query> [--in answer|reasoning|both][/red]")
+                            continue
+                        # Split off a trailing `--in <scope>` if present.
+                        scope = "both"
+                        query = rest
+                        marker = " --in "
+                        if marker in query:
+                            query, _, scope_arg = query.rpartition(marker)
+                            scope = scope_arg.strip().lower()
+                            query = query.strip()
+                        if scope not in ("answer", "reasoning", "both"):
+                            _say("[red]--in must be one of: answer, reasoning, both[/red]")
+                            continue
+                        if not query:
+                            _say("[red]Search query is empty.[/red]")
+                            continue
+                        try:
+                            hits = chat.store.search(query, scope=scope)
+                        except Exception as e:
+                            _say(f"[red]Search failed: {e}[/red]")
+                            continue
+                        print_search_results(hits, query, scope)
+                    elif head == "/title":
+                        if chat.store is None:
+                            _say("[red]Storage is disabled (--no-store).[/red]")
+                            continue
+                        if chat.conversation_id is None:
+                            _say("[yellow]No active conversation yet — send a message first.[/yellow]")
+                            continue
+                        if not rest:
+                            _say("[red]Usage: /title <text>[/red]")
+                            continue
+                        chat.store.update_title(chat.conversation_id, rest)
+                        _say(f"[green]✓[/green] Title set: {rest}")
+                    elif head == "/summary":
+                        if chat.store is None:
+                            _say("[red]Storage is disabled (--no-store).[/red]")
+                            continue
+                        if chat.conversation_id is None:
+                            _say("[yellow]No active conversation yet.[/yellow]")
+                            continue
+                        summary, through = chat.store.get_summary(chat.conversation_id)
+                        if summary:
+                            _say(f"[bold]Summary[/bold] (covers turns 1-{through}):\n{summary}")
+                        else:
+                            _say("[dim](no summary yet — first one is generated at turn 5)[/dim]")
                     else:
-                        print(f"Unknown command: {user_input}")
-                continue
-            
-            # Regular chat
-            metrics = chat.chat(user_input)
-            
-            if metrics:
-                if not chat.stream:
-                    print_response(metrics["response"])
-                print_metrics(metrics)
-            
-        except KeyboardInterrupt:
-            print()
-            if RICH_AVAILABLE:
-                console.print(chat.get_stats_table())
-                console.print("[yellow]Interrupted. Goodbye![/yellow]")
-            else:
-                print("Goodbye!")
-            break
-        except EOFError:
-            break
+                        _say(f"[red]Unknown command:[/red] {user_input}")
+                    continue
+
+                # Regular chat
+                metrics = chat.chat(user_input)
+
+                if metrics:
+                    if not chat.stream:
+                        print_response(metrics["response"])
+                    print_metrics(metrics)
+
+            except KeyboardInterrupt:
+                print()
+                if RICH_AVAILABLE:
+                    console.print(chat.get_stats_table())
+                    console.print("[yellow]Interrupted. Goodbye![/yellow]")
+                else:
+                    print("Goodbye!")
+                break
+            except EOFError:
+                break
+    finally:
+        # Drain background summarizer (5s budget) so an in-flight title or
+        # summary lands before we exit. Anything still in flight is abandoned.
+        if chat.summarizer is not None:
+            chat.summarizer.shutdown(drain_timeout_s=5.0)
+        if chat.store is not None:
+            chat.store.close()
 
 
 if __name__ == "__main__":

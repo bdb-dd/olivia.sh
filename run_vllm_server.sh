@@ -62,6 +62,12 @@ TP_SIZE="${TP_SIZE:-4}"                    # Tensor parallel size (per-node for 
 PP_SIZE="${PP_SIZE:-1}"                    # Pipeline parallel size (1=single-node, 2=across nodes)
 NUM_NODES="${NUM_NODES:-1}"                # Number of nodes to use (1 or 2)
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"       # GPU memory utilization
+# Ray compiled-DAG step timeout (seconds). Ray v2's default of 300s is too
+# short for multi-node PP inference over Slingshot: a single engine step can
+# run longer than that during big generations, and the raylet hits an
+# assertion failure / tears the cluster down. 1800s (30 min) is generous.
+# Only applied for multi-node (NUM_NODES > 1); single-node unaffected.
+RAY_CGRAPH_GET_TIMEOUT="${RAY_CGRAPH_GET_TIMEOUT:-1800}"
 # MAX_MODEL_LEN default is model-dependent and gets resolved after GLM
 # detection below: 131072 for GLM-5.1 (native 205K context, plenty of KV
 # cache headroom on 8×GH200 AWQ), 32768 elsewhere.
@@ -196,31 +202,6 @@ export VLLM_USE_FLASHINFER_MOE_FP16="${VLLM_USE_FLASHINFER_MOE_FP16:-0}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 
-echo "=============================================="
-echo "vLLM Server for GH200"
-echo "=============================================="
-echo ""
-echo "Configuration:"
-echo "  Container dir:    ${CONTAINER_DIR}"
-echo "  Model:            ${MODEL}"
-echo "  Tensor Parallel:  ${TP_SIZE}"
-echo "  GPU Memory:       ${GPU_MEM_UTIL}"
-echo "  Max Model Len:    ${MAX_MODEL_LEN}"
-echo "  Port:             ${PORT}"
-echo "  Log Level:        ${VLLM_LOGGING_LEVEL}"
-echo "  CUDAGraph Mode:   ${CUDAGRAPH_MODE:-<auto-select>}"
-if [[ "${VERBOSE}" == "1" ]]; then
-    echo "  VERBOSE mode:     ON (Ray backend=${RAY_BACKEND_LOG_LEVEL}, dedup=${RAY_DEDUP_LOGS}, NCCL=${NCCL_DEBUG})"
-fi
-if [[ "${ENABLE_PROXY}" == "1" ]]; then
-    echo ""
-    echo "Batching Proxy:     ENABLED"
-    echo "  Proxy Port:       ${PROXY_PORT}"
-    echo "  Batch Tokens:     ${PROXY_BATCH_TOKENS}"
-    echo "  Batch Chars:      ${PROXY_BATCH_CHARS}"
-    echo "  Batch Delay:      ${PROXY_BATCH_DELAY_MS}ms"
-fi
-echo ""
 # Detect GLM-4.7 model
 IS_GLM47=0
 if [[ "${MODEL}" == *"GLM-4.7"* ]] || [[ "${MODEL}" == *"glm-4.7"* ]]; then
@@ -262,6 +243,32 @@ if [[ -z "${MAX_MODEL_LEN+x}" ]]; then
         MAX_MODEL_LEN=32768
     fi
 fi
+
+echo "=============================================="
+echo "vLLM Server for GH200"
+echo "=============================================="
+echo ""
+echo "Configuration:"
+echo "  Container dir:    ${CONTAINER_DIR}"
+echo "  Model:            ${MODEL}"
+echo "  Tensor Parallel:  ${TP_SIZE}"
+echo "  GPU Memory:       ${GPU_MEM_UTIL}"
+echo "  Max Model Len:    ${MAX_MODEL_LEN}"
+echo "  Port:             ${PORT}"
+echo "  Log Level:        ${VLLM_LOGGING_LEVEL}"
+echo "  CUDAGraph Mode:   ${CUDAGRAPH_MODE:-<auto-select>}"
+if [[ "${VERBOSE}" == "1" ]]; then
+    echo "  VERBOSE mode:     ON (Ray backend=${RAY_BACKEND_LOG_LEVEL}, dedup=${RAY_DEDUP_LOGS}, NCCL=${NCCL_DEBUG})"
+fi
+if [[ "${ENABLE_PROXY}" == "1" ]]; then
+    echo ""
+    echo "Batching Proxy:     ENABLED"
+    echo "  Proxy Port:       ${PROXY_PORT}"
+    echo "  Batch Tokens:     ${PROXY_BATCH_TOKENS}"
+    echo "  Batch Chars:      ${PROXY_BATCH_CHARS}"
+    echo "  Batch Delay:      ${PROXY_BATCH_DELAY_MS}ms"
+fi
+echo ""
 
 # Detect AWQ quantized model
 IS_AWQ=0
@@ -383,6 +390,7 @@ if [[ "${NUM_NODES}" -gt 1 ]]; then
     echo "  Tensor Parallel:  ${TP_SIZE}  (intra-node, NVLink)"
     echo "  Pipeline Parallel: ${PP_SIZE}  (inter-node, Slingshot)"
     echo "  Total GPUs:       $((TP_SIZE * PP_SIZE))"
+    echo "  Ray step timeout: ${RAY_CGRAPH_GET_TIMEOUT}s (RAY_CGRAPH_get_timeout)"
 fi
 echo ""
 echo "GPU Configuration:"
@@ -843,6 +851,7 @@ SING_CMD=(
     --env "VLLM_CONFIGURE_LOGGING=${VLLM_CONFIGURE_LOGGING}"
     --env "RAY_BACKEND_LOG_LEVEL=${RAY_BACKEND_LOG_LEVEL}"
     --env "RAY_DEDUP_LOGS=${RAY_DEDUP_LOGS}"
+    --env "RAY_CGRAPH_get_timeout=${RAY_CGRAPH_GET_TIMEOUT}"
     --env "NCCL_DEBUG=${NCCL_DEBUG}"
     --env "VLLM_CACHE_QUANTIZED_WEIGHTS=${VLLM_CACHE_QUANTIZED_WEIGHTS}"
     --env "VLLM_USE_DEEP_GEMM=${VLLM_USE_DEEP_GEMM}"

@@ -16,3 +16,9 @@ pytorch_version_before.txt
 .idea/
 .vscode/
 
+# Local conversation storage (chat_devstral.py)
+chat.db
+chat.db-journal
+chat.db-wal
+chat.db-shm
+

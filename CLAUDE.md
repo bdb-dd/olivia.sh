@@ -273,6 +273,7 @@ Runs vLLM server with GH200-optimized settings:
 - `PP_SIZE`: Pipeline parallel size (default: `1`). For 2-node glm51 jobs this is `2`
 - `TP_SIZE`: Tensor parallel size (default: `4`). For multi-node jobs, this is the *intra-node* tensor parallel size (per node)
 - `RAY_PORT`: Ray GCS port (default: `6379`)
+- `RAY_CGRAPH_GET_TIMEOUT`: Ray compiled-DAG per-step timeout in seconds (default: `1800`, applied to multi-node only). Ray's upstream default of `300` is too short for multi-node PP inference over Slingshot — a single engine step during long generations can exceed it and crash the raylet with `ChannelError: Channel closed`.
 - Head node IP is auto-discovered via `ip -4 -o addr show hsn0` (Slingshot interface); falls back to `hostname -I`
 - Ray temp dir is per-job: `${WORKDIR}/cache/ray_tmp_${SLURM_JOB_ID}`
 
@@ -452,6 +453,7 @@ Optionally chain through the batching proxy for SSE compaction over the tunnel: 
 - `--upstream` — OpenAI-compatible URL (default `http://localhost:8000`, direct vLLM). Set to `http://localhost:8001` to chain through `vllm_proxy` (requires `ENABLE_PROXY=1` server-side).
 - `--model` *(required)* — the model name forwarded to vLLM (e.g. `cyankiwi/GLM-5.1-AWQ-4bit`). All Anthropic model names in client requests are remapped to this single value.
 - `-v` / `--verbose` — log request/response bodies for debugging.
+- `--keepalive-interval N` — seconds of upstream idle before sending a 1-token dummy completion to keep vLLM's Ray compiled-DAG warm (default `180`, set `0` to disable). Works around a multi-node PP instability where the engine wedges on idle → active transitions; pinging the DAG periodically avoids long idle windows.
 
 **What gets translated:**
 - Request: `system` (string or content-block list) → `role: system` message; `messages` with `text`/`tool_use`/`tool_result` blocks → OpenAI messages + `tool_calls` + `role: tool` results; `tools` → OpenAI `function` tools; `tool_choice` (`auto`/`any`/`none`/`tool`) → OpenAI equivalents; `stop_sequences` → `stop`.

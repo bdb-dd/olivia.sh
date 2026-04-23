@@ -2076,7 +2076,50 @@ done < <(scontrol -o show reservation 2>/dev/null)
 [ "$shown" -eq 0 ] && printf "  (none in horizon)\n"
 echo
 
-# --- 5. Hint -----------------------------------------------------------------
+# --- 5. Estimated start for a hypothetical new job ---------------------------
+# `sbatch --test-only` runs SLURM's backfill scheduler against the given shape
+# and prints a predicted start time without actually submitting. Reservation-
+# aware (upcoming maintenance windows are factored in), but assumes every
+# running job runs to its full TIME_LIMIT — so the result is a *pessimistic
+# upper bound*, not a likely start time.
+printf "${BLU}==>${RST} ${BLD}Estimated start for a new job${RST}  (SLURM backfill — pessimistic upper bound)\n"
+now_epoch=$(date +%s)
+
+estimate_start() {
+    nodes=$1; gpus=$2; label=$3
+    out=$(sbatch --test-only \
+        --partition="$PARTITION" \
+        --nodes="$nodes" --ntasks-per-node=1 \
+        --gpus-per-node="$gpus" --cpus-per-task=32 \
+        --mem=0 --time=04:00:00 \
+        --wrap='true' 2>&1)
+    # Expected: "sbatch: Job N to start at YYYY-MM-DDTHH:MM:SS ..."
+    ts=$(echo "$out" | sed -n 's/.*to start at \([0-9T:\-]*\).*/\1/p' | head -1)
+    if [ -z "$ts" ]; then
+        printf "  %-22s ${RED}prediction failed${RST}\n" "$label"
+        return
+    fi
+    ts_e=$(date -d "$ts" +%s 2>/dev/null)
+    if [ -z "$ts_e" ] || [ "$ts_e" -le "$((now_epoch + 60))" ]; then
+        printf "  %-22s ${GRN}starts immediately${RST}\n" "$label"
+        return
+    fi
+    delta=$(( ts_e - now_epoch ))
+    if [ "$delta" -lt 3600 ]; then
+        human="$(( delta / 60 ))m"
+    elif [ "$delta" -lt 86400 ]; then
+        human="$(( delta / 3600 ))h$(( (delta % 3600) / 60 ))m"
+    else
+        human="$(( delta / 86400 ))d$(( (delta % 86400) / 3600 ))h"
+    fi
+    printf "  %-22s starts %s  (~%s from now)\n" "$label" "$ts" "$human"
+}
+
+estimate_start 1 4 "1 node  × 4 GPUs:"
+estimate_start 2 4 "2 nodes × 4 GPUs:"
+echo
+
+# --- 6. Hint -----------------------------------------------------------------
 printf "${BLU}==>${RST} ${BLD}Notes${RST}\n"
 draining_count=$(echo "${state_count[draining]:-0}")
 if [ "$draining_count" -gt 10 ]; then

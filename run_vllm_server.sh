@@ -62,7 +62,9 @@ TP_SIZE="${TP_SIZE:-4}"                    # Tensor parallel size (per-node for 
 PP_SIZE="${PP_SIZE:-1}"                    # Pipeline parallel size (1=single-node, 2=across nodes)
 NUM_NODES="${NUM_NODES:-1}"                # Number of nodes to use (1 or 2)
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"       # GPU memory utilization
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"    # Max context length
+# MAX_MODEL_LEN default is model-dependent and gets resolved after GLM
+# detection below: 131072 for GLM-5.1 (native 205K context, plenty of KV
+# cache headroom on 8×GH200 AWQ), 32768 elsewhere.
 
 # Speculative decoding settings
 # - "auto": Enable MTP for GLM-4.7/GLM-5.1, disabled for other models
@@ -76,7 +78,9 @@ PROMPT_LOOKUP_MAX="${PROMPT_LOOKUP_MAX:-4}"  # Max n-gram window size
 # GLM-5.1 reuses the GLM-4.7 tool/reasoning parsers per the official vLLM recipe
 GLM_TOOL_PARSER="${GLM_TOOL_PARSER:-glm47}"
 GLM_REASONING_PARSER="${GLM_REASONING_PARSER:-glm45}"
-ENABLE_AUTO_TOOL_CHOICE="${ENABLE_AUTO_TOOL_CHOICE:-0}"
+# ENABLE_AUTO_TOOL_CHOICE default is model-dependent and gets resolved after
+# GLM detection below: 1 for GLM MoE models (tool parser is always set),
+# 0 elsewhere. Users can still override explicitly.
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
 MTP_SPECULATIVE_TOKENS="${MTP_SPECULATIVE_TOKENS:-3}"  # MTP speculative tokens (GLM-4.7 and GLM-5.1)
 
@@ -233,6 +237,30 @@ fi
 IS_GLM_MOE=0
 if [[ "${IS_GLM47}" == "1" || "${IS_GLM51}" == "1" ]]; then
     IS_GLM_MOE=1
+fi
+
+# Resolve ENABLE_AUTO_TOOL_CHOICE. GLM MoE models ship with the glm47 tool
+# parser wired up, so auto tool choice is safe to default-on and needed by
+# any OpenAI tool-using client (Claude Code via anthropic_proxy.py, etc.).
+# ``${VAR+x}`` distinguishes "user explicitly set (even to 0)" from "unset".
+if [[ -z "${ENABLE_AUTO_TOOL_CHOICE+x}" ]]; then
+    if [[ "${IS_GLM_MOE}" == "1" ]]; then
+        ENABLE_AUTO_TOOL_CHOICE=1
+    else
+        ENABLE_AUTO_TOOL_CHOICE=0
+    fi
+fi
+
+# Resolve MAX_MODEL_LEN. GLM-5.1 has a native 205K context window and ~260 GB
+# of KV cache headroom on 8×GH200 AWQ, so a generous 128K default is safe and
+# matches typical Claude Code usage (which requests max_tokens=32000).
+# Other models keep the conservative 32K default.
+if [[ -z "${MAX_MODEL_LEN+x}" ]]; then
+    if [[ "${IS_GLM51}" == "1" ]]; then
+        MAX_MODEL_LEN=131072
+    else
+        MAX_MODEL_LEN=32768
+    fi
 fi
 
 # Detect AWQ quantized model

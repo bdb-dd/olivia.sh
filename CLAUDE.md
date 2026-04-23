@@ -6,6 +6,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This repository contains scripts for building and running vLLM on NVIDIA GH200 (GraceHopper) ARM64 GPUs on HPC clusters. The key challenge is preserving NGC's custom PyTorch build while installing vLLM and its dependencies.
 
+## Local Python Setup
+
+Local tooling (`anthropic_proxy.py`, `chat_devstral.py`) runs on your workstation, not inside the cluster container, and needs its own Python deps. Pick either path — both land on the same `.venv/` (gitignored).
+
+**With mise** (auto-activated venv, recommended if you already use it):
+```bash
+mise trust       # one-time: approve mise.toml in this repo
+mise install     # installs the pinned Python version
+mise run install # pip install -r requirements.txt into .venv
+```
+After that, `cd`ing into the directory auto-activates the venv — no `source` needed.
+
+**Without mise** (plain venv):
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+Activate with `source .venv/bin/activate` before running `python anthropic_proxy.py …` or `python chat_devstral.py …`.
+
+Cluster-side scripts (`build_vllm_gh200.sh`, `run_vllm_server.sh`, `vllm_proxy.py`) use the Singularity container's Python and are unaffected by either path.
+
 ## Olivia CLI (`olivia.sh`)
 
 Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for single 2FA authentication per session.
@@ -226,7 +248,7 @@ Runs vLLM server with GH200-optimized settings:
 - `MODEL`: HuggingFace model ID (default: `mistralai/Devstral-2-123B-Instruct-2512`)
 - `TP_SIZE`: Tensor parallel size (default: 4)
 - `GPU_MEM_UTIL`: GPU memory utilization (default: 0.90)
-- `MAX_MODEL_LEN`: Maximum context length (default: 32768)
+- `MAX_MODEL_LEN`: Maximum context length (default: `131072` for GLM-5.1 — native 205K context with ~260 GB KV cache headroom on 8×GH200 AWQ; `32768` elsewhere)
 - `HF_TOKEN`: HuggingFace token for gated models
 - `VLLM_ATTENTION_BACKEND`: Attention backend (default: `FLASH_ATTN`)
 - `VERBOSE`: Set to `1` for detailed logging including weight loading progress (default: `0`)
@@ -241,7 +263,7 @@ Runs vLLM server with GH200-optimized settings:
 **GLM-4.7 / GLM-5.1 Specific (auto-detected when MODEL contains "GLM-4.7" or "GLM-5.1"):**
 - `GLM_TOOL_PARSER`: Tool call parser (default: `glm47` — GLM-5.1 reuses the GLM-4.7 parser per the official vLLM recipe)
 - `GLM_REASONING_PARSER`: Reasoning parser (default: `glm45`)
-- `ENABLE_AUTO_TOOL_CHOICE`: Enable automatic tool selection (default: `0`)
+- `ENABLE_AUTO_TOOL_CHOICE`: Enable automatic tool selection (default: `1` for GLM-4.7/GLM-5.1, `0` elsewhere — GLM ships with a tool parser wired up, and OpenAI tool-using clients like Claude Code via `anthropic_proxy.py` need this on). Set `ENABLE_AUTO_TOOL_CHOICE=0` explicitly to disable on GLM.
 - `SERVED_MODEL_NAME`: Custom model name for API (default: empty, uses model ID)
 - `MTP_SPECULATIVE_TOKENS`: MTP speculative tokens (default: `3`)
 - GLM-5.1 additionally passes `--trust-remote-code` and flips the MoE flashinfer kernel from `VLLM_USE_FLASHINFER_MOE_FP8=1` to `VLLM_USE_FLASHINFER_MOE_FP16=1` (matches the QuantTrio GLM-5-AWQ recipe)
@@ -397,6 +419,52 @@ The proxy can also be run standalone:
 ```bash
 python vllm_proxy.py --vllm-port 8000 --proxy-port 8001 --batch-tokens 15 --batch-delay-ms 150
 ```
+
+### Anthropic Compatibility Proxy (Claude Code bridge)
+
+`anthropic_proxy.py` lets Claude Code CLI (and any other Anthropic-Messages-API client) talk to our GLM deployment. It accepts `POST /v1/messages`, translates the request to OpenAI `/v1/chat/completions`, forwards to the upstream, and rewrites the streaming response from OpenAI deltas to Anthropic's block-oriented event model (`message_start` → `content_block_start`/`content_block_delta`/`content_block_stop` per block → `message_delta` → `message_stop`).
+
+**Architecture** (default — direct to vLLM via the existing `olivia.sh tunnel up` forward):
+```
+Claude Code ──/v1/messages──► anthropic_proxy ──/v1/chat/completions──► vllm:8000
+ (local)       (Anthropic)      (localhost:8002)                         (GLM-5.1,
+                                                                          via SSH tunnel)
+```
+
+**Usage (local machine):**
+```bash
+# 1. Tunnel to the cluster (forwards localhost:8000 → vllm:8000 on the GPU node).
+./olivia.sh tunnel up
+
+# 2. Start the Anthropic proxy locally (default listen 127.0.0.1:8002).
+python anthropic_proxy.py --model cyankiwi/GLM-5.1-AWQ-4bit
+
+# 3. Point Claude Code at it.
+export ANTHROPIC_BASE_URL=http://localhost:8002
+export ANTHROPIC_AUTH_TOKEN=sk-any-nonempty-string   # value is ignored, must be set
+claude
+```
+
+Optionally chain through the batching proxy for SSE compaction over the tunnel: start the server with `ENABLE_PROXY=1` (so `vllm_proxy` runs alongside vLLM on the cluster), tunnel 8001 as well, and run `python anthropic_proxy.py --upstream http://localhost:8001 --model …`.
+
+**Options:**
+- `--listen-host` / `--listen-port` — bind address (default `127.0.0.1:8002`)
+- `--upstream` — OpenAI-compatible URL (default `http://localhost:8000`, direct vLLM). Set to `http://localhost:8001` to chain through `vllm_proxy` (requires `ENABLE_PROXY=1` server-side).
+- `--model` *(required)* — the model name forwarded to vLLM (e.g. `cyankiwi/GLM-5.1-AWQ-4bit`). All Anthropic model names in client requests are remapped to this single value.
+- `-v` / `--verbose` — log request/response bodies for debugging.
+
+**What gets translated:**
+- Request: `system` (string or content-block list) → `role: system` message; `messages` with `text`/`tool_use`/`tool_result` blocks → OpenAI messages + `tool_calls` + `role: tool` results; `tools` → OpenAI `function` tools; `tool_choice` (`auto`/`any`/`none`/`tool`) → OpenAI equivalents; `stop_sequences` → `stop`.
+- Response: `reasoning_content` → `thinking` block; `content` → `text` block; `tool_calls` → `tool_use` block with incremental `input_json_delta` events; `finish_reason` → `stop_reason` (`stop`→`end_turn`, `length`→`max_tokens`, `tool_calls`→`tool_use`).
+
+**What is dropped silently (intentional):**
+- `cache_control` fields (GLM has no prompt cache)
+- `thinking` request param / extended-thinking config (GLM's reasoning parser always runs when configured server-side)
+- `image` content blocks → replaced with `[image omitted]` text
+
+**Known limitations:**
+- `input_tokens` in the initial `message_start` event is reported as `0` (real count is only available in the upstream's final usage chunk). Accurate `output_tokens` are reported in `message_delta`.
+- `thinking` blocks from prior assistant turns are dropped when replaying history — GLM regenerates reasoning each turn.
 
 ### Container/Cache Structure
 

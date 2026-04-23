@@ -1,0 +1,17 @@
+# Optional: auto-manages Python + .venv for users who have mise installed.
+# Without mise, follow the manual venv path in CLAUDE.md — this file is ignored.
+#
+# First time: run `mise trust` in this directory (mise will prompt), then
+# `mise install` to fetch Python, then `mise run install` to install deps.
+# After that, `cd`ing into the directory auto-activates the venv.
+
+[tools]
+python = "3.13"
+
+[env]
+# Auto-create and activate .venv on directory entry.
+_.python.venv = { path = ".venv", create = true }
+
+[tasks.install]
+description = "Install local Python deps into the venv"
+run = "pip install -r requirements.txt"

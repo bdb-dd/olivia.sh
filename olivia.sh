@@ -892,7 +892,15 @@ start_server_job() {
     # Forward selected debug/tuning env vars if the caller set them. Useful for
     # diagnosing startup hangs: `VERBOSE=1 ./olivia.sh server start glm51`
     # flips vLLM, Ray, and NCCL to verbose logging inside the SLURM job.
-    for forward_var in VERBOSE VLLM_LOGGING_LEVEL RAY_BACKEND_LOG_LEVEL RAY_DEDUP_LOGS NCCL_DEBUG CUDAGRAPH_MODE; do
+    # Tool/reasoning knobs are forwarded so Claude Code and other OpenAI
+    # tool-using clients can enable the GLM tool-call parser per-session
+    # without editing run_vllm_server.sh.
+    for forward_var in VERBOSE VLLM_LOGGING_LEVEL RAY_BACKEND_LOG_LEVEL \
+                       RAY_DEDUP_LOGS NCCL_DEBUG CUDAGRAPH_MODE \
+                       ENABLE_AUTO_TOOL_CHOICE GLM_TOOL_PARSER \
+                       GLM_REASONING_PARSER SERVED_MODEL_NAME \
+                       MTP_SPECULATIVE_TOKENS ENABLE_SPECULATIVE \
+                       MAX_MODEL_LEN GPU_MEM_UTIL; do
         if [[ -n "${!forward_var:-}" ]]; then
             env_vars+=" ${forward_var}=${!forward_var}"
         fi
@@ -2019,9 +2027,10 @@ done <<< "$sinfo_data"
 
 free_gpus=$(( total_gpus - used_gpus - nonusable_gpus ))
 [ "$free_gpus" -lt 0 ] && free_gpus=0
+full_nodes=${free_slot_count[4]:-0}
 
 printf "${BLU}==>${RST} ${BLD}Partition state${RST}  (h200, $total_nodes nodes / $total_gpus GPUs total)\n"
-printf "  ${GRN}free now:${RST}      %3d GPUs  (across non-drained nodes)\n" "$free_gpus"
+printf "  ${GRN}free:${RST}          %3d GPUs  (%d full nodes)\n" "$free_gpus" "$full_nodes"
 printf "  ${YEL}in use:${RST}        %3d GPUs\n" "$used_gpus"
 printf "  ${RED}unavailable:${RST}   %3d GPUs  (drained/reserved/down)\n\n" "$nonusable_gpus"
 
@@ -2036,18 +2045,35 @@ echo
 # Scattered 1- or 2-GPU holes don't satisfy either, even if they sum high.
 printf "  ${BLD}Free-slot fragmentation${RST} (schedulable nodes only):\n"
 full4=${free_slot_count[4]:-0}
+# Max across the 4 buckets for bar scaling.
+frag_max=0
+for k in 4 3 2 1; do
+    c=${free_slot_count[$k]:-0}
+    [ "$c" -gt "$frag_max" ] && frag_max=$c
+done
+[ "$frag_max" -eq 0 ] && frag_max=1
 any_free=0
 for k in 4 3 2 1; do
     c=${free_slot_count[$k]:-0}
     [ "$c" -eq 0 ] && continue
     any_free=1
     case "$k" in
-        (4) label="full 4-GPU nodes (each can start one single-node 4-GPU job)";;
-        (3) label="nodes with 3 free GPUs (unusable for 4-GPU shapes)";;
-        (2) label="nodes with 2 free GPUs (unusable for 4-GPU shapes)";;
-        (1) label="nodes with 1 free GPU  (unusable for 4-GPU shapes)";;
+        (4) label="full 4-GPU nodes"; color="$GRN";;
+        (3) label="3-GPU holes      "; color="$YEL";;
+        (2) label="2-GPU holes      "; color="$YEL";;
+        (1) label="1-GPU holes      "; color="$YEL";;
     esac
-    printf "    %3d × %s\n" "$c" "$label"
+    # Bar + trailing pad (manual — awk printf would work here too but keeping
+    # pure bash for consistency with the rest of the block).
+    w=$(( c * 20 / frag_max )); [ "$w" -lt 1 ] && w=1
+    bar=""
+    for ((i=0; i<w; i++)); do bar="${bar}█"; done
+    pad=""
+    for ((i=0; i<20-w; i++)); do pad="${pad} "; done
+    # %b (not %s) on color args — bash printf only interprets \033 escapes
+    # in the format string, or in %b arguments. $color is a literal-backslash
+    # string here (from the remote-script's RED='\033[1;33m' definitions).
+    printf "    %s  %b%s%b%s %3d\n" "$label" "$color" "$bar" "$RST" "$pad" "$c"
 done
 [ "$any_free" -eq 0 ] && printf "    (no free slots on schedulable nodes)\n"
 # Multi-node feasibility callout: PP=2 shape (glm51) needs 2 full nodes.
@@ -2069,12 +2095,35 @@ printf "  PENDING: %3d jobs in queue\n" "$total_pending"
 # Pending-reason histogram — SLURM's own verdict on why jobs aren't running.
 # Useful for distinguishing normal queue pressure (Priority/Resources) from
 # cluster-wide issues (ReqNodeNotAvail during maintenance, QOS ceilings).
+# Capture the aggregated counts once and reuse for both display and metrics.
+reasons_tally=""
 if [ "$total_pending" -gt 0 ]; then
-    printf "\n  ${BLD}Pending reasons${RST}:\n"
-    squeue -p "$PARTITION" -h -t PENDING -o '%R' \
+    reasons_tally=$(squeue -p "$PARTITION" -h -t PENDING -o '%R' \
         | sed 's/^(\(.*\))$/\1/' \
-        | sort | uniq -c | sort -rn | head -8 \
-        | awk '{n=$1; $1=""; sub(/^ /,""); printf "    %3d × %s\n", n, $0}'
+        | sort | uniq -c | sort -rn)
+fi
+if [ -n "$reasons_tally" ]; then
+    printf "\n  ${BLD}Pending reasons${RST}:\n"
+    # Max count for bar scaling (tally is sorted desc, so first line is max).
+    max_cnt=$(echo "$reasons_tally" | head -1 | awk '{print $1}')
+    [ -z "$max_cnt" ] && max_cnt=1
+    # Bars color-coded by severity: red for cluster-wide blockers (maintenance,
+    # QOS ceilings), yellow for resource pressure, green for normal queue states.
+    echo "$reasons_tally" | head -8 \
+        | awk -v max="$max_cnt" \
+              -v RED="$RED" -v YEL="$YEL" -v GRN="$GRN" -v RST="$RST" '
+        {
+            n = $1; $1 = ""; sub(/^ /, ""); reason = $0
+            w = int(n * 20 / max); if (w < 1) w = 1
+            color = GRN
+            if (reason ~ /ReqNodeNotAvail|Reserved|UnavailableNodes|QOS|AssocMax|Licenses/) color = RED
+            else if (reason ~ /Resources/) color = YEL
+            # Build bar + trailing space-padding manually: awk printf width
+            # specifiers count bytes, and "█" is 3 bytes in UTF-8.
+            bar = ""; for (i = 0; i < w; i++) bar = bar "█"
+            pad = ""; for (i = 0; i < 20 - w; i++) pad = pad " "
+            printf "    %-26s %s%s%s%s %d\n", reason, color, bar, RST, pad, n
+        }'
 fi
 
 # Your position in the pending queue (rank by submit time, oldest first).
@@ -2175,9 +2224,212 @@ if [ "$pending_count" -gt 1 ]; then
     printf "  ${YEL}!${RST} You have ${BLD}%d${RST} pending jobs of your own. Consider scancel'ing duplicates.\n" "$pending_count"
 fi
 echo
+
+# --- Machine-readable metrics line for local persistence ---------------------
+# Format: __METRICS__<TAB>free_total<TAB>f4<TAB>f3<TAB>f2<TAB>f1<TAB>pending<TAB>draining<TAB>reasons
+# reasons: pipe-separated key=count pairs (e.g. "Priority=5|Resources=3"), or "-" if none.
+# Local side captures this line, prepends its own timestamp, and appends to
+# cache/cluster-samples.tsv for the "Last hour" trend panel.
+reasons_str=$(echo "$reasons_tally" | awk '
+    BEGIN{s=""}
+    NF {n=$1; $1=""; sub(/^ /,""); s = s (s?"|":"") $0 "=" n}
+    END{print (s?s:"-")}')
+printf "__METRICS__\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\n" \
+    "$free_gpus" \
+    "${free_slot_count[4]:-0}" \
+    "${free_slot_count[3]:-0}" \
+    "${free_slot_count[2]:-0}" \
+    "${free_slot_count[1]:-0}" \
+    "$total_pending" \
+    "${state_count[draining]:-0}" \
+    "$reasons_str"
 REMOTE_SCRIPT
 )
-    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "$remote_script"
+    local sample_file="${SCRIPT_DIR}/cache/cluster-samples.tsv"
+    mkdir -p "$(dirname "$sample_file")"
+    local local_ts
+    local_ts=$(date +%s)
+
+    # Pipe ssh output through awk: display lines pass through to the terminal
+    # (with line-buffered flushes so --watch feels instant); the __METRICS__
+    # sentinel line is diverted into the sample file, prefixed with the local
+    # timestamp. Single SSH round-trip, no stderr juggling.
+    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "$remote_script" \
+        | awk -v f="$sample_file" -v ts="$local_ts" '
+            /^__METRICS__\t/ {
+                sub(/^__METRICS__\t/, "")
+                printf "%s\t%s\n", ts, $0 >> f
+                close(f)
+                next
+            }
+            { print; fflush() }
+          '
+
+    _prune_samples "$sample_file"
+    _render_history_panel "$sample_file"
+}
+
+# Keep only samples from the last 24h. Rewrites the file in place.
+_prune_samples() {
+    local f="$1"
+    [ ! -s "$f" ] && return
+    local cutoff
+    cutoff=$(( $(date +%s) - 86400 ))
+    awk -F'\t' -v c="$cutoff" '$1 + 0 >= c' "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
+}
+
+# Render a "Last hour" panel from the accumulated samples: min/avg/max of
+# free GPUs, free 4-GPU slots, and pending jobs — plus top pending reasons
+# by average count across the window. Meaningful only with ≥2 samples in
+# the last hour (use `cluster --watch` to build history quickly).
+_render_history_panel() {
+    local f="$1"
+    local cutoff
+    cutoff=$(( $(date +%s) - 3600 ))
+    # Local ANSI escapes — top-level color vars live only inside the remote heredoc.
+    local red=$'\033[1;31m' yel=$'\033[1;33m' grn=$'\033[1;32m'
+    local blu=$'\033[1;34m' bld=$'\033[1m' dim=$'\033[2m' rst=$'\033[0m'
+
+    printf "%s==>%s %sLast hour%s" "$blu" "$rst" "$bld" "$rst"
+
+    if [ ! -s "$f" ]; then
+        printf "  (no samples yet — run %scluster --watch%s to build history)\n\n" "$bld" "$rst"
+        return
+    fi
+
+    local in_window
+    in_window=$(awk -F'\t' -v c="$cutoff" '$1 + 0 >= c' "$f" | wc -l | tr -d ' ')
+
+    if [ "$in_window" -eq 0 ]; then
+        printf "  (no samples in last hour — run %scluster --watch%s to build history)\n\n" "$bld" "$rst"
+        return
+    fi
+    if [ "$in_window" -eq 1 ]; then
+        printf "  (1 sample — run again or use %s--watch%s for a trend)\n\n" "$bld" "$rst"
+        return
+    fi
+    printf "\n"
+
+    # Sparklines: Unicode block-height ramp (▁▂▃▄▅▆▇█) shows the shape of each
+    # time series. When samples exceed the max width, we bucket-average down.
+    awk -F'\t' -v c="$cutoff" \
+        -v RED="$red" -v YEL="$yel" -v GRN="$grn" -v DIM="$dim" -v RST="$rst" '
+    BEGIN {
+        split("▁ ▂ ▃ ▄ ▅ ▆ ▇ █", spark, " ")
+        maxw = 40
+    }
+    # Render one sparkline from a series. Returns a string of block-height
+    # chars. When n > maxw, each output char represents an avg over a bucket.
+    function render_spark(n, minv, maxv, vals,    i, j, lo, hi, sum, cnt, v, idx, out) {
+        if (n == 0) return ""
+        if (maxv == minv) {
+            out = ""
+            lim = (n < maxw) ? n : maxw
+            for (i = 1; i <= lim; i++) out = out spark[4]
+            return out
+        }
+        out = ""
+        if (n <= maxw) {
+            for (i = 1; i <= n; i++) {
+                idx = int((vals[i] - minv) / (maxv - minv) * 7) + 1
+                if (idx < 1) idx = 1; if (idx > 8) idx = 8
+                out = out spark[idx]
+            }
+        } else {
+            for (i = 1; i <= maxw; i++) {
+                lo = int((i - 1) * n / maxw) + 1
+                hi = int(i * n / maxw)
+                if (hi < lo) hi = lo
+                sum = 0; cnt = 0
+                for (j = lo; j <= hi; j++) { sum += vals[j]; cnt++ }
+                v = sum / cnt
+                idx = int((v - minv) / (maxv - minv) * 7) + 1
+                if (idx < 1) idx = 1; if (idx > 8) idx = 8
+                out = out spark[idx]
+            }
+        }
+        return out
+    }
+    $1 + 0 >= c {
+        n++
+        values_ft[n] = $2; values_f4[n] = $3; values_pd[n] = $7
+        if (n == 1) {
+            first_ts = $1
+            min_ft = max_ft = $2
+            min_f4 = max_f4 = $3
+            min_pd = max_pd = $7
+        } else {
+            if ($2 < min_ft) min_ft = $2; if ($2 > max_ft) max_ft = $2
+            if ($3 < min_f4) min_f4 = $3; if ($3 > max_f4) max_f4 = $3
+            if ($7 < min_pd) min_pd = $7; if ($7 > max_pd) max_pd = $7
+        }
+        last_ts = $1
+        sum_ft += $2; sum_f4 += $3; sum_pd += $7
+        if ($9 != "" && $9 != "-") {
+            ncnt = split($9, parts, "|")
+            for (i = 1; i <= ncnt; i++) {
+                eq = index(parts[i], "=")
+                if (eq == 0) continue
+                rk = substr(parts[i], 1, eq - 1)
+                rv = substr(parts[i], eq + 1) + 0
+                rsum[rk] += rv
+            }
+        }
+    }
+    END {
+        span = last_ts - first_ts
+        if (span < 90) {
+            span_str = sprintf("%ds", span)
+        } else if (span < 3600) {
+            span_str = sprintf("%dm", int((span + 30) / 60))
+        } else {
+            span_str = sprintf("%dh%dm", int(span / 3600), int((span % 3600 + 30) / 60))
+        }
+        printf "  %s(%d samples over %s)%s\n", DIM, n, span_str, RST
+
+        s_ft = render_spark(n, min_ft, max_ft, values_ft)
+        s_f4 = render_spark(n, min_f4, max_f4, values_f4)
+        s_pd = render_spark(n, min_pd, max_pd, values_pd)
+
+        # Sparkline width (char count, not bytes) is identical across rows
+        # because all three series share the same n, so column alignment of
+        # the scalar summary on the right works without explicit padding.
+        printf "  %-20s %s%s%s  min=%-3d avg=%-5.1f max=%-3d\n", "Free GPUs:",        GRN, s_ft, RST, min_ft, sum_ft/n, max_ft
+        printf "  %-20s %s%s%s  min=%-3d avg=%-5.1f max=%-3d\n", "Free 4-GPU slots:", GRN, s_f4, RST, min_f4, sum_f4/n, max_f4
+        printf "  %-20s %s%s%s  min=%-3d avg=%-5.1f max=%-3d\n", "Pending jobs:",     YEL, s_pd, RST, min_pd, sum_pd/n, max_pd
+
+        # Top reasons — insertion sort on keys[] by rsum desc, then render
+        # with colored bars scaled to the highest-average reason.
+        ni = 0
+        for (k in rsum) { keys[++ni] = k }
+        for (j = 2; j <= ni; j++) {
+            x = keys[j]; xv = rsum[x]; i = j - 1
+            while (i >= 1 && rsum[keys[i]] < xv) { keys[i+1] = keys[i]; i-- }
+            keys[i+1] = x
+        }
+        if (ni > 0) {
+            max_avg = 0
+            for (k in rsum) { a = rsum[k] / n; if (a > max_avg) max_avg = a }
+            if (max_avg <= 0) max_avg = 1
+            printf "  Top pending reasons (avg per sample):\n"
+            shown = 0
+            for (j = 1; j <= ni && shown < 5; j++) {
+                avg = rsum[keys[j]] / n
+                if (avg < 0.05) continue
+                color = GRN
+                if (keys[j] ~ /ReqNodeNotAvail|Reserved|UnavailableNodes|QOS|AssocMax|Licenses/) color = RED
+                else if (keys[j] ~ /Resources/) color = YEL
+                w = int(avg * 15 / max_avg); if (w < 1) w = 1
+                bar = ""; for (i = 0; i < w; i++) bar = bar "█"
+                pad = ""; for (i = 0; i < 15 - w; i++) pad = pad " "
+                printf "    %-26s %s%s%s%s %.1f\n", keys[j], color, bar, RST, pad, avg
+                shown++
+            }
+            if (shown == 0) printf "    %s(no pending jobs recorded in window)%s\n", DIM, RST
+        }
+        printf "\n"
+    }
+    ' "$f"
 }
 
 cmd_cluster_help() {

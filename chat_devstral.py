@@ -163,6 +163,9 @@ class DevstralChat:
     
     def _stream_response(self, payload: dict, start_time: float) -> Tuple[str, dict]:
         """Handle streaming response with token batching for improved throughput."""
+        import queue
+        import threading
+
         response_content = ""
         first_token_time = None
         prompt_tokens = 0
@@ -192,13 +195,43 @@ class DevstralChat:
         else:
             print("\nAssistant: ", end="", flush=True)
 
+        # Decouple stdout from the SSE receive loop. Without this, every
+        # `print(..., flush=True)` blocks the reader until the terminal has
+        # flushed; on slow terminals (or terminals with heavy scrollback),
+        # this back-pressures the upstream socket and roughly halves observed
+        # tok/s vs. a silent receiver. The writer thread drains a queue and
+        # does the actual I/O; the receiver only enqueues bytes.
+        write_q: queue.Queue = queue.Queue()
+        WRITER_DONE = object()
+
+        def _writer():
+            while True:
+                item = write_q.get()
+                if item is WRITER_DONE:
+                    return
+                sys.stdout.write(item)
+                sys.stdout.flush()
+
+        writer_thread = threading.Thread(target=_writer, daemon=True)
+        writer_thread.start()
+
         def flush_buffer():
             nonlocal token_buffer, last_flush_time, tokens_in_buffer
             if token_buffer:
-                print(token_buffer, end="", flush=True)
+                write_q.put(token_buffer)
                 token_buffer = ""
                 tokens_in_buffer = 0
                 last_flush_time = time.time()
+
+        # Track whether we're currently inside a "reasoning" run so we can
+        # render it visibly distinct from the final answer (GLM-5.1 with
+        # --reasoning-parser glm45 streams its chain-of-thought as
+        # `delta.reasoning`; without explicit handling here, reasoning was
+        # silently dropped and the client appeared to hang during long
+        # chain-of-thought even though the server was generating fine).
+        in_reasoning = False
+        REASONING_OPEN = "\033[2;3m<thinking>\n"   # dim italic
+        REASONING_CLOSE = "\n</thinking>\033[0m\n"
 
         for line in resp.iter_lines():
             if line:
@@ -206,30 +239,54 @@ class DevstralChat:
                 if line.startswith("data: "):
                     data_str = line[6:]
                     if data_str == "[DONE]":
+                        if in_reasoning:
+                            flush_buffer()
+                            write_q.put(REASONING_CLOSE)
+                            in_reasoning = False
                         flush_buffer()  # Flush any remaining tokens
                         break
                     try:
                         data = json.loads(data_str)
 
                         if first_token_time is None and data.get("choices"):
-                            first_token_time = time.time() - start_time
+                            delta_peek = data["choices"][0].get("delta", {})
+                            if delta_peek.get("content") or delta_peek.get("reasoning"):
+                                first_token_time = time.time() - start_time
 
                         delta = data.get("choices", [{}])[0].get("delta", {})
                         content = delta.get("content", "")
+                        reasoning = delta.get("reasoning", "")
+
+                        # Handle reasoning: render in a dim italic block so
+                        # the user can see thinking happen, but it's visually
+                        # distinct from the final answer.
+                        if reasoning:
+                            if not in_reasoning:
+                                flush_buffer()  # close any pending content batch
+                                write_q.put(REASONING_OPEN)
+                                in_reasoning = True
+                            token_buffer += reasoning
+                            tokens_in_buffer += 1
+                            response_content += reasoning
+
                         if content:
+                            if in_reasoning:
+                                flush_buffer()  # drain reasoning before switching
+                                write_q.put(REASONING_CLOSE)
+                                in_reasoning = False
                             token_buffer += content
                             tokens_in_buffer += 1
                             response_content += content
 
+                        if reasoning or content:
                             # Flush buffer if: enough tokens, enough chars, or timeout
                             current_time = time.time()
                             should_flush = (
                                 tokens_in_buffer >= BATCH_SIZE or
                                 len(token_buffer) >= BATCH_CHARS or
                                 (current_time - last_flush_time) >= BATCH_TIMEOUT or
-                                '\n' in content  # Always flush on newlines for readability
+                                '\n' in (reasoning + content)
                             )
-
                             if should_flush:
                                 flush_buffer()
 
@@ -242,6 +299,9 @@ class DevstralChat:
 
         # Final flush in case anything remains
         flush_buffer()
+        # Shut down the writer thread and wait for it to drain.
+        write_q.put(WRITER_DONE)
+        writer_thread.join()
         print()
 
         if completion_tokens == 0:

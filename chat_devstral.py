@@ -87,7 +87,8 @@ class DevstralChat:
             "messages": self.conversation_history,
             "temperature": 0.7,
             "max_tokens": 4096,
-            "stream": self.stream
+            "stream": self.stream,
+            "stream_options": {"include_usage": True},
         }
         
         start_time = time.time()
@@ -253,7 +254,11 @@ class DevstralChat:
                             if delta_peek.get("content") or delta_peek.get("reasoning"):
                                 first_token_time = time.time() - start_time
 
-                        delta = data.get("choices", [{}])[0].get("delta", {})
+                        # The final chunk under stream_options.include_usage=True
+                        # has `choices: []` (empty) and only carries usage —
+                        # don't try to read a delta from it.
+                        choices = data.get("choices") or []
+                        delta = choices[0].get("delta", {}) if choices else {}
                         content = delta.get("content", "")
                         reasoning = delta.get("reasoning", "")
 
@@ -279,13 +284,20 @@ class DevstralChat:
                             response_content += content
 
                         if reasoning or content:
-                            # Flush buffer if: enough tokens, enough chars, or timeout
+                            # Flush buffer if: enough tokens, enough chars, or timeout.
+                            # Newlines-in-content trigger a flush for prose
+                            # readability (no mid-sentence freezes). Newlines-in-
+                            # reasoning don't — GLM chain-of-thought is heavily
+                            # newline-delimited (numbered steps, line breaks
+                            # between thoughts), so flushing per-newline there
+                            # would collapse the effective batch size to ~1 token
+                            # and add unnecessary writer wake-ups.
                             current_time = time.time()
                             should_flush = (
                                 tokens_in_buffer >= BATCH_SIZE or
                                 len(token_buffer) >= BATCH_CHARS or
                                 (current_time - last_flush_time) >= BATCH_TIMEOUT or
-                                '\n' in (reasoning + content)
+                                '\n' in content
                             )
                             if should_flush:
                                 flush_buffer()

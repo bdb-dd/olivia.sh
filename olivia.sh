@@ -492,11 +492,69 @@ cmd_build_logs() {
     fi
 }
 
+cmd_build_cancel() {
+    ensure_master_connection || exit 1
+
+    info "Looking for build-vllm-gh200 jobs..."
+
+    # List all build jobs regardless of state (PENDING, RUNNING, CONFIGURING, ...).
+    # cancel_job's find_job_id helper matches on RUNNING only and returns just
+    # the first match, which is the wrong behavior here: a queued build is still
+    # a build you probably want to kill, and a user who fat-fingered the CLI may
+    # have stacked several.
+    local squeue_output
+    if ! squeue_output=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+        "squeue -u \$USER -h -o '%i %j %T %R' --name=build-vllm-gh200" 2>/dev/null); then
+        error "Failed to query SLURM queue"
+        return 1
+    fi
+
+    if [[ -z "$squeue_output" ]]; then
+        warn "No build-vllm-gh200 jobs found"
+        return 0
+    fi
+
+    local job_count
+    job_count=$(echo "$squeue_output" | wc -l | tr -d ' ')
+
+    if (( job_count > 1 )); then
+        warn "Found ${job_count} build jobs:"
+        echo "$squeue_output" | while read -r jid jname jstate jreason; do
+            printf "    %s  %-20s  %-12s  %s\n" "$jid" "$jname" "$jstate" "$jreason" >&2
+        done
+        echo "" >&2
+        local reply
+        read -r -p "Cancel all ${job_count} jobs? [y/N] " reply
+        if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+            info "Aborted"
+            return 0
+        fi
+    fi
+
+    local job_ids
+    job_ids=$(echo "$squeue_output" | awk '{print $1}' | tr '\n' ' ')
+
+    info "Canceling job(s): ${job_ids}"
+    if ! ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "scancel ${job_ids}"; then
+        error "Failed to cancel job(s): ${job_ids}"
+        return 1
+    fi
+
+    success "Canceled ${job_count} build job(s)"
+}
+
 cmd_build() {
     # Subcommand: logs — tail the currently running build job's log
     if [[ "${1:-}" == "logs" ]]; then
         shift
         cmd_build_logs "$@"
+        return $?
+    fi
+
+    # Subcommand: cancel — scancel running/pending build-vllm-gh200 jobs
+    if [[ "${1:-}" == "cancel" ]]; then
+        shift
+        cmd_build_cancel "$@"
         return $?
     fi
 
@@ -579,6 +637,19 @@ cmd_build() {
                 ;;
             *)
                 if [[ -z "$model_id" ]]; then
+                    # Guard against subcommand-shaped tokens being silently
+                    # accepted as MODEL_IDs. `build_vllm_gh200.sh` falls back
+                    # to generic defaults for unknown MODEL_IDs, which means a
+                    # typo like `./olivia.sh build cancel` would otherwise
+                    # submit a real SLURM job building `vllm-cancel-1-sandbox`.
+                    case "$1" in
+                        cancel|logs|help|status|list|presets|stop)
+                            error "'$1' looks like a subcommand, not a preset name"
+                            echo "    Subcommands must come first: ./olivia.sh build $1" >&2
+                            echo "    Run './olivia.sh build --presets' to see valid presets" >&2
+                            exit 1
+                            ;;
+                    esac
                     model_id="$1"
                 else
                     error "Unexpected argument: $1"
@@ -600,6 +671,7 @@ cmd_build() {
         echo "    ./olivia.sh build --presets     Show available presets"
         echo "    ./olivia.sh build --list        List existing containers"
         echo "    ./olivia.sh build logs          Tail logs of a running build"
+        echo "    ./olivia.sh build cancel        Cancel running/pending build job(s)"
         echo ""
         echo "Build examples:"
         echo "    ./olivia.sh build glm47            Build GLM-4.7 container"
@@ -668,13 +740,14 @@ cmd_build() {
 
 cmd_build_help() {
     cat <<EOF
-Usage: ./olivia.sh build [preset|logs] [options]
+Usage: ./olivia.sh build [preset|logs|cancel] [options]
 
 Build vLLM containers on Olivia HPC cluster.
 
 Arguments:
     preset              Model preset (glm51, glm47, devstral, llama, qwen, generic)
     logs                Tail logs of the currently running build job
+    cancel              Cancel running/pending build-vllm-gh200 job(s)
 
 Options:
     --list, -l          List existing containers
@@ -704,6 +777,7 @@ Examples:
     ./olivia.sh build devstral --sif    Build Devstral and create SIF
     ./olivia.sh build --list            List existing containers
     ./olivia.sh build logs              Tail running build job logs
+    ./olivia.sh build cancel            Cancel running/pending build job(s)
 EOF
 }
 
@@ -818,7 +892,7 @@ start_server_job() {
     # Forward selected debug/tuning env vars if the caller set them. Useful for
     # diagnosing startup hangs: `VERBOSE=1 ./olivia.sh server start glm51`
     # flips vLLM, Ray, and NCCL to verbose logging inside the SLURM job.
-    for forward_var in VERBOSE VLLM_LOGGING_LEVEL RAY_BACKEND_LOG_LEVEL RAY_DEDUP_LOGS NCCL_DEBUG CUDAGRAPH_MODE; do
+    for forward_var in VERBOSE VLLM_LOGGING_LEVEL RAY_BACKEND_LOG_LEVEL RAY_DEDUP_LOGS NCCL_DEBUG CUDAGRAPH_MODE ENABLE_PROXY PROXY_PORT; do
         if [[ -n "${!forward_var:-}" ]]; then
             env_vars+=" ${forward_var}=${!forward_var}"
         fi
@@ -1559,6 +1633,25 @@ cmd_tunnel() {
 
     case "$action" in
         up|open|start)
+            # Allow `--port N` to retarget both local and remote ports — useful
+            # for tunneling to the batching proxy (port 8001) instead of vLLM
+            # directly (port 8000). Without this, `tunnel up` always tunnels
+            # 8000->8000 even when the proxy is the intended target.
+            shift || true
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --port)
+                        LOCAL_PORT="$2"
+                        REMOTE_PORT="$2"
+                        TUNNEL_NODE_FILE="/tmp/olivia-tunnel-${LOCAL_PORT}.node"
+                        shift 2
+                        ;;
+                    *)
+                        error "Unknown option for tunnel up: $1"
+                        exit 1
+                        ;;
+                esac
+            done
             ensure_master_connection || exit 1
             local gpu_node
             if ! gpu_node=$(find_vllm_node); then
@@ -1828,6 +1921,221 @@ cmd_status() {
 }
 
 # =============================================================================
+# MODULE: Cluster utilization
+# =============================================================================
+
+cmd_cluster() {
+    local watch_mode=false
+    local interval=30
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --watch|-w)
+                watch_mode=true
+                shift
+                ;;
+            --interval|-n)
+                interval="$2"
+                shift 2
+                ;;
+            -h|--help)
+                cmd_cluster_help
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1"
+                cmd_cluster_help
+                exit 1
+                ;;
+        esac
+    done
+    if [[ ! "$interval" =~ ^[0-9]+$ ]] || [[ "$interval" -lt 5 ]]; then
+        error "--interval must be an integer >= 5 (got: $interval)"
+        exit 1
+    fi
+
+    if $watch_mode; then
+        # `watch` clears the screen between iterations, but we want to keep
+        # color output and avoid re-launching ssh from scratch each tick (the
+        # ControlMaster handles that already, but `watch` re-execs the whole
+        # command). Use a simple loop with clear+sleep instead.
+        info "Watching cluster (refresh every ${interval}s, Ctrl-C to stop)"
+        ensure_master_connection || exit 1
+        while true; do
+            clear
+            _cluster_snapshot
+            printf "\n  ${BLD:-}refreshing in ${interval}s — Ctrl-C to stop${RST:-}\n"
+            sleep "$interval"
+        done
+        return
+    fi
+
+    ensure_master_connection || exit 1
+    _cluster_snapshot
+}
+
+# All data-gathering + formatting happens on the remote side in one SSH call
+# (cheap thanks to ControlMaster). The remote script outputs colored text
+# that we just stream back to the user's terminal.
+_cluster_snapshot() {
+    local remote_script
+    remote_script=$(cat <<'REMOTE_SCRIPT'
+set -u
+PARTITION="accel"
+
+# ANSI color helpers (mirror the local olivia.sh palette).
+RED='\033[1;31m'; YEL='\033[1;33m'; GRN='\033[1;32m'; BLU='\033[1;34m'
+MAG='\033[1;35m'; CYA='\033[1;36m'; BLD='\033[1m'; RST='\033[0m'
+
+printf "\n${MAG}Olivia Cluster Utilization (partition=${PARTITION})${RST}\n\n"
+
+# --- 1. Your jobs ------------------------------------------------------------
+printf "${BLU}==>${RST} ${BLD}Your jobs${RST}\n"
+running_count=$(squeue -h -u "$USER" -t RUNNING -o "%i" | wc -l)
+pending_count=$(squeue -h -u "$USER" -t PENDING -o "%i" | wc -l)
+if [ "$running_count" -eq 0 ] && [ "$pending_count" -eq 0 ]; then
+    printf "    (none)\n"
+else
+    squeue -u "$USER" -o "  %.8i  %.14j  %.8T  %.5D  %.10M  %.10l  %R" | tail -n +1
+    if [ "$pending_count" -gt 0 ]; then
+        printf "\n  ${BLD}Estimated start (PENDING):${RST}\n"
+        squeue --start -h -u "$USER" -o "  %.8i  %.20S  %R" 2>/dev/null || true
+    fi
+fi
+echo
+
+# --- 2. Partition node states ------------------------------------------------
+# Pull "<state> <gres_used>" per node, count states, sum used vs total GPUs.
+# State suffixes (@,*,#,~) are stripped to base state. -N forces one row per
+# node (default sinfo aggregates by identical state+gres fields).
+sinfo_data=$(sinfo -p "$PARTITION" -h -N --Format="StateLong:20,GresUsed:40")
+
+total_nodes=$(echo "$sinfo_data" | grep -c .)
+total_gpus=$(( total_nodes * 4 ))   # all accel nodes are h200:4
+
+declare -A state_count
+used_gpus=0; nonusable_gpus=0
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    state=$(echo "$line" | awk '{print $1}' | sed 's/[@*#~+]$//')
+    gres_used=$(echo "$line" | awk '{print $2}')
+    used_n=$(echo "$gres_used" | sed -n 's/^gpu:h200:\([0-9]*\).*/\1/p')
+    used_n=${used_n:-0}
+    state_count[$state]=$(( ${state_count[$state]:-0} + 1 ))
+    used_gpus=$(( used_gpus + used_n ))
+    case "$state" in
+        (draining|drained|down|reserved|maint|fail*|unknown)
+            nonusable_gpus=$(( nonusable_gpus + 4 - used_n ))
+            ;;
+    esac
+done <<< "$sinfo_data"
+
+free_gpus=$(( total_gpus - used_gpus - nonusable_gpus ))
+[ "$free_gpus" -lt 0 ] && free_gpus=0
+
+printf "${BLU}==>${RST} ${BLD}Partition state${RST}  (h200, $total_nodes nodes / $total_gpus GPUs total)\n"
+printf "  ${GRN}free now:${RST}      %3d GPUs  (across non-drained nodes)\n" "$free_gpus"
+printf "  ${YEL}in use:${RST}        %3d GPUs\n" "$used_gpus"
+printf "  ${RED}unavailable:${RST}   %3d GPUs  (drained/reserved/down)\n\n" "$nonusable_gpus"
+
+printf "  ${BLD}Node-state breakdown:${RST}\n"
+for state in "${!state_count[@]}"; do
+    printf "    %-12s %3d nodes\n" "$state" "${state_count[$state]}"
+done | sort
+echo
+
+# --- 3. Queue summary --------------------------------------------------------
+printf "${BLU}==>${RST} ${BLD}Queue (partition=${PARTITION})${RST}\n"
+total_running=$(squeue -p "$PARTITION" -h -t RUNNING -o "%i" | wc -l)
+total_pending=$(squeue -p "$PARTITION" -h -t PENDING -o "%i" | wc -l)
+unique_users=$(squeue -p "$PARTITION" -h -o "%u" | sort -u | wc -l)
+printf "  RUNNING: %3d jobs across %d users\n" "$total_running" "$unique_users"
+printf "  PENDING: %3d jobs in queue\n" "$total_pending"
+
+# Your position in the pending queue (rank by submit time, oldest first).
+if [ "$pending_count" -gt 0 ]; then
+    your_first=$(squeue -h -u "$USER" -t PENDING -o "%V" | sort | head -1)
+    if [ -n "$your_first" ]; then
+        ahead=$(squeue -p "$PARTITION" -h -t PENDING -o "%V" | awk -v t="$your_first" '$1<t' | wc -l)
+        printf "  Your earliest pending job is behind ${BLD}%d${RST} other(s) by submit time\n" "$ahead"
+    fi
+fi
+
+# Top blockers — longest-running 2+ node jobs (those most likely holding the
+# resources a multi-node vLLM job needs). Show 5.
+printf "\n  ${BLD}Top long-running multi-node jobs (potential blockers):${RST}\n"
+squeue -p "$PARTITION" -h -t RUNNING -o "%.8i %.10u %.5D %.12M %.12l %R" | \
+    awk '$3 >= 2' | sort -k 4 -r | head -5 | \
+    awk 'BEGIN{printf "    %-9s %-11s %-5s %-12s %-12s %s\n","JOBID","USER","NODES","ELAPSED","TIME_LIMIT","NODELIST"}
+         {printf "    %-9s %-11s %-5s %-12s %-12s %s\n",$1,$2,$3,$4,$5,$6}'
+echo
+
+# --- 4. Reservations ---------------------------------------------------------
+# Use `scontrol -o` for one-line-per-reservation output so awk can parse all
+# fields together (default multi-line output spreads State=/Nodes=/StartTime=
+# across separate lines).
+printf "${BLU}==>${RST} ${BLD}Active / upcoming reservations${RST} (next 7 days)\n"
+now_epoch=$(date +%s)
+horizon=$(( now_epoch + 7*86400 ))
+shown=0
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    name=$(echo "$line" | sed -n 's/.*ReservationName=\([^ ]*\).*/\1/p')
+    state=$(echo "$line" | sed -n 's/.*State=\([^ ]*\).*/\1/p')
+    st=$(echo "$line" | sed -n 's/.*StartTime=\([^ ]*\).*/\1/p')
+    nodes=$(echo "$line" | sed -n 's/.*Nodes=\([^ ]*\).*/\1/p')
+    [ -z "$st" ] && continue
+    st_e=$(date -d "$st" +%s 2>/dev/null)
+    [ -z "$st_e" ] && continue
+    [ "$st_e" -gt "$horizon" ] && continue
+    [ "$st_e" -lt "$now_epoch" ] && [ "$state" != "ACTIVE" ] && continue
+    printf "  %-26s state=%-8s starts=%s nodes=%s\n" "$name" "$state" "$st" "$nodes"
+    shown=$(( shown + 1 ))
+    [ "$shown" -ge 10 ] && break
+done < <(scontrol -o show reservation 2>/dev/null)
+[ "$shown" -eq 0 ] && printf "  (none in horizon)\n"
+echo
+
+# --- 5. Hint -----------------------------------------------------------------
+printf "${BLU}==>${RST} ${BLD}Notes${RST}\n"
+draining_count=$(echo "${state_count[draining]:-0}")
+if [ "$draining_count" -gt 10 ]; then
+    printf "  ${YEL}!${RST} %d nodes are draining — likely an upcoming maintenance.\n" "$draining_count"
+    printf "    Multi-node jobs may wait significantly longer than the queue depth suggests.\n"
+fi
+if [ "$pending_count" -gt 1 ]; then
+    printf "  ${YEL}!${RST} You have ${BLD}%d${RST} pending jobs of your own. Consider scancel'ing duplicates.\n" "$pending_count"
+fi
+echo
+REMOTE_SCRIPT
+)
+    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "$remote_script"
+}
+
+cmd_cluster_help() {
+    cat <<EOF
+Usage: ./olivia.sh cluster [--watch] [--interval SECS]
+
+Show a snapshot of Olivia's accel partition: your jobs, GPU availability,
+queue depth, top blockers, and active reservations.
+
+Options:
+    -w, --watch              Refresh continuously (Ctrl-C to stop)
+    -n, --interval SECS      Refresh interval for --watch (default: 30, min: 5)
+    -h, --help               Show this help
+
+Useful when:
+  - Your job is PENDING and you want to know why
+  - You're deciding whether to submit a 2-node job vs 1-node
+  - You suspect maintenance is causing scheduler slowness
+
+Examples:
+    ./olivia.sh cluster                       # one-shot snapshot
+    ./olivia.sh cluster --watch               # refresh every 30s
+    ./olivia.sh cluster --watch --interval 10 # refresh every 10s
+EOF
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -1843,6 +2151,7 @@ Commands:
     server      Manage vLLM server (deploy, restart, logs)
     tunnel      Manage SSH tunnel
     status      Show cluster and connection status
+    cluster     Show Olivia partition utilization (queue, GPUs, reservations)
 
 Global Options:
     --kill-all          Close tunnel and SSH connection
@@ -1897,6 +2206,9 @@ main() {
             ;;
         status)
             cmd_status "$@"
+            ;;
+        cluster)
+            cmd_cluster "$@"
             ;;
         *)
             error "Unknown command: $cmd"

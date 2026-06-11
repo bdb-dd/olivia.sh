@@ -4,7 +4,10 @@
 #SBATCH --gpus=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=0
+# Bounded memory: NOT --mem=0, which requests the whole node's RAM (~808G) and
+# blocks this 1-GPU build from backfilling into a partially-used node. 128G is
+# ample for a vLLM compile; raise it if parallel nvcc/ninja ever pressures it.
+#SBATCH --mem=128G
 #SBATCH --time=08:00:00
 #SBATCH --output=build_vllm_%j.log
 

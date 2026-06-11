@@ -474,15 +474,16 @@ list_containers() {
 cmd_build_logs() {
     ensure_master_connection || exit 1
 
-    local job_id
-    if job_id=$(find_job_id "build-vllm-gh200"); then
-        local log_file="${REMOTE_CONTAINER_DIR}/build_vllm_${job_id}.log"
-        info "Tailing logs for build job ${job_id}..."
-        echo "    (Press Ctrl+C to stop watching - build will continue running)" >&2
-        echo "" >&2
-        ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "tail -F '${log_file}' 2>/dev/null" || true
-    else
-        error "No running build job found"
+    # Find the build job in ANY state (PENDING/CONFIGURING/RUNNING), not just
+    # RUNNING. A queued build has no log file yet but is still the job the user
+    # means — find_job_id is RUNNING-only by design (the server commands rely on
+    # that), so build logs queries by name directly instead.
+    local job_info
+    job_info=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+        "squeue -u \$USER -h -o '%i %T %R' --name=build-vllm-gh200 2>/dev/null | head -n1") || true
+
+    if [[ -z "$job_info" ]]; then
+        error "No build job in the queue"
         local latest_log
         latest_log=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
             "ls -t ${REMOTE_CONTAINER_DIR}/build_vllm_*.log 2>/dev/null | head -n1") || true
@@ -492,6 +493,45 @@ cmd_build_logs() {
         fi
         exit 1
     fi
+
+    local job_id job_state job_reason
+    job_id=$(echo "$job_info" | awk '{print $1}')
+    job_state=$(echo "$job_info" | awk '{print $2}')
+    # Reason is the remaining field(s), e.g. "(Resources)" / "(Priority)".
+    job_reason=$(echo "$job_info" | awk '{$1=""; $2=""; sub(/^ +/, ""); print}')
+    local log_file="${REMOTE_CONTAINER_DIR}/build_vllm_${job_id}.log"
+
+    # If the job hasn't started, say so and wait for it to start (like the
+    # server-watch PENDING phase). Ctrl+C stops watching; the build stays queued.
+    if [[ "$job_state" != "RUNNING" ]]; then
+        warn "Build job ${job_id} is ${job_state}${job_reason:+ ${job_reason}} — not started yet"
+        info "Waiting for it to start (Ctrl+C to stop; the build stays queued)..."
+        echo "" >&2
+        while ! ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "test -f '${log_file}'" 2>/dev/null; do
+            local st
+            st=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+                "squeue -j ${job_id} -h -o '%T %R'" 2>/dev/null) || true
+            if [[ -z "$st" ]]; then
+                # Left the queue. Either it started and finished fast (log now
+                # exists → tail it) or it was cancelled/failed before logging.
+                if ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "test -f '${log_file}'" 2>/dev/null; then
+                    break
+                fi
+                echo "" >&2
+                error "Build job ${job_id} left the queue before producing a log (cancelled or failed early)"
+                exit 1
+            fi
+            printf "\r    %-50s" "${st} (waiting for start...)" >&2
+            sleep 10
+        done
+        echo "" >&2
+        success "Build job ${job_id} started"
+    fi
+
+    info "Tailing logs for build job ${job_id}..."
+    echo "    (Press Ctrl+C to stop watching - build will continue running)" >&2
+    echo "" >&2
+    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "tail -F '${log_file}' 2>/dev/null" || true
 }
 
 cmd_build_cancel() {

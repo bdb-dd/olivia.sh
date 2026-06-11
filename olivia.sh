@@ -577,7 +577,7 @@ cmd_build() {
                 info "To build a new container:"
                 echo "    ./olivia.sh build <preset>" >&2
                 echo "" >&2
-                echo "Available presets: glm51_v19 (alias: glm51), glm51_v20, glm47, devstral, llama, qwen, generic" >&2
+                echo "Available presets: glm51_v19 (alias: glm51), glm51_v20, glm47, kimi, devstral, llama, qwen, generic" >&2
                 exit 0
                 ;;
             --presets|-p)
@@ -595,6 +595,10 @@ cmd_build() {
                 echo ""
                 echo "  glm47      GLM-4.7 (358B) flagship model"
                 echo "             vLLM: main, transformers>=5.0.0rc0"
+                echo ""
+                echo "  kimi       Kimi K2.6 (1T MoE, 32B active) MLA + multimodal"
+                echo "             vLLM: v0.19.1, transformers>=4.57.1,<5.0.0"
+                echo "             native int4 ~640GB, 8 GPUs (2×4-GPU nodes, TP=4 + PP=2)"
                 echo ""
                 echo "  devstral   Devstral/Mistral models"
                 echo "             vLLM: main, transformers>=4.45.0"
@@ -816,6 +820,7 @@ normalize_preset() {
         glm51|glm-5.1|glm5.1|glm51_v19) echo "glm51_v19" ;;
         glm51_v20)                      echo "glm51_v20" ;;
         glm47|glm-4.7)                  echo "glm47" ;;
+        kimi|kimi26|kimi-k2.6|kimi_k26) echo "kimi" ;;
         devstral|mistral)               echo "devstral" ;;
         llama|llama3)                   echo "llama" ;;
         qwen|qwen2)                     echo "qwen" ;;
@@ -856,6 +861,13 @@ preset_field() {
             ;;
         glm47)
             model="QuantTrio/GLM-4.7-AWQ"
+            ;;
+        kimi)
+            # Kimi K2.6 (1T MoE, 32B active). The base repo ships Moonshot's
+            # native int4 (compressed-tensors, ~640GB) — there is no separate
+            # -AWQ repo. ~640GB → 8 GPUs / 2 nodes, same TP=4 + PP=2 as glm51.
+            model="moonshotai/Kimi-K2.6"
+            nodes="2"; gpus="4"; pp="2"
             ;;
         devstral)
             model="mistralai/Devstral-2-123B-Instruct-2512"

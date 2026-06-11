@@ -62,6 +62,7 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 ./olivia.sh build glm51_v19    # Build GLM-5.1 container on vLLM v0.19.0 (alias: glm51)
 ./olivia.sh build glm51_v20    # Build GLM-5.1 container on vLLM v0.20.0 (quarantined — same wedge)
 ./olivia.sh build glm47        # Build GLM-4.7 container
+./olivia.sh build kimi         # Build Kimi K2.6 container on vLLM v0.19.1
 ./olivia.sh build devstral     # Build Devstral container
 ./olivia.sh build llama        # Build Llama container
 
@@ -85,6 +86,7 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 ./olivia.sh server start glm51_v19   # Start GLM-5.1 server on vLLM v0.19.0 (alias: glm51; 8 GPUs across 2 nodes, TP=4 + PP=2)
 ./olivia.sh server start glm51_v20   # Start GLM-5.1 server on vLLM v0.20.0 (quarantined — same wedge)
 ./olivia.sh server start glm47       # Start GLM-4.7 server
+./olivia.sh server start kimi        # Start Kimi K2.6 server (8 GPUs across 2 nodes, TP=4 + PP=2)
 ./olivia.sh server start devstral    # Start Devstral server
 ./olivia.sh server start llama       # Start Llama server
 ./olivia.sh server start qwen        # Start Qwen server
@@ -127,6 +129,7 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 | `glm51_v19` (alias `glm51`) | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | TP=4 + PP=2, vLLM v0.19.0, container index 1. Pair with `anthropic_proxy.py` serialization to work around multi-node PP decode wedge. |
 | `glm51_v20` | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | Same as glm51_v19 but on vLLM v0.20.0 + RayExecutorV2, container index 2. **Quarantined** — same wedge as v0.19.0; kept for diagnostic work only. |
 | `glm47` | `QuantTrio/GLM-4.7-AWQ` | 4 | TP=4, MTP speculative |
+| `kimi` | `moonshotai/Kimi-K2.6` | 8 (2 nodes × 4) | TP=4 + PP=2, native int4, MLA, multimodal, vLLM v0.19.1 |
 | `devstral` | `mistralai/Devstral-2-123B-Instruct-2512` | 4 | TP=4 |
 | `llama` | `meta-llama/Llama-3.3-70B-Instruct` | 4 | TP=4 |
 | `qwen` | `Qwen/Qwen2.5-72B-Instruct` | 4 | TP=4 |
@@ -219,6 +222,7 @@ The build script includes predefined configurations for common models. Run witho
 | `glm51_v19` (alias `glm51`) | GLM-5.1 (744B / 40B active) MoE+DSA flagship, recipe-default | v0.19.0 | >=5.4.0 |
 | `glm51_v20` | GLM-5.1 on RayExecutorV2 — **quarantined**, same multi-node PP wedge as v0.19.0 | v0.20.0 | >=5.4.0 |
 | `glm47` | GLM-4.7 (358B) flagship model | main | >=5.0.0rc0 |
+| `kimi` | Kimi K2.6 (1T / 32B active) MoE + MLA, multimodal | v0.19.1 | >=4.57.1,<5.0.0 |
 | `devstral` | Devstral/Mistral models | main | >=4.45.0 |
 | `llama` | Llama 3.x models | main | >=4.45.0 |
 | `qwen` | Qwen 2.5 models | main | >=4.45.0 |
@@ -271,6 +275,11 @@ Runs vLLM server with GH200-optimized settings:
 - `SERVED_MODEL_NAME`: Custom model name for API (default: empty, uses model ID)
 - `MTP_SPECULATIVE_TOKENS`: MTP speculative tokens (default: `3`)
 - GLM-5.1 additionally passes `--trust-remote-code` and flips the MoE flashinfer kernel from `VLLM_USE_FLASHINFER_MOE_FP8=1` to `VLLM_USE_FLASHINFER_MOE_FP16=1` (matches the QuantTrio GLM-5-AWQ recipe)
+
+**Kimi K2.6 Specific (auto-detected when MODEL contains "Kimi-K2"):**
+- `KIMI_TOOL_PARSER`: Tool call parser (default: `kimi_k2`)
+- `KIMI_REASONING_PARSER`: Reasoning parser (default: `kimi_k2`; set to empty to omit, e.g. instant mode). Thinking mode is on by default, so this is normally required.
+- Kimi K2.6 also passes `--trust-remote-code` (custom `KimiK25ForConditionalGeneration`) and `--mm-encoder-tp-mode data` (MoonViT vision encoder replicated across the TP group), auto-selects an MLA attention backend, and enables expert parallel. No `--quantization` flag — the native int4 is `compressed-tensors`, which vLLM auto-detects.
 
 **Multi-node Distributed Inference (GLM-5.1):**
 - `NUM_NODES`: Number of nodes to use (default: `1`). When `>1`, `run_vllm_server.sh` bootstraps a Ray cluster via `srun`, starts head on node 0, workers on remaining nodes, waits for the cluster to register the expected GPU count, then launches vLLM with `--distributed-executor-backend ray`
@@ -412,6 +421,49 @@ CONTAINER=vllm-glm51-1-sandbox MODEL=cyankiwi/GLM-5.1-AWQ-4bit \
 
 The Ray cluster is bootstrapped at job start via `srun`, torn down on exit via a trap. vLLM discovers GPUs across both nodes through Ray and assigns the pipeline stages accordingly.
 
+### Kimi K2.6 Quantization Options
+
+Kimi K2.6 (Moonshot) is a 1T-parameter MoE (~32B active) with 384 experts, MLA attention, a 262K context window, and a native MoonViT vision encoder (multimodal). It uses the same 2-node shape as glm51 on Olivia: it does **not** fit on a single 4-GPU node.
+
+| Model | Size | Olivia Compatible | Notes |
+|-------|------|-------------------|-------|
+| `moonshotai/Kimi-K2.6` | ~640 GB | **Yes (Recommended)** | Moonshot's **native int4** (compressed-tensors); fits on 8×GH200. This base repo *is* the int4 checkpoint. |
+| `nvidia/Kimi-K2.6-NVFP4` | ~smaller | **No** | Requires Blackwell FP4 tensor cores |
+| `amd/Kimi-K2.6-MXFP4` | ~smaller | **No** | AMD MXFP4 (ROCm) |
+| `unsloth/Kimi-K2.6-GGUF` | varies | **No** | GGUF is for llama.cpp, not vLLM |
+| `moonshotai/Kimi-K2.6-AWQ` | — | **Does not exist** | There is no AWQ repo — use the native-int4 base repo above. |
+
+**Important:**
+- The model is the base repo `moonshotai/Kimi-K2.6` — its native int4 is `quant_method: compressed-tensors`, which vLLM auto-detects, so **no `--quantization` flag** is passed.
+- **transformers must be `>=4.57.1,<5.0.0`** (a hard requirement from the model card, and incompatible with glm51's `>=5.4.0` — which is why Kimi gets its own container). vLLM **v0.19.1** is the manually-verified stable release; newer K2.6 support is nightly-only.
+- Architecture `KimiK25ForConditionalGeneration` ships as `custom_code`, so `--trust-remote-code` is required.
+- Per Moonshot's deploy guide the server auto-passes `--tool-call-parser kimi_k2 --reasoning-parser kimi_k2 --mm-encoder-tp-mode data --trust-remote-code`. **Thinking mode is on by default**, so the reasoning parser is required; for instant mode pass `chat_template_kwargs={"thinking": false}` (recommended `temperature` 1.0 thinking / 0.6 instant, `top_p` 0.95).
+- The ~640 GB weights download from HF at **serve** time, so the cluster needs `HF_TOKEN` set then (not for the build).
+
+### Kimi K2.6 Usage
+
+```bash
+# Build Kimi K2.6 container (vLLM v0.19.1, transformers >=4.57.1,<5.0.0)
+./olivia.sh build kimi
+
+# Start Kimi K2.6 server (preset auto-allocates 2 nodes × 4 GPUs, TP=4 + PP=2)
+./olivia.sh server start kimi
+./olivia.sh server watch
+
+# Override context length (native 262K; default is 131072)
+# or direct: MAX_MODEL_LEN=262144 ... run_vllm_server.sh
+
+# Force instant mode (no reasoning extraction) by dropping the reasoning parser
+KIMI_REASONING_PARSER="" CONTAINER=vllm-kimi-1-sandbox MODEL=moonshotai/Kimi-K2.6 \
+    NUM_NODES=2 TP_SIZE=4 PP_SIZE=2 ./run_vllm_server.sh
+```
+
+**Memory requirements for Kimi K2.6 (1T params, ~32B active):**
+| Quantization | Model Size | 8×GH200 (768 GB HBM) | Notes |
+|--------------|------------|----------------------|-------|
+| Native int4 | ~640 GB | ~50–120 GB free (@0.90 util) | Recommended; MLA keeps KV cache compact |
+| BF16 | ~2 TB | Won't fit | — |
+
 ### Batching Proxy for SSH Tunnels
 
 When accessing vLLM over SSH tunnels, streaming responses can be slow due to per-token network overhead. The batching proxy aggregates multiple tokens into single SSE events, reducing network round-trips by ~70%.
@@ -503,6 +555,7 @@ Optionally chain through the batching proxy for SSE compaction over the tunnel: 
 Naming examples:
 - `vllm-glm51-1-sandbox` - GLM-5.1 build #1
 - `vllm-glm47-1-sandbox` - GLM-4.7 build #1
+- `vllm-kimi-1-sandbox` - Kimi K2.6 build #1
 - `vllm-devstral-1-sandbox` - Devstral build #1
 - `vllm-generic-1-sandbox` - Generic build #1
 

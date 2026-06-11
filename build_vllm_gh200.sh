@@ -52,6 +52,10 @@ show_presets() {
     echo "               vLLM: main, transformers>=5.0.0rc0"
     echo "               Requires ~358GB VRAM (FP8) or ~716GB (BF16)"
     echo ""
+    echo "  kimi       - Kimi K2.6 (1T MoE, 32B active) MLA + multimodal from Moonshot"
+    echo "               vLLM: v0.19.1, transformers>=4.57.1,<5.0.0"
+    echo "               native int4 ~640GB, 8 GPUs (2 nodes × 4× GH200, TP=4 + PP=2)"
+    echo ""
     echo "  devstral   - Devstral/Mistral models (7B-123B)"
     echo "               vLLM: main, transformers>=4.45.0"
     echo "               Standard Mistral architecture"
@@ -117,6 +121,21 @@ apply_preset() {
             PRESET_VLLM_VERSION="main"
             PRESET_TRANSFORMERS=">=5.0.0rc0"
             PRESET_NOTES="GLM-4.7 requires MTP speculative decoding, tool/reasoning parsers"
+            ;;
+        kimi|KIMI|kimi26|kimi-k2.6|kimi_k26|Kimi-K2.6)
+            MODEL_ID="kimi"
+            # Kimi K2.6 (Moonshot): 1T-param MoE (32B active), MLA attention,
+            # multimodal (MoonViT). The base repo moonshotai/Kimi-K2.6 ships
+            # native int4 (compressed-tensors, ~640GB) — there is no separate
+            # -AWQ repo. Targets 8 GPUs across 2 nodes on Olivia (TP=4 + PP=2),
+            # like glm51. Architecture KimiK25ForConditionalGeneration is
+            # custom_code. vLLM 0.19.1 is the manually-verified stable release
+            # per Moonshot's deploy guide; newer support is nightly-only.
+            PRESET_VLLM_VERSION="v0.19.1"
+            # Hard requirement from the model card: transformers >=4.57.1,<5.0.0
+            # (NOT the 5.x line glm51 uses — that's why Kimi gets its own build).
+            PRESET_TRANSFORMERS=">=4.57.1,<5.0.0"
+            PRESET_NOTES="Kimi K2.6 (1T MoE, MLA, multimodal): native int4, multi-node TP=4 + PP=2, kimi_k2 parser"
             ;;
         devstral|mistral|Devstral|Mistral)
             MODEL_ID="devstral"

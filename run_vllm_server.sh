@@ -90,6 +90,13 @@ PROMPT_LOOKUP_MAX="${PROMPT_LOOKUP_MAX:-4}"  # Max n-gram window size
 # GLM-5.1 reuses the GLM-4.7 tool/reasoning parsers per the official vLLM recipe
 GLM_TOOL_PARSER="${GLM_TOOL_PARSER:-glm47}"
 GLM_REASONING_PARSER="${GLM_REASONING_PARSER:-glm45}"
+# Kimi K2.x (Moonshot) parsers — used when MODEL contains "Kimi-K2". Per the
+# official deploy guide both are kimi_k2: --tool-call-parser enables tool calls,
+# and --reasoning-parser is required because K2.6 runs thinking mode by default.
+# (Set KIMI_REASONING_PARSER="" only if you deliberately want instant-mode raw
+# output without reasoning extraction.)
+KIMI_TOOL_PARSER="${KIMI_TOOL_PARSER:-kimi_k2}"
+KIMI_REASONING_PARSER="${KIMI_REASONING_PARSER:-kimi_k2}"
 # ENABLE_AUTO_TOOL_CHOICE default is model-dependent and gets resolved after
 # GLM detection below: 1 for GLM MoE models (tool parser is always set),
 # 0 elsewhere. Users can still override explicitly.
@@ -220,6 +227,15 @@ if [[ "${MODEL}" == *"GLM-5.1"* ]] || [[ "${MODEL}" == *"glm-5.1"* ]]; then
     IS_GLM51=1
 fi
 
+# Detect Kimi K2.x model (Moonshot). 1T-param MoE (32B active), MLA attention,
+# multimodal (MoonViT). Architecture KimiK25ForConditionalGeneration ships as
+# custom_code, so it needs --trust-remote-code. Uses the kimi_k2 parser family,
+# not the GLM parsers, so it's tracked separately from IS_GLM_MOE below.
+IS_KIMI=0
+if [[ "${MODEL}" == *"Kimi-K2"* ]] || [[ "${MODEL}" == *"kimi-k2"* ]]; then
+    IS_KIMI=1
+fi
+
 # Any GLM MoE model that uses the glm47/glm45 parser family
 IS_GLM_MOE=0
 if [[ "${IS_GLM47}" == "1" || "${IS_GLM51}" == "1" ]]; then
@@ -231,7 +247,7 @@ fi
 # any OpenAI tool-using client (Claude Code via anthropic_proxy.py, etc.).
 # ``${VAR+x}`` distinguishes "user explicitly set (even to 0)" from "unset".
 if [[ -z "${ENABLE_AUTO_TOOL_CHOICE+x}" ]]; then
-    if [[ "${IS_GLM_MOE}" == "1" ]]; then
+    if [[ "${IS_GLM_MOE}" == "1" || "${IS_KIMI}" == "1" ]]; then
         ENABLE_AUTO_TOOL_CHOICE=1
     else
         ENABLE_AUTO_TOOL_CHOICE=0
@@ -243,7 +259,9 @@ fi
 # matches typical Claude Code usage (which requests max_tokens=32000).
 # Other models keep the conservative 32K default.
 if [[ -z "${MAX_MODEL_LEN+x}" ]]; then
-    if [[ "${IS_GLM51}" == "1" ]]; then
+    if [[ "${IS_GLM51}" == "1" || "${IS_KIMI}" == "1" ]]; then
+        # GLM-5.1 ~205K native, Kimi K2.6 ~256K native. 128K is a safe default
+        # with KV-cache headroom on 8×GH200; raise per-job if needed.
         MAX_MODEL_LEN=131072
     else
         MAX_MODEL_LEN=32768
@@ -298,7 +316,9 @@ fi
 # from whatever is installed — if nothing works, the error will tell us what
 # to install.
 if [[ -z "${VLLM_ATTENTION_BACKEND}" ]]; then
-    if [[ "${IS_GLM51}" == "1" ]]; then
+    if [[ "${IS_GLM51}" == "1" || "${IS_KIMI}" == "1" ]]; then
+        # MLA models: FLASH_ATTN rejects MLA. GLM-5.1 is sparse-MLA (DSA); Kimi
+        # K2.6 is standard MLA. Leave empty so vLLM auto-selects an MLA backend.
         VLLM_ATTENTION_BACKEND=""   # auto-select
     else
         VLLM_ATTENTION_BACKEND="FLASH_ATTN"
@@ -312,10 +332,11 @@ USE_EXPERT_PARALLEL=0
 if [[ "${ENABLE_EXPERT_PARALLEL}" == "1" ]]; then
     USE_EXPERT_PARALLEL=1
 elif [[ "${ENABLE_EXPERT_PARALLEL}" == "auto" ]]; then
-    # Auto-enable for AWQ GLM MoE models
-    if [[ "${IS_AWQ}" == "1" && "${IS_GLM_MOE}" == "1" ]]; then
+    # Auto-enable for AWQ GLM MoE models, and for Kimi K2.x (large MoE — benefits
+    # from expert parallel regardless of the quant checkpoint's naming).
+    if [[ ( "${IS_AWQ}" == "1" && "${IS_GLM_MOE}" == "1" ) || "${IS_KIMI}" == "1" ]]; then
         USE_EXPERT_PARALLEL=1
-        echo "[INFO] Auto-enabling expert parallel for AWQ MoE model"
+        echo "[INFO] Auto-enabling expert parallel for MoE model"
     fi
 fi
 
@@ -387,6 +408,16 @@ if [[ "${IS_GLM_MOE}" == "1" ]]; then
         echo "  Quantization:     AWQ (Hopper-compatible)"
         echo "  Expert Parallel:  ${USE_EXPERT_PARALLEL}"
     fi
+fi
+
+if [[ "${IS_KIMI}" == "1" ]]; then
+    echo ""
+    echo "Kimi K2.6 Settings:"
+    echo "  Tool Parser:      ${KIMI_TOOL_PARSER}"
+    echo "  Reasoning Parser: ${KIMI_REASONING_PARSER:-<none>}"
+    echo "  Auto Tool Choice: ${ENABLE_AUTO_TOOL_CHOICE}"
+    echo "  Multimodal:       MoonViT (mm-encoder-tp-mode=data)"
+    echo "  Expert Parallel:  ${USE_EXPERT_PARALLEL}"
 fi
 
 if [[ "${NUM_NODES}" -gt 1 ]]; then
@@ -692,6 +723,25 @@ if [[ "${IS_GLM_MOE}" == "1" ]]; then
             echo "                     Tool results will render as empty <tools></tools> — see CLAUDE.md."
         fi
     fi
+fi
+
+# Kimi K2.x (Moonshot) arguments
+if [[ "${IS_KIMI}" == "1" ]]; then
+    VLLM_ARGS+=("--tool-call-parser" "${KIMI_TOOL_PARSER}")
+    if [[ -n "${KIMI_REASONING_PARSER}" ]]; then
+        VLLM_ARGS+=("--reasoning-parser" "${KIMI_REASONING_PARSER}")
+    fi
+    if [[ "${ENABLE_AUTO_TOOL_CHOICE}" == "1" ]]; then
+        VLLM_ARGS+=("--enable-auto-tool-choice")
+    fi
+    if [[ -n "${SERVED_MODEL_NAME}" ]]; then
+        VLLM_ARGS+=("--served-model-name" "${SERVED_MODEL_NAME}")
+    fi
+    # KimiK25ForConditionalGeneration ships as custom_code.
+    VLLM_ARGS+=("--trust-remote-code")
+    # Multimodal (MoonViT vision encoder): replicate the encoder across the TP
+    # group instead of sharding it (vLLM K2.6 recipe recommendation).
+    VLLM_ARGS+=("--mm-encoder-tp-mode" "data")
 fi
 
 # Expert parallel for MoE models (required for AWQ-quantized MoE like GLM-4.7-AWQ)

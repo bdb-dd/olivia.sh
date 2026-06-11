@@ -65,6 +65,11 @@ class DevstralChat:
         self.store: Optional[ConversationStore] = None
         self.summarizer: Optional[Summarizer] = None
         self.conversation_id: Optional[int] = None
+        # Tracks the conversation_id we've already attempted to title in this
+        # session so we don't re-enqueue every turn — but we *do* attempt on
+        # the first turn after a resume if the title is still missing (i.e. an
+        # earlier session's title generation failed).
+        self._title_attempted_for: Optional[int] = None
 
     def attach_storage(self, db_path: Path) -> None:
         """Open the conversation DB and start the background summarizer.
@@ -202,10 +207,22 @@ class DevstralChat:
                     completion_tokens=completion_tokens,
                 )
                 if self.summarizer is not None:
-                    if self.turn_count == 1:
-                        self.summarizer.enqueue_title(
-                            self.conversation_id, user_message, response_content
-                        )
+                    # Enqueue a title at most once per session per conversation,
+                    # but only if one is actually missing. This handles both
+                    # fresh conversations (turn 1) and resumed conversations
+                    # whose earlier title attempt failed silently.
+                    if self._title_attempted_for != self.conversation_id:
+                        existing_title = self.store.get_title(self.conversation_id)
+                        if not existing_title:
+                            # Use the first turn from history (not necessarily
+                            # the current turn) so titles remain anchored to
+                            # the conversation's opening, even after resume.
+                            first_user = self.conversation_history[0]["content"]
+                            first_asst = self.conversation_history[1]["content"]
+                            self.summarizer.enqueue_title(
+                                self.conversation_id, first_user, first_asst
+                            )
+                        self._title_attempted_for = self.conversation_id
                     if self.turn_count >= 5 and self.turn_count % 5 == 0:
                         # Summary worker pulls fresh state from the DB at job
                         # execution time, so successive enqueues chain
@@ -403,6 +420,7 @@ class DevstralChat:
         self.conversation_history = []
         self.turn_count = 0
         self.conversation_id = None
+        self._title_attempted_for = None
 
     def load_conversation(self, conversation_id: int) -> Optional[Dict[str, Any]]:
         """Replace in-memory state with a stored conversation. Returns metadata
@@ -420,6 +438,9 @@ class DevstralChat:
         ]
         self.conversation_id = conversation_id
         self.turn_count = meta["turn_count"]
+        # Reset so the next persisted turn re-checks whether a title is needed
+        # (covers the case where the prior session failed to generate one).
+        self._title_attempted_for = None
         return {
             "id": meta["id"],
             "title": meta["title"],

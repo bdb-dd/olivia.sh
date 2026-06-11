@@ -25,7 +25,9 @@ from typing import Literal, Optional
 import requests
 
 
-SCHEMA_SQL = """
+CURRENT_SCHEMA_VERSION = 2
+
+CORE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS conversations (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at            TEXT NOT NULL,
@@ -54,11 +56,20 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, turn);
 
+CREATE TABLE IF NOT EXISTS _schema_version (version INTEGER PRIMARY KEY);
+"""
+
+# FTS5 with the trigram tokenizer for true substring matching: a query like
+# "FTS" matches "FTS5", "auth" matches "authentication", etc. case_sensitive=0
+# folds case so users don't have to. The index is ~2-3x larger than the default
+# tokenizer's, which is a non-issue at chat scale.
+FTS_SCHEMA_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content,
     reasoning,
     content='messages',
-    content_rowid='id'
+    content_rowid='id',
+    tokenize="trigram case_sensitive 0"
 );
 
 CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
@@ -75,9 +86,13 @@ CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
     INSERT INTO messages_fts(rowid, content, reasoning)
     VALUES (new.id, new.content, new.reasoning);
 END;
+"""
 
-CREATE TABLE IF NOT EXISTS _schema_version (version INTEGER PRIMARY KEY);
-INSERT OR IGNORE INTO _schema_version VALUES (1);
+DROP_FTS_SQL = """
+DROP TRIGGER IF EXISTS messages_ai;
+DROP TRIGGER IF EXISTS messages_ad;
+DROP TRIGGER IF EXISTS messages_au;
+DROP TABLE IF EXISTS messages_fts;
 """
 
 
@@ -120,7 +135,34 @@ class ConversationStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.executescript(SCHEMA_SQL)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Apply core schema, then handle FTS migration on version bumps."""
+        self._conn.executescript(CORE_SCHEMA_SQL)
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(version), 0) AS v FROM _schema_version"
+        ).fetchone()
+        current_v = row["v"]
+
+        if current_v < 2:
+            # v1 → v2: switch FTS5 from default tokenizer to trigram. The old
+            # FTS table (if present) and its sync triggers must be dropped
+            # before the new schema is applied. On a fresh DB the DROP IF
+            # EXISTS calls are no-ops.
+            self._conn.executescript(DROP_FTS_SQL)
+
+        self._conn.executescript(FTS_SCHEMA_SQL)
+
+        if current_v < 2:
+            # Reindex any existing message rows into the new trigram FTS table.
+            # No-op on a fresh DB; cheap on a chat-scale DB (thousands of rows).
+            self._conn.execute(
+                "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')"
+            )
+            self._conn.execute(
+                "INSERT INTO _schema_version VALUES (?)", (CURRENT_SCHEMA_VERSION,)
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -225,6 +267,14 @@ class ConversationStore:
             ).fetchone()
             return row["id"] if row else None
 
+    def get_title(self, conversation_id: int) -> Optional[str]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT title FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+        return row["title"] if row else None
+
     def get_summary(self, conversation_id: int) -> tuple[Optional[str], int]:
         """Return (summary_text, summary_through_turn) for a conversation."""
         with self._lock:
@@ -255,6 +305,10 @@ class ConversationStore:
         scope: Literal["answer", "reasoning", "both"] = "both",
         limit: int = 20,
     ) -> list[SearchHit]:
+        # Trigram tokenizer requires at least 3 characters in the query —
+        # shorter inputs produce zero trigrams and silently match nothing.
+        if len(query.strip()) < 3:
+            raise ValueError("search query must be at least 3 characters")
         # Quote the whole query as an FTS5 phrase so punctuation (hyphens,
         # parens, colons) in user input doesn't get parsed as FTS operators
         # or column refs. Trade-off: AND/OR/NEAR aren't usable from /search;
@@ -413,7 +467,9 @@ class Summarizer:
                 ),
             },
         ]
-        text = self._call_vllm(messages, max_tokens=40)
+        # Generous budget so reasoning-emitting models (e.g. GLM-5.1) still
+        # have room to produce visible content after their chain-of-thought.
+        text = self._call_vllm(messages, max_tokens=200)
         title = _clean_title(text)
         if title:
             self.store.update_title(job.conversation_id, title)
@@ -453,7 +509,7 @@ class Summarizer:
                 ),
             },
         ]
-        text = self._call_vllm(messages, max_tokens=240)
+        text = self._call_vllm(messages, max_tokens=800)
         text = (text or "").strip()
         if text:
             self.store.update_summary(job.conversation_id, text, job.through_turn)
@@ -465,6 +521,10 @@ class Summarizer:
             "temperature": 0.3,
             "max_tokens": max_tokens,
             "stream": False,
+            # Try to suppress chain-of-thought for housekeeping calls. Models
+            # without a thinking-toggle (e.g. Devstral, Llama) ignore this; the
+            # GLM-5.1 chat template honors it and skips reasoning entirely.
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         resp = self._session.post(
             f"{self.base_url}/v1/chat/completions",
@@ -473,8 +533,14 @@ class Summarizer:
         )
         resp.raise_for_status()
         data = resp.json()
-        # Discard reasoning if any; only the visible content is the title/summary.
-        return data["choices"][0]["message"].get("content") or ""
+        msg = data["choices"][0]["message"]
+        content = msg.get("content") or ""
+        # Last-ditch fallback: if the server still emitted only reasoning
+        # (template didn't honor enable_thinking and budget was exhausted),
+        # use whatever's there so we don't end up with (untitled) anyway.
+        if not content.strip():
+            content = msg.get("reasoning_content") or msg.get("reasoning") or ""
+        return content
 
 
 def _clean_title(text: str) -> str:

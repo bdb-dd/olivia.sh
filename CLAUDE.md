@@ -136,6 +136,19 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 
 **Per-preset GPU allocation:** `olivia.sh server start` reads resources from `get_preset_resources()` in `olivia.sh` and passes corresponding `--nodes`, `--gpus-per-node`, `--cpus-per-task` overrides to `sbatch`. The `glm51` preset is the only one today that crosses a node boundary (2 nodes × 4 GPUs); everything else runs single-node 4 GPUs.
 
+#### Prefetch Module
+```bash
+./olivia.sh prefetch kimi                    # Download a preset's default weights
+./olivia.sh prefetch glm51                   # ... resolves the preset to its repo id
+./olivia.sh prefetch moonshotai/Kimi-K2.6    # ... or pass a literal HF repo id
+./olivia.sh prefetch kimi --revision <rev>   # Pin a revision
+./olivia.sh prefetch kimi --no-follow        # Don't tail the download log
+```
+
+Downloads model weights into the **persistent** `HF_HOME` from a **login node** — detached via `setsid`, resumable, and using no GPU/SLURM time. It spins up a one-time throwaway `python3.12` venv with `huggingface_hub` + `hf_xet` (the arm64 GH200 containers can't exec on the amd64 login node). Run this ahead of a serve so the GPU job doesn't stall for hours re-downloading hundreds of GB.
+
+**`HF_HOME` must be set** to persistent project storage (e.g. `/cluster/projects/<proj>/huggingface`) and must **not** live on `/cluster/work`, which NRIS auto-purges after 21–42 days (that silently deleted the GLM-5.1 weights once, leaving dangling symlinks). `run_vllm_server.sh` now errors if `HF_HOME` is unset. `HF_TOKEN` is required for gated repos.
+
 #### Tunnel Module
 ```bash
 ./olivia.sh tunnel             # Show tunnel status
@@ -258,6 +271,7 @@ Runs vLLM server with GH200-optimized settings:
 - `GPU_MEM_UTIL`: GPU memory utilization (default: 0.90)
 - `MAX_MODEL_LEN`: Maximum context length (default: `131072` for GLM-5.1 — native 205K context with ~260 GB KV cache headroom on 8×GH200 AWQ; `32768` elsewhere)
 - `HF_TOKEN`: HuggingFace token for gated models
+- `HF_HOME`: **Required.** Persistent HuggingFace cache for model weights (e.g. `/cluster/projects/<proj>/huggingface`). Must NOT be on `/cluster/work` (NRIS auto-purges it after 21–42 days, silently deleting weights). `HF_CACHE` is accepted as a back-compat alias; `run_vllm_server.sh` errors if neither is set. Regenerable compile caches (Triton/DeepGEMM/TorchInductor/vLLM) stay under `$PWD`, separate from this.
 - `VLLM_ATTENTION_BACKEND`: Attention backend (default: `FLASH_ATTN`)
 - `VERBOSE`: Set to `1` for detailed logging including weight loading progress (default: `0`)
 - `VLLM_LOGGING_LEVEL`: Logging level - `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`, or `DEBUG` if VERBOSE=1)

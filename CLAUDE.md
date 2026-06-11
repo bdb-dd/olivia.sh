@@ -133,6 +133,27 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 
 **Per-preset GPU allocation:** `olivia.sh server start` reads resources from `get_preset_resources()` in `olivia.sh` and passes corresponding `--nodes`, `--gpus-per-node`, `--cpus-per-task` overrides to `sbatch`. The `glm51` preset is the only one today that crosses a node boundary (2 nodes × 4 GPUs); everything else runs single-node 4 GPUs.
 
+#### Prefetch Module
+```bash
+./olivia.sh prefetch glm51_v19                  # preset -> its default repo
+./olivia.sh prefetch cyankiwi/GLM-5.1-AWQ-4bit  # explicit HuggingFace repo id
+./olivia.sh prefetch glm47 --revision <sha>     # pin a revision
+./olivia.sh prefetch <model> --no-follow        # start, don't tail progress
+```
+
+Downloads model weights into the persistent HuggingFace cache (`HF_HOME`) **from a login
+node** — never a GPU/SLURM job, so the multi-hundred-GB transfer doesn't burn allocation. The
+download is **detached** (`setsid`, survives closing the CLI) and **resumable** (skips
+already-complete blobs). Run it once before `server start` so the server job serves
+immediately instead of downloading inside the allocation.
+
+Mechanism notes:
+- The Olivia login node is **amd64** while the GH200 compute nodes are **arm64**, so the
+  containers can't exec on the login node. Prefetch instead builds a one-time throwaway
+  `python3.12` venv (under `<HF_HOME parent>/.prefetch/venv`) with `huggingface_hub` + `hf_xet`.
+- `HF_HOME` is pinned explicitly from your local environment (see "Persistent model cache"
+  under Container/Cache Structure); `HF_TOKEN` is forwarded over stdin for gated repos.
+
 #### Tunnel Module
 ```bash
 ./olivia.sh tunnel             # Show tunnel status
@@ -253,7 +274,8 @@ Runs vLLM server with GH200-optimized settings:
 - `TP_SIZE`: Tensor parallel size (default: 4)
 - `GPU_MEM_UTIL`: GPU memory utilization (default: 0.90)
 - `MAX_MODEL_LEN`: Maximum context length (default: `131072` for GLM-5.1 — native 205K context with ~260 GB KV cache headroom on 8×GH200 AWQ; `32768` elsewhere)
-- `HF_TOKEN`: HuggingFace token for gated models
+- `HF_HOME`: Persistent HuggingFace cache directory for model weights (**required**). Must live on persistent project storage (e.g. `/cluster/projects/<proj>/huggingface`), **not** `/cluster/work` (auto-purged after 21–42 days — see "Persistent model cache" under Container/Cache Structure). `olivia.sh` forwards it from your local environment (`mise.local.toml`); `run_vllm_server.sh` errors if it is unset and warns if it resolves under `/cluster/work`. `HF_CACHE` is a back-compat alias.
+- `HF_TOKEN`: HuggingFace token for gated models. `olivia.sh` forwards it over stdin (kept off argv and out of logs), so it lives only in local config — not the cluster shell.
 - `VLLM_ATTENTION_BACKEND`: Attention backend (default: `FLASH_ATTN`)
 - `VERBOSE`: Set to `1` for detailed logging including weight loading progress (default: `0`)
 - `VLLM_LOGGING_LEVEL`: Logging level - `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`, or `DEBUG` if VERBOSE=1)
@@ -506,8 +528,6 @@ Naming examples:
 - `vllm-devstral-1-sandbox` - Devstral build #1
 - `vllm-generic-1-sandbox` - Generic build #1
 
-**Local cache directories**:
-- `cache/pip/`: Pip cache directory
-- `cache/huggingface/`: HuggingFace model cache
-- `cache/vllm/`: vLLM cache
-- `logs/`: Build and server logs
+**Persistent model cache (`HF_HOME`)**: HuggingFace model weights (hundreds of GB) live in a persistent project area — e.g. `/cluster/projects/<proj>/huggingface`. They must **not** sit on `/cluster/work`, which NRIS auto-purges after 21–42 days (this silently deleted a ~430 GB GLM-5.1 AWQ cache once, leaving only metadata + dangling symlinks). `HF_HOME` is set in `mise.local.toml` and forwarded to jobs by `olivia.sh`; populate it with `./olivia.sh prefetch`. Note `/cluster/work` and `/cluster/projects` are different Lustre filesystems, so migrating weights between them is copy-then-delete (no cross-FS hardlinks).
+
+**Ephemeral compile/JIT caches**: Triton, DeepGEMM, TorchInductor and vLLM compile caches are regenerable and stay under `$PWD/cache/` on `/cluster/work` (`run_vllm_server.sh` sets `TRITON_CACHE_DIR`, `DG_JIT_CACHE_DIR`, `TORCHINDUCTOR_CACHE_DIR`, `VLLM_CACHE_ROOT`). They're large and high-churn, so auto-purge is harmless — but they must avoid the small home quota (defaulting them to `~/.triton` crashes jobs mid-profile with `Disk quota exceeded`).

@@ -36,10 +36,17 @@ mkdir -p "${WORKDIR:-$PWD}/logs"
 show_presets() {
     echo "Available model presets:"
     echo ""
-    echo "  glm51      - GLM-5.1 (744B, 40B active) MoE with DeepSeek Sparse Attention"
-    echo "               vLLM: v0.19.0, transformers>=5.3.0.dev0"
-    echo "               AWQ ~430GB, requires 8 GPUs (2 nodes × 4× GH200 on Olivia)"
-    echo "               Uses TP=4 + PP=2 across nodes (Slingshot-friendly)"
+    echo "  glm51_v19  - GLM-5.1 (744B, 40B active) MoE+DSA on vLLM v0.19.0 (recipe default)"
+    echo "               vLLM: v0.19.0, transformers>=5.4.0"
+    echo "               AWQ ~430GB, 8 GPUs (2 nodes × 4× GH200, TP=4 + PP=2)"
+    echo "               KNOWN-WEDGE on multi-node PP concurrent decode; use with"
+    echo "               anthropic_proxy.py request serialization as workaround."
+    echo "               Alias: glm51 (for backwards compat)"
+    echo ""
+    echo "  glm51_v20  - GLM-5.1 on vLLM v0.20.0 + RayExecutorV2 (QUARANTINED)"
+    echo "               vLLM: v0.20.0, transformers>=5.4.0, RayExecutorV2 data plane"
+    echo "               Same multi-node PP wedge as glm51_v19 reproduced — kept for"
+    echo "               diagnostic work only, not for routine use. Builds to index 2."
     echo ""
     echo "  glm47      - GLM-4.7 (358B) - Latest flagship model from THUDM"
     echo "               vLLM: main, transformers>=5.0.0rc0"
@@ -72,15 +79,38 @@ apply_preset() {
     local preset="$1"
 
     case "${preset}" in
-        glm51|GLM51|glm-5.1|GLM-5.1)
+        glm51_v19|GLM51_V19|glm51|GLM51|glm-5.1|GLM-5.1)
+            # MODEL_ID stays "glm51" so the container name is vllm-glm51-<index>-sandbox
+            # (both v19 and v20 variants share the glm51 container prefix, index
+            # distinguishes them: index 1 = v0.19.0, index 2 = v0.20.0).
             MODEL_ID="glm51"
-            # Pinned per the official vLLM GLM-5 recipe
-            # (https://github.com/vllm-project/recipes/blob/main/GLM/GLM5.md):
-            #   uv pip install "vllm==0.19.0" --torch-backend=auto
-            #   uv pip install "transformers>=5.4.0"
+            # v0.19.0 is the version pinned by the official vLLM GLM-5 recipe
+            # (https://github.com/vllm-project/recipes/blob/main/GLM/GLM5.md).
+            # Recipe only covers single-node TP=8; multi-node PP is not an upstream-
+            # validated config. On 2-node × 4×GH200 (TP=4 + PP=2) over Slingshot,
+            # decode wedges reproducibly under concurrent requests — both Ray
+            # Compiled Graph (v0.19.0 default) AND RayExecutorV2 (v0.20.0, see
+            # glm51_v20) hit the same signature. Use anthropic_proxy.py's
+            # request serialization to work around it until there's a proper fix.
             PRESET_VLLM_VERSION="v0.19.0"
             PRESET_TRANSFORMERS=">=5.4.0"
-            PRESET_NOTES="GLM-5.1 (744B MoE+DSA): AWQ, multi-node TP=4 + PP=2, MTP speculative, glm47/glm45 parsers"
+            PRESET_NOTES="GLM-5.1 (744B MoE+DSA), vLLM v0.19.0. Multi-node PP wedges on concurrent decode — pair with proxy serialization."
+            ;;
+        glm51_v20|GLM51_V20)
+            # Quarantined. Builds to container index 2 (vllm-glm51-2-sandbox) so
+            # it lives alongside the v0.19.0 build without overwriting.
+            MODEL_ID="glm51"
+            # v0.20.0 + RayExecutorV2 was attempted to escape the Ray Compiled
+            # Graph deadlock (ray#58426). V2 bypasses Compiled Graph and uses
+            # MultiprocExecutor's ZMQ/NCCL data plane. Confirmed active via
+            # startup logs, BUT the same decode wedge still reproduces with
+            # identical signature (Running >=1, 0 tok/s, KV cache frozen) —
+            # falsifying the "Compiled Graph is the root cause" hypothesis.
+            # Requires torch 2.11 (NGC 26.02+), CUDA 13.0+, transformers>=4.56.
+            # Kept here for future diagnostic work, NOT routine use.
+            PRESET_VLLM_VERSION="v0.20.0"
+            PRESET_TRANSFORMERS=">=5.4.0"
+            PRESET_NOTES="GLM-5.1 on vLLM v0.20.0 + RayExecutorV2 — quarantined, same multi-node PP wedge as v0.19.0"
             ;;
         glm47|GLM47|glm-4.7|GLM-4.7)
             MODEL_ID="glm47"

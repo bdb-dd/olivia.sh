@@ -68,6 +68,12 @@ GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"       # GPU memory utilization
 # assertion failure / tears the cluster down. 1800s (30 min) is generous.
 # Only applied for multi-node (NUM_NODES > 1); single-node unaffected.
 RAY_CGRAPH_GET_TIMEOUT="${RAY_CGRAPH_GET_TIMEOUT:-1800}"
+# Select RayExecutorV2 over the legacy RayDistributedExecutor. V2 inherits
+# MultiprocExecutor's ZMQ/NCCL data plane and bypasses Ray's Compiled Graph
+# entirely — structurally avoids the MutableObjectProvider deadlock on
+# cross-node PP (ray#58426, vllm#26318, #26899). Required in vLLM v0.20.0+
+# where V2 exists but is off by default (upstream TODO to flip).
+VLLM_USE_RAY_V2_EXECUTOR_BACKEND="${VLLM_USE_RAY_V2_EXECUTOR_BACKEND:-1}"
 # MAX_MODEL_LEN default is model-dependent and gets resolved after GLM
 # detection below: 131072 for GLM-5.1 (native 205K context, plenty of KV
 # cache headroom on 8×GH200 AWQ), 32768 elsewhere.
@@ -391,6 +397,7 @@ if [[ "${NUM_NODES}" -gt 1 ]]; then
     echo "  Pipeline Parallel: ${PP_SIZE}  (inter-node, Slingshot)"
     echo "  Total GPUs:       $((TP_SIZE * PP_SIZE))"
     echo "  Ray step timeout: ${RAY_CGRAPH_GET_TIMEOUT}s (RAY_CGRAPH_get_timeout)"
+    echo "  Ray executor V2:  ${VLLM_USE_RAY_V2_EXECUTOR_BACKEND} (1=RayExecutorV2, 0=legacy RayDistributedExecutor)"
 fi
 echo ""
 echo "GPU Configuration:"
@@ -663,6 +670,27 @@ if [[ "${IS_GLM_MOE}" == "1" ]]; then
     # GLM-5.1 requires trust-remote-code for its custom attention config
     if [[ "${IS_GLM51}" == "1" ]]; then
         VLLM_ARGS+=("--trust-remote-code")
+        # Override the shipped chat template. cyankiwi/GLM-5.1-AWQ-4bit's
+        # chat_template.jinja has a bug in the role:tool handler — the
+        # else-branch expects content items with a .name field (Anthropic's
+        # tool_reference convention), but vLLM's OpenAI API auto-converts
+        # string content to ``[{type:"text", text:"..."}]`` which has no
+        # .name, so tool results render as empty ``<tools></tools>`` and the
+        # model never sees any tool output. The base zai-org/GLM-5.1
+        # template has a fallback branch using ``visible_text(m.content)``
+        # that handles this case correctly.
+        #
+        # CHAT_TEMPLATE_FILE defaults to the base-template copy shipped in
+        # this repo at templates/glm51_chat_template.jinja (deployed to
+        # CONTAINER_DIR alongside this script).
+        CHAT_TEMPLATE_FILE="${CHAT_TEMPLATE_FILE:-${CONTAINER_DIR}/glm51_chat_template.jinja}"
+        if [[ -f "${CHAT_TEMPLATE_FILE}" ]]; then
+            VLLM_ARGS+=("--chat-template" "${CHAT_TEMPLATE_FILE}")
+            echo "[$(date '+%H:%M:%S')] Using GLM-5.1 base chat template: ${CHAT_TEMPLATE_FILE}"
+        else
+            echo "[$(date '+%H:%M:%S')] WARNING: GLM-5.1 chat template override not found at ${CHAT_TEMPLATE_FILE}"
+            echo "                     Tool results will render as empty <tools></tools> — see CLAUDE.md."
+        fi
     fi
 fi
 
@@ -852,6 +880,7 @@ SING_CMD=(
     --env "RAY_BACKEND_LOG_LEVEL=${RAY_BACKEND_LOG_LEVEL}"
     --env "RAY_DEDUP_LOGS=${RAY_DEDUP_LOGS}"
     --env "RAY_CGRAPH_get_timeout=${RAY_CGRAPH_GET_TIMEOUT}"
+    --env "VLLM_USE_RAY_V2_EXECUTOR_BACKEND=${VLLM_USE_RAY_V2_EXECUTOR_BACKEND}"
     --env "NCCL_DEBUG=${NCCL_DEBUG}"
     --env "VLLM_CACHE_QUANTIZED_WEIGHTS=${VLLM_CACHE_QUANTIZED_WEIGHTS}"
     --env "VLLM_USE_DEEP_GEMM=${VLLM_USE_DEEP_GEMM}"
@@ -871,6 +900,10 @@ SING_CMD=(
     --bind "${TRITON_CACHE_DIR}:${TRITON_CACHE_DIR}"
     --bind "${DG_JIT_CACHE_DIR}:${DG_JIT_CACHE_DIR}"
     --bind "${TORCHINDUCTOR_CACHE_DIR}:${TORCHINDUCTOR_CACHE_DIR}"
+    # Make CONTAINER_DIR readable inside the container so vLLM can load
+    # ${CONTAINER_DIR}/glm51_chat_template.jinja (and any other sibling
+    # files we deploy alongside run_vllm_server.sh).
+    --bind "${CONTAINER_DIR}:${CONTAINER_DIR}"
 )
 
 if [[ "${NUM_NODES}" -le 1 ]]; then

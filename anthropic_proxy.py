@@ -42,8 +42,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import datetime as _dt
 import json
 import logging
+import os
 import sys
 import uuid
 from typing import Any, Optional
@@ -123,6 +126,116 @@ def _tool_result_to_text(content: Any) -> str:
                 parts.append(json.dumps(blk))
         return "\n".join(parts)
     return json.dumps(content)
+
+
+def _sanitize_tool_schema(schema: Any) -> dict:
+    """Ensure a tool's parameters schema is well-formed for vLLM's guided
+    decoder. Fills in ``type``, ``properties``, and ``additionalProperties``
+    defaults so schemaless tools don't hit edge-cases in vLLM's
+    schema-to-grammar compilation. No-op for already-well-formed schemas.
+    """
+    if not isinstance(schema, dict):
+        schema = {}
+    out = dict(schema)
+    out.setdefault("type", "object")
+    out.setdefault("properties", {})
+    out.setdefault("additionalProperties", True)
+    return out
+
+
+# Known Anthropic server-side tools. These arrive as schemaless stubs
+# (``{"type": "web_search_20250305", "name": "web_search", ...}``) because
+# Anthropic's hosted API runs them server-side and Claude Code expects the
+# upstream to Just Know what they mean. We don't — vLLM + GLM need a real
+# schema to emit a valid tool_use. The rewrite makes these behave like
+# normal client function tools that GLM can invoke and Claude Code's local
+# dispatcher can parse.
+#
+# Mapping values: (normalized_name, description, input_schema). If a value
+# is ``None``, the tool is stripped entirely (too complex to emulate).
+_SERVER_SIDE_TOOL_REWRITES: dict[str, Optional[tuple[str, str, dict]]] = {
+    "web_search_20250305": (
+        "web_search",
+        "Perform a web search and return relevant results for the user's query.",
+        {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query text",
+                },
+            },
+            "required": ["query"],
+        },
+    ),
+    "code_execution_20250522": (
+        "code_execution",
+        "Execute code in a sandboxed environment and return the output.",
+        {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "The code to execute",
+                },
+            },
+            "required": ["code"],
+        },
+    ),
+    # Computer use has many actions (click, type, screenshot, etc) with a
+    # complex action-union schema. Not worth trying to emulate — strip it.
+    "computer_20241022": None,
+    "computer_20250124": None,
+}
+
+
+def _translate_tool(tool: dict) -> Optional[dict]:
+    """Translate an Anthropic tool definition to an OpenAI function tool.
+
+    Returns the OpenAI tool dict, or None if this tool should be stripped
+    entirely (e.g. unknown server-side type we can't reliably emulate).
+    """
+    anth_type = tool.get("type")
+    name = tool.get("name")
+    if not name:
+        return None
+
+    # Client tool: either no type field, or explicit "custom". Pass through
+    # with schema sanitization.
+    if not anth_type or anth_type == "custom":
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": tool.get("description") or f"Invoke the {name} tool.",
+                "parameters": _sanitize_tool_schema(tool.get("input_schema")),
+            },
+        }
+
+    # Server-side tool: try to rewrite to a client function equivalent.
+    rewrite = _SERVER_SIDE_TOOL_REWRITES.get(anth_type)
+    if rewrite is None:
+        if anth_type in _SERVER_SIDE_TOOL_REWRITES:
+            # Explicit None → known-but-stripped.
+            log.warning("stripping server-side tool '%s' (type=%s, no emulation available)",
+                        name, anth_type)
+        else:
+            # Unknown server-side type: strip safely.
+            log.warning("stripping unknown server-side tool '%s' (type=%s); "
+                        "vLLM can't execute this", name, anth_type)
+        return None
+
+    rewritten_name, rewritten_desc, rewritten_schema = rewrite
+    log.info("rewrote server-side tool type=%s (name=%s) → client function "
+             "name=%s with schema", anth_type, name, rewritten_name)
+    return {
+        "type": "function",
+        "function": {
+            "name": rewritten_name,
+            "description": rewritten_desc,
+            "parameters": rewritten_schema,
+        },
+    }
 
 
 def anthropic_to_openai(body: dict, model_override: str) -> dict:
@@ -217,20 +330,25 @@ def anthropic_to_openai(body: dict, model_override: str) -> dict:
     out["messages"] = messages
 
     tools = body.get("tools")
+    # Build a map from original Anthropic tool name → translated OpenAI name
+    # so we can rewrite tool_choice references if a server-side tool was
+    # renamed (e.g. ``web_search`` stays ``web_search`` under our rewrite —
+    # but if we ever rename, tool_choice follows the rewritten identifier).
+    name_map: dict[str, str] = {}
     if tools:
-        out["tools"] = [
-            {
-                "type": "function",
-                "function": {
-                    "name": t.get("name"),
-                    "description": t.get("description", ""),
-                    "parameters": t.get("input_schema")
-                                  or {"type": "object", "properties": {}},
-                },
-            }
-            for t in tools
-            if isinstance(t, dict) and t.get("name")
-        ]
+        translated: list[dict] = []
+        for t in tools:
+            if not isinstance(t, dict):
+                continue
+            orig_name = t.get("name")
+            out_tool = _translate_tool(t)
+            if out_tool is None:
+                continue  # stripped
+            translated.append(out_tool)
+            if orig_name:
+                name_map[orig_name] = out_tool["function"]["name"]
+        if translated:
+            out["tools"] = translated
 
     tc = body.get("tool_choice")
     if isinstance(tc, dict):
@@ -242,10 +360,29 @@ def anthropic_to_openai(body: dict, model_override: str) -> dict:
         elif ttype == "none":
             out["tool_choice"] = "none"
         elif ttype == "tool" and tc.get("name"):
-            out["tool_choice"] = {
-                "type": "function",
-                "function": {"name": tc["name"]},
-            }
+            # WORKAROUND: Claude Code sends ``tool_choice: {type: "tool",
+            # name: "web_search"}`` for its WebSearch subrequests. Translating
+            # this to OpenAI ``{type: "function", function: {name: X}}``
+            # triggers vLLM's guided-decoder force-mode. On multi-node PP,
+            # two such forced requests in rapid succession wedge the engine
+            # on the second (observed after rewriting the stub to a proper
+            # schema — first subrequest succeeds, second hangs admission).
+            #
+            # Drop the forced tool_choice entirely. The named tool stays in
+            # the catalog, so the model can (and usually will) emit a
+            # tool_use for it based on the user prompt alone, without the
+            # guided-decoder setup that's tripping vLLM. No wedge, at the
+            # small cost that the model *might* occasionally answer in plain
+            # text instead of tool_use.
+            if tc["name"] in name_map:
+                log.info("dropping forced tool_choice for tool=%s "
+                         "(multi-node PP rapid-fire wedge workaround); "
+                         "tool stays in catalog for model to invoke on its own",
+                         name_map[tc["name"]])
+            else:
+                log.warning("tool_choice referenced stripped tool '%s'; "
+                            "dropping tool_choice so model can respond freely",
+                            tc["name"])
 
     if out["stream"]:
         # Final chunk carries real usage counts so we can report
@@ -560,10 +697,17 @@ def _error_response(status: int, err_type: str, message: str) -> web.Response:
 
 class AnthropicProxy:
     def __init__(self, upstream_url: str, model: str,
-                 keepalive_interval: int = 180):
+                 keepalive_interval: int = 180,
+                 serialize_requests: bool = True,
+                 dump_requests_dir: Optional[str] = None):
         self.upstream_url = upstream_url.rstrip("/")
         self.model = model
         self.session: Optional[aiohttp.ClientSession] = None
+        # If set, every /v1/messages request body (plus headers) is dumped to
+        # {dump_requests_dir}/req-{timestamp}-{short_id}.json. Used for
+        # capturing exact Claude Code payloads so they can be replayed via
+        # curl to reproduce wedges outside a live client session.
+        self.dump_requests_dir = dump_requests_dir
         # Keepalive: 0 disables. Otherwise, every N seconds of idle, send a
         # trivial completion upstream to keep vLLM's Ray compiled-DAG warm.
         # Multi-node PP has an instability pattern where the engine wedges
@@ -571,6 +715,16 @@ class AnthropicProxy:
         self.keepalive_interval = keepalive_interval
         self._keepalive_task: Optional[asyncio.Task] = None
         self._last_activity: float = 0.0
+        # Serialize upstream requests: only one /v1/chat/completions in flight
+        # at a time. Workaround for the glm51 multi-node PP decode wedge that
+        # reproduces reliably when vLLM's engine has Running≥2 concurrent
+        # sequences. Claude Code sends generate_session_title + repl_main_thread
+        # in parallel on every turn, which reliably triggers the wedge without
+        # this serialization. Cost: the second request queues behind the first
+        # (title-gen is fire-and-forget so user-visible latency is unaffected).
+        # See anthropic_proxy.py --no-serialize to disable for testing.
+        self.serialize_requests = serialize_requests
+        self._upstream_lock: Optional[asyncio.Lock] = None  # created in start()
 
     def _mark_activity(self) -> None:
         self._last_activity = asyncio.get_event_loop().time()
@@ -612,7 +766,37 @@ class AnthropicProxy:
 
     async def start(self) -> None:
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
+        # Lock must be created inside the running loop — module-level asyncio
+        # primitives bind to whatever loop is current at creation time.
+        self._upstream_lock = asyncio.Lock()
+        if self.serialize_requests:
+            log.info("serialize: one upstream /v1/chat/completions at a time "
+                     "(workaround for glm51 multi-node PP wedge; use --no-serialize to disable)")
         self._mark_activity()
+
+    @contextlib.asynccontextmanager
+    async def _upstream_guard(self):
+        """Optionally serialize upstream requests so vLLM only ever sees one
+        /v1/chat/completions in flight at a time. No-op when serialize_requests
+        is False. When a request has to wait, we log the waiters count at DEBUG
+        so behavior is observable with -v.
+        """
+        if not self.serialize_requests or self._upstream_lock is None:
+            yield
+            return
+        # Peek at queue depth before acquire for visibility. Locks in asyncio
+        # expose waiting coroutines via a private attribute; fall back silently
+        # if the internal layout changes.
+        waiting = 0
+        try:
+            waiting = len(getattr(self._upstream_lock, "_waiters", []) or [])
+        except Exception:
+            pass
+        if self._upstream_lock.locked():
+            log.debug("serialize: upstream busy, queueing (%d already waiting)",
+                      waiting)
+        async with self._upstream_lock:
+            yield
         if self.keepalive_interval > 0:
             self._keepalive_task = asyncio.create_task(self._keepalive_loop())
 
@@ -626,6 +810,42 @@ class AnthropicProxy:
         if self.session:
             await self.session.close()
 
+    def _dump_request(self, request: web.Request, body: dict) -> None:
+        """Write a captured request to {dump_requests_dir}/req-<ts>-<id>.json.
+        Redacts auth headers so dumps can be shared without leaking tokens.
+        Called only when dump_requests_dir is set. Blocking I/O is fine — it's
+        a few KB and only runs when explicitly enabled."""
+        if not self.dump_requests_dir:
+            return
+        try:
+            ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%f")[:-3] + "Z"
+            short = uuid.uuid4().hex[:8]
+            fname = os.path.join(self.dump_requests_dir, f"req-{ts}-{short}.json")
+            # Copy + redact headers.
+            redacted_headers = {}
+            for k, v in request.headers.items():
+                if k.lower() in ("authorization", "x-api-key", "anthropic-auth-token"):
+                    redacted_headers[k] = "<redacted>"
+                else:
+                    redacted_headers[k] = v
+            record = {
+                "captured_at": ts,
+                "method": request.method,
+                "path": request.path_qs,
+                "remote": request.remote,
+                "headers": redacted_headers,
+                "body": body,
+            }
+            # Write atomically: build in tmp then rename.
+            tmp = fname + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(record, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, fname)
+            log.debug("dumped request to %s", fname)
+        except Exception:
+            # Never let a dump failure break a real request.
+            log.exception("failed to dump request (continuing)")
+
     async def handle_messages(self, request: web.Request) -> web.StreamResponse:
         self._mark_activity()
         try:
@@ -633,21 +853,24 @@ class AnthropicProxy:
         except json.JSONDecodeError:
             return _error_response(400, "invalid_request_error", "Invalid JSON body")
 
+        self._dump_request(request, body)
+
         openai_body = anthropic_to_openai(body, self.model)
         is_streaming = openai_body.get("stream", False)
         model_label = body.get("model") or self.model
 
         if not is_streaming:
             try:
-                async with self.session.post(
-                    f"{self.upstream_url}/v1/chat/completions",
-                    json=openai_body,
-                    headers={"Content-Type": "application/json"},
-                ) as upstream:
-                    if upstream.status != 200:
-                        text = await upstream.text()
-                        return _error_response(upstream.status, "api_error", text)
-                    data = await upstream.json()
+                async with self._upstream_guard():
+                    async with self.session.post(
+                        f"{self.upstream_url}/v1/chat/completions",
+                        json=openai_body,
+                        headers={"Content-Type": "application/json"},
+                    ) as upstream:
+                        if upstream.status != 200:
+                            text = await upstream.text()
+                            return _error_response(upstream.status, "api_error", text)
+                        data = await upstream.json()
             except aiohttp.ClientError as e:
                 return _error_response(502, "api_error", f"Upstream unreachable: {e}")
             return web.json_response(openai_to_anthropic(data, model_label))
@@ -678,16 +901,17 @@ class AnthropicProxy:
                             message[:120])
 
         try:
-            async with self.session.post(
-                f"{self.upstream_url}/v1/chat/completions",
-                json=openai_body,
-                headers={"Content-Type": "application/json"},
-            ) as upstream:
-                if upstream.status != 200:
-                    text = await upstream.text()
-                    await _try_write_error(text)
-                    return response
-                await translate_stream(upstream, response, model_label)
+            async with self._upstream_guard():
+                async with self.session.post(
+                    f"{self.upstream_url}/v1/chat/completions",
+                    json=openai_body,
+                    headers={"Content-Type": "application/json"},
+                ) as upstream:
+                    if upstream.status != 200:
+                        text = await upstream.text()
+                        await _try_write_error(text)
+                        return response
+                    await translate_stream(upstream, response, model_label)
         except aiohttp.ClientError as e:
             await _try_write_error(str(e))
         return response
@@ -746,9 +970,13 @@ async def _logging_middleware(request: web.Request, handler):
 
 
 def create_app(upstream_url: str, model: str,
-               keepalive_interval: int = 180) -> web.Application:
+               keepalive_interval: int = 180,
+               serialize_requests: bool = True,
+               dump_requests_dir: Optional[str] = None) -> web.Application:
     proxy = AnthropicProxy(upstream_url, model,
-                           keepalive_interval=keepalive_interval)
+                           keepalive_interval=keepalive_interval,
+                           serialize_requests=serialize_requests,
+                           dump_requests_dir=dump_requests_dir)
 
     async def on_startup(app: web.Application) -> None:
         await proxy.start()
@@ -795,7 +1023,29 @@ def main() -> None:
                              "trivial completion to keep the Ray compiled-DAG "
                              "warm on multi-node PP (default: 180). "
                              "Set to 0 to disable.")
+    parser.add_argument("--no-serialize", dest="serialize_requests",
+                        action="store_false", default=True,
+                        help="Disable the one-request-at-a-time guard around "
+                             "upstream POST /v1/chat/completions. The guard is "
+                             "on by default as a workaround for the glm51 "
+                             "multi-node PP decode wedge (engine hangs when "
+                             "Running>=2). Disable only for testing or if the "
+                             "underlying vLLM bug has been fixed upstream.")
+    parser.add_argument("--dump-requests", metavar="DIR", default=None,
+                        help="When set, every /v1/messages request body is "
+                             "written to DIR/req-<timestamp>-<id>.json. Auth "
+                             "headers are redacted. Use this to capture the "
+                             "exact payload that triggers a wedge so it can "
+                             "be replayed via curl for diagnosis.")
     args = parser.parse_args()
+
+    if args.dump_requests:
+        try:
+            os.makedirs(args.dump_requests, exist_ok=True)
+        except OSError as e:
+            print(f"Error: could not create dump dir {args.dump_requests}: {e}",
+                  file=sys.stderr)
+            sys.exit(1)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -811,6 +1061,8 @@ def main() -> None:
     print(f"Model override : {args.model}")
     print(f"Keepalive      : {args.keepalive_interval}s"
           if args.keepalive_interval > 0 else "Keepalive      : disabled")
+    print(f"Serialize reqs : {'on (one upstream req at a time)' if args.serialize_requests else 'off (pass-through)'}")
+    print(f"Dump requests  : {args.dump_requests if args.dump_requests else 'off'}")
     print()
     print("Point Claude Code at this proxy:")
     print(f"  export ANTHROPIC_BASE_URL=http://{args.listen_host}:{args.listen_port}")
@@ -819,7 +1071,9 @@ def main() -> None:
     print("=" * 60)
 
     app = create_app(args.upstream, args.model,
-                     keepalive_interval=args.keepalive_interval)
+                     keepalive_interval=args.keepalive_interval,
+                     serialize_requests=args.serialize_requests,
+                     dump_requests_dir=args.dump_requests)
     web.run_app(app, host=args.listen_host, port=args.listen_port, print=None)
 
 

@@ -43,6 +43,8 @@ REMOTE_CONTAINER_DIR="${REMOTE_CONTAINER_DIR:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL_SERVER_SCRIPT="${SCRIPT_DIR}/run_vllm_server.sh"
 LOCAL_BUILD_SCRIPT="${SCRIPT_DIR}/build_vllm_gh200.sh"
+# Chat-template override for GLM-5.1 (see run_vllm_server.sh for why).
+LOCAL_GLM51_CHAT_TEMPLATE="${SCRIPT_DIR}/templates/glm51_chat_template.jinja"
 CHAT_SCRIPT="${SCRIPT_DIR}/chat_devstral.py"
 
 # SSH control socket
@@ -575,14 +577,21 @@ cmd_build() {
                 info "To build a new container:"
                 echo "    ./olivia.sh build <preset>" >&2
                 echo "" >&2
-                echo "Available presets: glm51, glm47, devstral, llama, qwen, generic" >&2
+                echo "Available presets: glm51_v19 (alias: glm51), glm51_v20, glm47, devstral, llama, qwen, generic" >&2
                 exit 0
                 ;;
             --presets|-p)
                 header "Available Model Presets"
-                echo "  glm51      GLM-5.1 (744B/40B active) MoE+DSA flagship"
-                echo "             vLLM: v0.19.0, transformers>=5.3.0.dev0"
-                echo "             AWQ ~430GB, needs 8 GPUs (2×4-GPU nodes, TP=4 + PP=2)"
+                echo "  glm51_v19  GLM-5.1 (744B/40B) on vLLM v0.19.0 — recipe default"
+                echo "             vLLM: v0.19.0, transformers>=5.4.0, container index 1"
+                echo "             AWQ ~430GB, 8 GPUs (2×4-GPU nodes, TP=4 + PP=2)"
+                echo "             Multi-node PP wedges on concurrent decode — use with"
+                echo "             anthropic_proxy.py request serialization as workaround."
+                echo "             Alias: glm51"
+                echo ""
+                echo "  glm51_v20  GLM-5.1 on vLLM v0.20.0 + RayExecutorV2 (QUARANTINED)"
+                echo "             vLLM: v0.20.0, transformers>=5.4.0, container index 2"
+                echo "             Same wedge as glm51_v19; kept for diagnostics only."
                 echo ""
                 echo "  glm47      GLM-4.7 (358B) flagship model"
                 echo "             vLLM: main, transformers>=5.0.0rc0"
@@ -696,6 +705,12 @@ cmd_build() {
         echo ""
     fi
 
+    # Apply preset-specific default build index (glm51_v20 → 2). If the user
+    # already passed --index, that wins.
+    if [[ -z "$build_index" ]]; then
+        build_index=$(get_preset_default_index "$model_id")
+    fi
+
     # Build environment variables.
     # CONTAINER_DIR must be exported to the SLURM job — `cd` alone doesn't
     # propagate it as an env var (build_vllm_gh200.sh requires it explicitly).
@@ -720,9 +735,13 @@ cmd_build() {
     job_id=$(echo "$submit_output" | grep -oE '[0-9]+' | tail -1)
     success "Submitted build job ${job_id}"
 
-    # Determine expected sandbox name
+    # Determine expected sandbox name. Version-tagged presets (glm51_v19,
+    # glm51_v20) share a container prefix with their base preset, so use
+    # resolve_container_prefix to get the on-disk directory name.
     local idx="${build_index:-1}"
-    local sandbox_name="vllm-${model_id}-${idx}-sandbox"
+    local prefix
+    prefix=$(resolve_container_prefix "$model_id")
+    local sandbox_name="vllm-${prefix}-${idx}-sandbox"
     echo "    Container: ${sandbox_name}" >&2
 
     if $tail_logs; then
@@ -789,7 +808,7 @@ EOF
 get_default_model() {
     local preset="$1"
     case "${preset}" in
-        glm51|glm-5.1)
+        glm51|glm51_v19|glm51_v20|glm-5.1)
             echo "cyankiwi/GLM-5.1-AWQ-4bit"
             ;;
         glm47|glm-4.7)
@@ -816,7 +835,7 @@ get_default_model() {
 get_preset_resources() {
     local preset="$1"
     case "${preset}" in
-        glm51|glm-5.1)
+        glm51|glm51_v19|glm51_v20|glm-5.1)
             # 744B MoE AWQ — ~430GB, needs 8 GPUs.
             # TP=4 intra-node (NVLink) + PP=2 cross-node (Slingshot) is the
             # sweet spot: PP tolerates the ~25 GB/s cross-node fabric far better
@@ -830,11 +849,44 @@ get_preset_resources() {
     esac
 }
 
+# Map preset name to the container-name prefix (what goes between "vllm-" and
+# "-<index>-sandbox"). glm51_v19 and glm51_v20 are version-tagged aliases that
+# share the same "glm51" container prefix — the version distinction is encoded
+# in the index (1 = v0.19.0, 2 = v0.20.0) rather than a separate directory.
+resolve_container_prefix() {
+    case "$1" in
+        glm51|glm51_v19|glm51_v20|glm-5.1|GLM51|GLM51_V19|GLM51_V20|GLM-5.1)
+            echo "glm51"
+            ;;
+        glm47|glm-4.7|GLM47|GLM-4.7)
+            echo "glm47"
+            ;;
+        *)
+            echo "$1"
+            ;;
+    esac
+}
+
+# Default container index per preset. Used when the user doesn't pass --index.
+# glm51_v19 uses index 1 (the v0.19.0 build); glm51_v20 uses index 2 (v0.20.0).
+get_preset_default_index() {
+    case "$1" in
+        glm51_v20|GLM51_V20)
+            echo "2"
+            ;;
+        *)
+            echo "1"
+            ;;
+    esac
+}
+
 # Resolve preset to container name
 resolve_container_name() {
     local preset="$1"
     local index="${2:-1}"
-    echo "vllm-${preset}-${index}-sandbox"
+    local prefix
+    prefix=$(resolve_container_prefix "$preset")
+    echo "vllm-${prefix}-${index}-sandbox"
 }
 
 deploy_server_script() {
@@ -849,6 +901,17 @@ deploy_server_script() {
         "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_CONTAINER_DIR}/run_vllm_server.sh"; then
         error "Failed to upload server script"
         return 1
+    fi
+
+    # Also upload auxiliary files that run_vllm_server.sh expects at runtime.
+    # Currently just the GLM-5.1 chat template override; grows as needed.
+    if [[ -f "${LOCAL_GLM51_CHAT_TEMPLATE}" ]]; then
+        info "Uploading glm51_chat_template.jinja"
+        if ! scp_run "${LOCAL_GLM51_CHAT_TEMPLATE}" \
+            "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_CONTAINER_DIR}/glm51_chat_template.jinja"; then
+            error "Failed to upload GLM-5.1 chat template"
+            return 1
+        fi
     fi
 
     success "Server script deployed"
@@ -900,7 +963,8 @@ start_server_job() {
                        ENABLE_AUTO_TOOL_CHOICE GLM_TOOL_PARSER \
                        GLM_REASONING_PARSER SERVED_MODEL_NAME \
                        MTP_SPECULATIVE_TOKENS ENABLE_SPECULATIVE \
-                       MAX_MODEL_LEN GPU_MEM_UTIL RAY_CGRAPH_GET_TIMEOUT; do
+                       MAX_MODEL_LEN GPU_MEM_UTIL RAY_CGRAPH_GET_TIMEOUT \
+                       VLLM_USE_RAY_V2_EXECUTOR_BACKEND; do
         if [[ -n "${!forward_var:-}" ]]; then
             env_vars+=" ${forward_var}=${!forward_var}"
         fi
@@ -1250,7 +1314,10 @@ cmd_server() {
     local container=""
     local model=""
     local preset=""
-    local index="1"
+    # Empty sentinel: "user did not pass --index". After arg parsing, we fall
+    # back to the preset's default index via get_preset_default_index (e.g.,
+    # glm51_v20 defaults to 2 to match its vllm-glm51-2-sandbox container).
+    local index=""
     local tail_logs=true
 
     # Parse arguments
@@ -1347,6 +1414,13 @@ cmd_server() {
     if [[ -z "$action" ]]; then
         cmd_server_help
         exit 0
+    fi
+
+    # If the user didn't pass --index, pick the preset's default (1 for most,
+    # 2 for glm51_v20 which shares the glm51 container prefix). Presets that
+    # don't have a special default still get "1".
+    if [[ -z "$index" ]]; then
+        index=$(get_preset_default_index "$preset")
     fi
 
     ensure_master_connection || exit 1
@@ -1727,6 +1801,7 @@ get_server_info() {
 cmd_chat() {
     local stream_flag="--stream"
     local tunnel_only=false
+    local extra_args=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1742,6 +1817,21 @@ cmd_chat() {
                 LOCAL_PORT="$2"
                 TUNNEL_NODE_FILE="/tmp/olivia-tunnel-${LOCAL_PORT}.node"
                 shift 2
+                ;;
+            --no-store)
+                extra_args+=("--no-store")
+                shift
+                ;;
+            --resume)
+                extra_args+=("--resume")
+                # --resume takes an optional numeric ID; consume only if next
+                # arg looks like one, otherwise leave it as a bare flag.
+                if [[ -n "${2:-}" && "$2" =~ ^[0-9]+$ ]]; then
+                    extra_args+=("$2")
+                    shift 2
+                else
+                    shift
+                fi
                 ;;
             -h|--help)
                 cmd_chat_help
@@ -1845,7 +1935,8 @@ cmd_chat() {
         exit 1
     fi
 
-    python3 "${CHAT_SCRIPT}" localhost --port "${LOCAL_PORT}" ${stream_flag}
+    python3 "${CHAT_SCRIPT}" localhost --port "${LOCAL_PORT}" ${stream_flag} \
+        ${extra_args[@]+"${extra_args[@]}"}
 
     echo ""
     info "Chat ended. Tunnel remains open on port ${LOCAL_PORT}"
@@ -1863,12 +1954,16 @@ Options:
     --port PORT         Local port (default: 8000)
     --tunnel-only       Only set up tunnel, don't start chat
     --no-stream         Disable streaming in chat
+    --resume [ID]       Resume most recent stored conversation, or specific ID
+    --no-store          Disable conversation persistence for this session
     -h, --help          Show this help
 
 Examples:
     ./olivia.sh chat                Connect and start chat
     ./olivia.sh chat --port 9000    Use different port
     ./olivia.sh chat --tunnel-only  Just set up tunnel
+    ./olivia.sh chat --resume       Resume most recent conversation
+    ./olivia.sh chat --resume 12    Resume conversation #12
 EOF
 }
 

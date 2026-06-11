@@ -2616,6 +2616,100 @@ EOF
 }
 
 # =============================================================================
+# MODULE: Prefetch
+# =============================================================================
+# Download model weights into the persistent HF cache (HF_HOME) from a LOGIN
+# node — never from a GPU/SLURM job. Why login-node + venv (not a container):
+#   * Login nodes have internet egress and a modern system python3.12. The
+#     compute nodes are GH200 (arm64) and their containers cannot exec on the
+#     amd64 login node at all, so we build a tiny throwaway venv instead.
+#   * HF_HOME points at persistent project storage (/cluster/projects/...), so
+#     weights survive the /cluster/work auto-purge (21-42 days) and are fetched
+#     once rather than re-downloaded per job.
+# The transfer runs detached (setsid) and is resumable (hf download skips
+# already-complete blobs), so closing the CLI never aborts a multi-100GB pull.
+
+cmd_prefetch() {
+    local target="" revision="" follow=true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -r|--revision) revision="$2"; shift 2 ;;
+            --no-follow)   follow=false; shift ;;
+            -h|--help)
+                echo "Usage: $(basename "$0") prefetch <preset|repo_id> [--revision REV] [--no-follow]" >&2
+                echo "" >&2
+                echo "Downloads model weights into HF_HOME on a login node (detached, resumable)." >&2
+                echo "Examples:" >&2
+                echo "    ./olivia.sh prefetch glm51_v19                 # preset -> default repo" >&2
+                echo "    ./olivia.sh prefetch cyankiwi/GLM-5.1-AWQ-4bit # explicit repo id" >&2
+                return 0 ;;
+            -*) error "Unknown option: $1"; return 1 ;;
+            *)  target="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$target" ]]; then
+        error "No model specified"
+        echo "    Usage: ./olivia.sh prefetch <preset|repo_id>" >&2
+        return 1
+    fi
+
+    require_remote_config || return 1
+    if [[ -z "${HF_HOME:-}" ]]; then
+        error "HF_HOME is not set"
+        echo "    Set HF_HOME to the persistent model cache on the cluster, e.g.:" >&2
+        echo "    export HF_HOME=/cluster/projects/<proj>/huggingface" >&2
+        return 1
+    fi
+    ensure_master_connection || return 1
+
+    # Resolve a preset alias to its default repo id; otherwise treat the
+    # argument as a literal HuggingFace repo id.
+    local repo; repo=$(get_default_model "$target")
+    [[ -z "$repo" ]] && repo="$target"
+
+    local state venv slug log
+    state="$(dirname "${HF_HOME}")/.prefetch"
+    venv="${state}/venv"
+    slug=$(printf '%s' "$repo" | tr '/:' '__')
+    log="${state}/${slug}.log"
+
+    info "Prefetching ${repo}"
+    echo "    -> ${HF_HOME}  (login node, detached, resumable)" >&2
+
+    # All ${...} below are host-interpolated; \$ / \" are evaluated remotely.
+    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "
+        set -e
+        HF='${HF_HOME}'; STATE='${state}'; VENV='${venv}'; LOG='${log}'; REPO='${repo}'
+        mkdir -p \"\$HF\" \"\$STATE\"
+        if [ ! -x \"\$VENV/bin/hf\" ]; then
+            echo 'Creating prefetch venv (python3.12)…'
+            python3.12 -m venv \"\$VENV\"
+            \"\$VENV/bin/pip\" -q install -U pip huggingface_hub hf_xet
+        fi
+        PIDF=\"\$STATE/${slug}.pid\"
+        if [ -f \"\$PIDF\" ] && kill -0 \"\$(cat \"\$PIDF\")\" 2>/dev/null; then
+            echo \"Already downloading (pid \$(cat \"\$PIDF\"))\"
+        else
+            HF_HOME=\"\$HF\" HF_XET_HIGH_PERFORMANCE=1 setsid nohup \\
+                \"\$VENV/bin/hf\" download \"\$REPO\" ${revision:+--revision '${revision}'} \\
+                >\"\$LOG\" 2>&1 </dev/null &
+            echo \$! > \"\$PIDF\"
+            echo \"Started pid \$(cat \"\$PIDF\")\"
+        fi
+    " || { error "Failed to start prefetch"; return 1; }
+
+    if [[ "$follow" != true ]]; then
+        echo "    Watch: ssh ${REMOTE_HOST} \"tail -f ${log}\"" >&2
+        return 0
+    fi
+    echo "    (Ctrl-C stops watching; the download continues in the background)" >&2
+    echo "" >&2
+    # hf writes \r-style progress bars; translate to lines so they stream.
+    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "tail -F '${log}' 2>/dev/null | tr '\r' '\n'" || true
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -2629,6 +2723,7 @@ Commands:
     chat        Connect to vLLM server and start chat (default)
     build       Build vLLM containers
     server      Manage vLLM server (deploy, restart, logs)
+    prefetch    Download model weights into persistent HF_HOME (login node)
     tunnel      Manage SSH tunnel
     status      Show cluster and connection status
     cluster     Show Olivia partition utilization (queue, GPUs, reservations)
@@ -2680,6 +2775,9 @@ main() {
             ;;
         server)
             cmd_server "$@"
+            ;;
+        prefetch)
+            cmd_prefetch "$@"
             ;;
         tunnel)
             cmd_tunnel "$@"

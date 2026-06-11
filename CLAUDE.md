@@ -664,3 +664,7 @@ Naming examples:
 **Persistent model cache (`HF_HOME`)**: HuggingFace model weights (hundreds of GB) live in a persistent project area — e.g. `/cluster/projects/<proj>/huggingface`. They must **not** sit on `/cluster/work`, which NRIS auto-purges after 21–42 days (this silently deleted a ~430 GB GLM-5.1 AWQ cache once, leaving only metadata + dangling symlinks). `HF_HOME` is set in `mise.local.toml` and forwarded to jobs by `olivia.sh`; populate it with `./olivia.sh prefetch`. Note `/cluster/work` and `/cluster/projects` are different Lustre filesystems, so migrating weights between them is copy-then-delete (no cross-FS hardlinks).
 
 **Ephemeral compile/JIT caches**: Triton, DeepGEMM, TorchInductor and vLLM compile caches are regenerable and stay under `$PWD/cache/` on `/cluster/work` (`run_vllm_server.sh` sets `TRITON_CACHE_DIR`, `DG_JIT_CACHE_DIR`, `TORCHINDUCTOR_CACHE_DIR`, `VLLM_CACHE_ROOT`). They're large and high-churn, so auto-purge is harmless — but they must avoid the small home quota (defaulting them to `~/.triton` crashes jobs mid-profile with `Disk quota exceeded`).
+
+## Troubleshooting
+
+**Allocation failures / jobs stuck pending.** Before debugging a job that won't start, rule out a cluster maintenance window: run `scontrol show reservation` on the cluster. A `maintstop` reservation covers all nodes and only permits specific maintenance accounts; SLURM reports `ReqNodeNotAvail, Reserved for maintenance` without useful context. Multi-node jobs (e.g. the 2×4-GPU `glm51` or 3×4-GPU `glm52` presets) are especially sensitive.

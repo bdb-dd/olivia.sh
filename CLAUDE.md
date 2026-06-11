@@ -59,7 +59,8 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 ./olivia.sh build logs         # Tail logs of a currently running build job
 
 # Build containers (deploys script and submits SLURM job)
-./olivia.sh build glm51        # Build GLM-5.1 container (vLLM v0.19.0)
+./olivia.sh build glm51_v19    # Build GLM-5.1 container on vLLM v0.19.0 (alias: glm51)
+./olivia.sh build glm51_v20    # Build GLM-5.1 container on vLLM v0.20.0 (quarantined — same wedge)
 ./olivia.sh build glm47        # Build GLM-4.7 container
 ./olivia.sh build devstral     # Build Devstral container
 ./olivia.sh build llama        # Build Llama container
@@ -81,7 +82,8 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 ./olivia.sh server status            # Show running server status
 
 # Start a server (uses preset with default model)
-./olivia.sh server start glm51       # Start GLM-5.1 server (8 GPUs across 2 nodes, TP=4 + PP=2)
+./olivia.sh server start glm51_v19   # Start GLM-5.1 server on vLLM v0.19.0 (alias: glm51; 8 GPUs across 2 nodes, TP=4 + PP=2)
+./olivia.sh server start glm51_v20   # Start GLM-5.1 server on vLLM v0.20.0 (quarantined — same wedge)
 ./olivia.sh server start glm47       # Start GLM-4.7 server
 ./olivia.sh server start devstral    # Start Devstral server
 ./olivia.sh server start llama       # Start Llama server
@@ -122,7 +124,8 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 **Server presets** (with default models):
 | Preset | Default Model | GPUs | Notes |
 |--------|---------------|------|-------|
-| `glm51` | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | TP=4 + PP=2, MTP speculative, Ray cluster |
+| `glm51_v19` (alias `glm51`) | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | TP=4 + PP=2, vLLM v0.19.0, container index 1. Pair with `anthropic_proxy.py` serialization to work around multi-node PP decode wedge. |
+| `glm51_v20` | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | Same as glm51_v19 but on vLLM v0.20.0 + RayExecutorV2, container index 2. **Quarantined** — same wedge as v0.19.0; kept for diagnostic work only. |
 | `glm47` | `QuantTrio/GLM-4.7-AWQ` | 4 | TP=4, MTP speculative |
 | `devstral` | `mistralai/Devstral-2-123B-Instruct-2512` | 4 | TP=4 |
 | `llama` | `meta-llama/Llama-3.3-70B-Instruct` | 4 | TP=4 |
@@ -213,7 +216,8 @@ The build script includes predefined configurations for common models. Run witho
 
 | Preset | Description | vLLM | Transformers |
 |--------|-------------|------|--------------|
-| `glm51` | GLM-5.1 (744B / 40B active) MoE+DSA flagship | v0.19.0 | >=5.3.0.dev0 |
+| `glm51_v19` (alias `glm51`) | GLM-5.1 (744B / 40B active) MoE+DSA flagship, recipe-default | v0.19.0 | >=5.4.0 |
+| `glm51_v20` | GLM-5.1 on RayExecutorV2 — **quarantined**, same multi-node PP wedge as v0.19.0 | v0.20.0 | >=5.4.0 |
 | `glm47` | GLM-4.7 (358B) flagship model | main | >=5.0.0rc0 |
 | `devstral` | Devstral/Mistral models | main | >=4.45.0 |
 | `llama` | Llama 3.x models | main | >=4.45.0 |
@@ -337,16 +341,36 @@ GLM-5.1 is a 744B-parameter MoE model with DeepSeek Sparse Attention (DSA), acti
 
 **Important:** On Olivia, glm51 is the only preset that crosses a node boundary today. Internode bandwidth is **HPE Slingshot at 200 Gbit/s (~25 GB/s)**, ~36× slower than intra-node NVLink C2C (900 GB/s). Naive TP=8 across 2 nodes would bottleneck on cross-node all-reduce for every transformer layer. The preset therefore uses **TP=4 intra-node + PP=2 cross-node**: pipeline parallelism only transfers hidden states between stages (not per-layer), so it degrades gracefully on Slingshot-class links.
 
+### Known issue: multi-node PP decode wedge
+
+GLM-5.1 on Olivia (2×4 GH200, TP=4+PP=2, Slingshot) reproducibly wedges during decode when `Running >= 2` concurrent sequences hit the engine. Prefill completes normally; the first few decode tokens may emit; then generation stops at `0 tok/s` while `Running` stays pinned and the engine step loop never advances. HTTP front-end stays responsive. Eventually Ray raylet aborts with `Fatal Python error: Aborted`.
+
+Originally suspected to be Ray Compiled Graph's `MutableObjectProvider` deadlock (`ray#58426`), but **upgrading to vLLM v0.20.0 + RayExecutorV2 (which bypasses Compiled Graph entirely, confirmed in logs) reproduced the exact same wedge**. The actual root cause is likely deeper — candidates include DSA attention + PP decode sync, MoE expert-parallel routing across PP stages, or NCCL P2P behavior on Slingshot for decode-sized tensors. No upstream fix exists; the official vLLM GLM-5 recipe only validates single-node TP=8.
+
+**Workaround:** run `anthropic_proxy.py` with request serialization (on by default), which holds an `asyncio.Lock` around the upstream `/v1/chat/completions` call so vLLM never sees `Running >= 2` from our proxy. Claude Code sends parallel `generate_session_title` + `repl_main_thread` on every turn — the second request queues invisibly behind the first. Cost: parallel client requests serialize; for single-user CLI usage this is invisible.
+
+Upstream issue trackers to check for future fixes: `vllm#26318` (Slurm + Slingshot PP hang), `vllm#30044` (2-node GH200 TP=4/PP=2), `vllm#24689` / `PR #25906` (full-CUDAGraph cross-rank dispatch wedge).
+
+### Known issue: empty tool_response in GLM-5.1 chat template (cyankiwi fork)
+
+`cyankiwi/GLM-5.1-AWQ-4bit` ships a modified `chat_template.jinja` that **silently drops the content of `role:tool` messages**, rendering every tool result as literal `<tool_response><tools>\n</tools></tool_response>` with no content inside. The model sees "empty tools" for every MCP tool call (WebSearch, Tavily, etc.) and can't act on the results.
+
+Root cause: vLLM's OpenAI entrypoint (`chat_utils.py:1519-1521`) auto-converts string `role:tool` content into `[{"type": "text", "text": "..."}]`. The cyankiwi template's tool-handler hits its `{%- else -%}` branch for non-string content and treats each item as a `tool_reference` lookup (expecting a `.name` field) — but text content parts have no `.name`, so the inner loop emits nothing. The base `zai-org/GLM-5.1` template has a third fallback branch (`visible_text(m.content)`) that cyankiwi removed.
+
+**Fix:** we ship the base `zai-org/GLM-5.1/chat_template.jinja` at `templates/glm51_chat_template.jinja` and auto-pass `--chat-template <path>` to vLLM when running GLM-5.1. `olivia.sh server deploy` uploads the template alongside `run_vllm_server.sh`. No proxy change needed. Override via `CHAT_TEMPLATE_FILE=<path>` if you want to experiment with a different template.
+
 ### GLM-5.1 Usage
 
 ```bash
-# Build GLM-5.1 container
-./olivia.sh build glm51
+# Build GLM-5.1 container on vLLM v0.19.0 (alias glm51, container index 1)
+./olivia.sh build glm51_v19
+# Quarantined v0.20.0 + RayExecutorV2 build (container index 2)
+./olivia.sh build glm51_v20
 # or direct:
 MODEL_ID=glm51 sbatch build_vllm_gh200.sh
 
 # Start GLM-5.1 server (preset auto-allocates 2 nodes × 4 GPUs)
-./olivia.sh server start glm51
+./olivia.sh server start glm51_v19
 
 # Watch loading progress (handles multi-node GPU aggregation automatically)
 ./olivia.sh server watch
@@ -358,7 +382,7 @@ CONTAINER=vllm-glm51-1-sandbox MODEL=cyankiwi/GLM-5.1-AWQ-4bit \
     run_vllm_server.sh
 
 # Override context length (GLM-5.1 has native 205K context window)
-./olivia.sh server start glm51
+./olivia.sh server start glm51_v19
 # or direct: MAX_MODEL_LEN=65536 ... run_vllm_server.sh
 ```
 
@@ -454,6 +478,8 @@ Optionally chain through the batching proxy for SSE compaction over the tunnel: 
 - `--model` *(required)* — the model name forwarded to vLLM (e.g. `cyankiwi/GLM-5.1-AWQ-4bit`). All Anthropic model names in client requests are remapped to this single value.
 - `-v` / `--verbose` — log request/response bodies for debugging.
 - `--keepalive-interval N` — seconds of upstream idle before sending a 1-token dummy completion to keep vLLM's Ray compiled-DAG warm (default `180`, set `0` to disable). Works around a multi-node PP instability where the engine wedges on idle → active transitions; pinging the DAG periodically avoids long idle windows.
+- `--no-serialize` — disable the request-serialization guard (on by default). Without this flag, the proxy holds an `asyncio.Lock` around every upstream `/v1/chat/completions` call so only one request is in flight at a time. This works around the glm51 multi-node PP decode wedge (see "Known issue" above) — Claude Code's parallel `generate_session_title` + `repl_main_thread` pattern reliably triggers the wedge without it. Disable only for testing or if the underlying vLLM bug has been fixed upstream.
+- `--dump-requests DIR` — diagnostic: writes every `/v1/messages` request body (plus headers, with `authorization` / `x-api-key` redacted) to `DIR/req-<timestamp>-<id>.json`. Used to capture the exact Claude Code payload that triggers a wedge, so it can be replayed verbatim via curl to isolate the trigger. Off by default.
 
 **What gets translated:**
 - Request: `system` (string or content-block list) → `role: system` message; `messages` with `text`/`tool_use`/`tool_result` blocks → OpenAI messages + `tool_calls` + `role: tool` results; `tools` → OpenAI `function` tools; `tool_choice` (`auto`/`any`/`none`/`tool`) → OpenAI equivalents; `stop_sequences` → `stop`.

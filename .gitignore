@@ -22,3 +22,7 @@ chat.db-journal
 chat.db-wal
 chat.db-shm
 
+# MCP config: holds API keys (e.g. BRAVE_API_KEY); keep local-only.
+.mcp.json
+
+cc_dumps/

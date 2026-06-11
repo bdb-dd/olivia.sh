@@ -964,6 +964,19 @@ start_server_job() {
     env_vars+=" TP_SIZE=${gpus_per_node}"
     env_vars+=" PP_SIZE=${pp_size}"
 
+    # HF_HOME (persistent model cache) is forwarded from the local environment
+    # (mise.local.toml) rather than read from the cluster shell, so there is a
+    # single source of truth and nothing stale lives in the cluster ~/.bashrc.
+    # It is a path, not a secret, so it rides in env_vars like the rest.
+    # run_vllm_server.sh requires it.
+    if [[ -z "${HF_HOME:-}" ]]; then
+        error "HF_HOME is not set — cannot start server"
+        echo "    HF_HOME should come from mise.local.toml (the persistent model cache)," >&2
+        echo "    e.g. export HF_HOME=/cluster/projects/<proj>/huggingface" >&2
+        return 1
+    fi
+    env_vars+=" HF_HOME=${HF_HOME}"
+
     # Forward selected debug/tuning env vars if the caller set them. Useful for
     # diagnosing startup hangs: `VERBOSE=1 ./olivia.sh server start glm51`
     # flips vLLM, Ray, and NCCL to verbose logging inside the SLURM job.
@@ -1000,12 +1013,19 @@ start_server_job() {
     echo "    sbatch opts: ${sbatch_opts}" >&2
     echo "    env vars:    ${env_vars}" >&2
 
-    local submit_output
-    if ! submit_output=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
-        "cd ${REMOTE_CONTAINER_DIR} && ${env_vars} sbatch ${sbatch_opts} run_vllm_server.sh" 2>&1); then
-        error "Failed to submit job"
-        echo "$submit_output" >&2
-        return 1
+    # HF_TOKEN is a secret, so it is NOT placed in env_vars (which is echoed
+    # above) or on any command line (which `ps` could expose on the shared login
+    # node). Instead it is piped over stdin; the remote shell reads it into its
+    # environment and sbatch's default --export=ALL carries it into the job.
+    local submit_output remote_submit
+    remote_submit="cd ${REMOTE_CONTAINER_DIR} && ${env_vars} sbatch ${sbatch_opts} run_vllm_server.sh"
+    if [[ -n "${HF_TOKEN:-}" ]]; then
+        submit_output=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+            "IFS= read -r HF_TOKEN && export HF_TOKEN && ${remote_submit}" <<<"${HF_TOKEN}" 2>&1) \
+            || { error "Failed to submit job"; echo "$submit_output" >&2; return 1; }
+    else
+        submit_output=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "${remote_submit}" 2>&1) \
+            || { error "Failed to submit job"; echo "$submit_output" >&2; return 1; }
     fi
 
     local job_id
@@ -2625,8 +2645,14 @@ cmd_prefetch() {
     info "Prefetching ${repo}"
     echo "    -> ${HF_HOME}  (login node, detached, resumable)" >&2
 
+    # HF_TOKEN (secret, needed for gated repos) is forwarded over stdin so it
+    # stays off argv and out of logs; the exported value is inherited by the
+    # detached `hf download`. Public repos work with it unset.
+    local token_read=""
+    [[ -n "${HF_TOKEN:-}" ]] && token_read="IFS= read -r HF_TOKEN && export HF_TOKEN; "
+
     # All ${...} below are host-interpolated; \$ / \" are evaluated remotely.
-    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "
+    local remote_cmd="${token_read}
         set -e
         HF='${HF_HOME}'; STATE='${state}'; VENV='${venv}'; LOG='${log}'; REPO='${repo}'
         mkdir -p \"\$HF\" \"\$STATE\"
@@ -2645,7 +2671,14 @@ cmd_prefetch() {
             echo \$! > \"\$PIDF\"
             echo \"Started pid \$(cat \"\$PIDF\")\"
         fi
-    " || { error "Failed to start prefetch"; return 1; }
+    "
+    if [[ -n "${HF_TOKEN:-}" ]]; then
+        ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "${remote_cmd}" <<<"${HF_TOKEN}" \
+            || { error "Failed to start prefetch"; return 1; }
+    else
+        ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "${remote_cmd}" \
+            || { error "Failed to start prefetch"; return 1; }
+    fi
 
     if [[ "$follow" != true ]]; then
         echo "    Watch: ssh ${REMOTE_HOST} \"tail -f ${log}\"" >&2

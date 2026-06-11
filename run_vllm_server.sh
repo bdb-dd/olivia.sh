@@ -130,14 +130,43 @@ CUDAGRAPH_MODE="${CUDAGRAPH_MODE:-}"
 # Set to 0 to keep custom kernel even with capture enabled (will likely crash).
 DISABLE_CUSTOM_ALL_REDUCE="${DISABLE_CUSTOM_ALL_REDUCE:-auto}"
 
-# Cache directories. All cache paths must live on the project filesystem
-# (CONTAINER_DIR is under /cluster/work/... on Olivia, which has generous
-# quota). Defaulting Triton / DeepGEMM JIT caches to user home causes jobs
-# to fail mid-profile with `OSError: [Errno 122] Disk quota exceeded` once
-# the small home quota fills with compiled kernels — especially for models
-# with MoE + many experts + many shapes (GLM-5.1 hit this on first profile
-# pass when cache landed under ~/.triton).
-HF_CACHE="${HF_CACHE:-$PWD/cache/huggingface}"
+# Cache directories — split by lifetime, because model weights and compile
+# artifacts have opposite storage needs:
+#
+#   HF_HOME -> model weights (HuggingFace hub cache). Hundreds of GB and slow to
+#     re-download, so this MUST be persistent. It must NOT live on /cluster/work,
+#     which NRIS auto-purges after 21-42 days: that silently deletes downloaded
+#     weights and forces a multi-hour re-download on the next run (exactly what
+#     wiped the GLM-5.1 AWQ cache — blobs gone, only dangling symlinks left).
+#     Point HF_HOME at a persistent project area, e.g.
+#     /cluster/projects/<proj>/huggingface.
+#
+#   Triton / DeepGEMM / TorchInductor / vLLM compile caches -> regenerable JIT
+#     artifacts: large, high-churn, cheap to rebuild, so they stay under $PWD on
+#     /cluster/work where auto-purge is harmless. They must still avoid the small
+#     home quota — defaulting them to ~/.triton fills it and crashes jobs
+#     mid-profile with `OSError: [Errno 122] Disk quota exceeded`, especially for
+#     MoE models with many experts × shapes (GLM-5.1 hit this under ~/.triton).
+#
+# HF_HOME is HuggingFace's canonical location var; HF_CACHE is kept as a
+# back-compat alias. One must be set — no hardcoded cluster path here (matches
+# the CONTAINER_DIR contract).
+HF_CACHE="${HF_HOME:-${HF_CACHE:-}}"
+if [[ -z "${HF_CACHE}" ]]; then
+    echo "Error: HF_HOME is not set." >&2
+    echo "Set it to a PERSISTENT model cache on project storage, e.g.:" >&2
+    echo "    export HF_HOME=/cluster/projects/<your-project>/huggingface" >&2
+    echo "Avoid /cluster/work — NRIS auto-purges it after 21-42 days and weights are lost." >&2
+    exit 1
+fi
+case "${HF_CACHE}" in
+    /cluster/work/*)
+        echo "WARNING: HF_HOME=${HF_CACHE}" >&2
+        echo "         is on /cluster/work, which NRIS auto-purges after 21-42 days —" >&2
+        echo "         downloaded weights WILL be deleted and re-downloaded. Move it to a" >&2
+        echo "         persistent area, e.g. /cluster/projects/<proj>/huggingface." >&2
+        ;;
+esac
 VLLM_CACHE="${VLLM_CACHE:-$PWD/cache/vllm}"
 # VLLM_CACHE_ROOT: controls where vLLM writes torch_compile_cache, modelinfos,
 # deep_gemm warmup caches, etc. Default inside vLLM is `~/.cache/vllm`; since

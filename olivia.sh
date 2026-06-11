@@ -804,89 +804,101 @@ EOF
 # MODULE: Server
 # =============================================================================
 
-# Default model mappings for presets
-get_default_model() {
-    local preset="$1"
-    case "${preset}" in
-        glm51|glm51_v19|glm51_v20|glm-5.1)
-            echo "cyankiwi/GLM-5.1-AWQ-4bit"
-            ;;
-        glm47|glm-4.7)
-            echo "QuantTrio/GLM-4.7-AWQ"
-            ;;
-        devstral|mistral)
-            echo "mistralai/Devstral-2-123B-Instruct-2512"
-            ;;
-        llama|llama3)
-            echo "meta-llama/Llama-3.3-70B-Instruct"
-            ;;
-        qwen|qwen2)
-            echo "Qwen/Qwen2.5-72B-Instruct"
-            ;;
-        *)
-            echo ""
-            ;;
+# Canonicalize a preset name: lowercase + map aliases to a canonical token.
+# This is the ONLY place that knows about aliases, so every other preset lookup
+# can match canonical tokens only. Unknown names pass through (lowercased) and
+# are treated as a custom MODEL_ID downstream.
+# (lowercase via `tr` rather than ${1,,} — macOS ships bash 3.2.)
+normalize_preset() {
+    local p
+    p=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    case "$p" in
+        glm51|glm-5.1|glm5.1|glm51_v19) echo "glm51_v19" ;;
+        glm51_v20)                      echo "glm51_v20" ;;
+        glm47|glm-4.7)                  echo "glm47" ;;
+        devstral|mistral)               echo "devstral" ;;
+        llama|llama3)                   echo "llama" ;;
+        qwen|qwen2)                     echo "qwen" ;;
+        generic)                        echo "generic" ;;
+        *)                              echo "$p" ;;
     esac
 }
 
-# Resource allocation per preset.
-# Emits "num_nodes gpus_per_node pp_size" for use by start_server_job.
-# Defaults to single-node 4 GPUs if the preset is unknown.
-get_preset_resources() {
-    local preset="$1"
-    case "${preset}" in
-        glm51|glm51_v19|glm51_v20|glm-5.1)
-            # 744B MoE AWQ — ~430GB, needs 8 GPUs.
-            # TP=4 intra-node (NVLink) + PP=2 cross-node (Slingshot) is the
-            # sweet spot: PP tolerates the ~25 GB/s cross-node fabric far better
-            # than naive TP=8 would.
-            echo "2 4 2"
+# Single source of truth for per-preset runtime config. Given a (raw) preset
+# name and a field, emit that field's value. All per-preset data lives in the
+# one case statement below — add or change a preset here and every accessor
+# (get_default_model / get_preset_resources / resolve_container_* /
+# get_preset_default_index) picks it up.
+#
+# Fields: model | nodes | gpus | pp | resources | prefix | index
+preset_field() {
+    local canon field
+    canon=$(normalize_preset "$1")
+    field="$2"
+    # Defaults: single-node 4-GPU (matches run_vllm_server.sh #SBATCH directives),
+    # container prefix == canonical name, index 1, no default model.
+    local prefix="$canon" index="1" model="" nodes="1" gpus="4" pp="1"
+    case "$canon" in
+        glm51_v19)
+            # glm51_v19/glm51_v20 share the "glm51" container prefix; the index
+            # encodes the vLLM version (1 = v0.19.0, 2 = v0.20.0).
+            prefix="glm51"; index="1"
+            model="cyankiwi/GLM-5.1-AWQ-4bit"
+            # 744B MoE AWQ (~430GB) needs 8 GPUs. TP=4 intra-node (NVLink) +
+            # PP=2 cross-node (Slingshot) — PP tolerates the ~25 GB/s cross-node
+            # fabric far better than naive TP=8 would.
+            nodes="2"; gpus="4"; pp="2"
+            ;;
+        glm51_v20)
+            prefix="glm51"; index="2"
+            model="cyankiwi/GLM-5.1-AWQ-4bit"
+            nodes="2"; gpus="4"; pp="2"
+            ;;
+        glm47)
+            model="QuantTrio/GLM-4.7-AWQ"
+            ;;
+        devstral)
+            model="mistralai/Devstral-2-123B-Instruct-2512"
+            ;;
+        llama)
+            model="meta-llama/Llama-3.3-70B-Instruct"
+            ;;
+        qwen)
+            model="Qwen/Qwen2.5-72B-Instruct"
+            ;;
+        generic)
             ;;
         *)
-            # Single-node 4-GPU default (matches run_vllm_server.sh #SBATCH directives)
-            echo "1 4 1"
+            # Custom/unknown preset: keep the raw name for the container prefix
+            # so it matches build_vllm_gh200.sh's MODEL_ID="${preset}" (which
+            # preserves case); no default model, single-node defaults.
+            prefix="$1"
             ;;
+    esac
+    case "$field" in
+        model)     echo "$model" ;;
+        nodes)     echo "$nodes" ;;
+        gpus)      echo "$gpus" ;;
+        pp)        echo "$pp" ;;
+        resources) echo "$nodes $gpus $pp" ;;
+        prefix)    echo "$prefix" ;;
+        index)     echo "$index" ;;
+        *)         echo "" ;;
     esac
 }
 
-# Map preset name to the container-name prefix (what goes between "vllm-" and
-# "-<index>-sandbox"). glm51_v19 and glm51_v20 are version-tagged aliases that
-# share the same "glm51" container prefix — the version distinction is encoded
-# in the index (1 = v0.19.0, 2 = v0.20.0) rather than a separate directory.
-resolve_container_prefix() {
-    case "$1" in
-        glm51|glm51_v19|glm51_v20|glm-5.1|GLM51|GLM51_V19|GLM51_V20|GLM-5.1)
-            echo "glm51"
-            ;;
-        glm47|glm-4.7|GLM47|GLM-4.7)
-            echo "glm47"
-            ;;
-        *)
-            echo "$1"
-            ;;
-    esac
-}
+# Thin accessors over preset_field — kept as named functions so call sites read
+# clearly and don't all have to learn the field names.
+get_default_model()        { preset_field "$1" model; }
+get_preset_resources()     { preset_field "$1" resources; }  # "num_nodes gpus_per_node pp_size"
+resolve_container_prefix() { preset_field "$1" prefix; }
+get_preset_default_index() { preset_field "$1" index; }
 
-# Default container index per preset. Used when the user doesn't pass --index.
-# glm51_v19 uses index 1 (the v0.19.0 build); glm51_v20 uses index 2 (v0.20.0).
-get_preset_default_index() {
-    case "$1" in
-        glm51_v20|GLM51_V20)
-            echo "2"
-            ;;
-        *)
-            echo "1"
-            ;;
-    esac
-}
-
-# Resolve preset to container name
+# Resolve preset + index to a container sandbox name.
 resolve_container_name() {
-    local preset="$1"
-    local index="${2:-1}"
     local prefix
-    prefix=$(resolve_container_prefix "$preset")
-    echo "vllm-${prefix}-${index}-sandbox"
+    prefix=$(preset_field "$1" prefix)
+    echo "vllm-${prefix}-${2:-1}-sandbox"
 }
 
 deploy_server_script() {

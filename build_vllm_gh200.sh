@@ -8,7 +8,10 @@
 # blocks this 1-GPU build from backfilling into a partially-used node. 128G is
 # ample for a vLLM compile; raise it if parallel nvcc/ninja ever pressures it.
 #SBATCH --mem=128G
-#SBATCH --time=08:00:00
+# Build needs ~30-90 min; a short walltime backfills into transient GPU holes
+# far more easily than an 8h reservation (the scheduler can only place an 8h job
+# in a hole that stays free for 8h before the next higher-priority reservation).
+#SBATCH --time=02:00:00
 #SBATCH --output=build_vllm_%j.log
 
 # =============================================================================
@@ -406,12 +409,19 @@ else
     SING_OPTS="--nv --writable"
 fi
 
-# Export preset values for use inside container
+# Export preset values for use inside the container.
+# PRESET_TRANSFORMERS is forwarded via the SINGULARITYENV_/APPTAINERENV_ prefix
+# rather than `singularity exec --env`: that flag splits a value on commas (and
+# this Apptainer build does NOT honor backslash-escaping them), which mangles a
+# pip range like ">=4.57.1,<5.0.0" (Kimi needs transformers <5.0.0) into a
+# malformed second entry and aborts Phase 3. The prefix mechanism passes the
+# value into the container env verbatim, with no comma parsing.
+export SINGULARITYENV_PRESET_TRANSFORMERS="${PRESET_TRANSFORMERS}"
+export APPTAINERENV_PRESET_TRANSFORMERS="${PRESET_TRANSFORMERS}"
 export PRESET_TRANSFORMERS="${PRESET_TRANSFORMERS}"
 export VLLM_VERSION="${VLLM_VERSION}"
 
 singularity exec ${SING_OPTS} \
-    --env "PRESET_TRANSFORMERS=${PRESET_TRANSFORMERS}" \
     --env "VLLM_VERSION=${VLLM_VERSION}" \
     --bind "${PIP_CACHE}:/root/.cache/pip" \
     "${SANDBOX_PATH}" /bin/bash << 'BUILDSCRIPT'

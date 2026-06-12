@@ -460,30 +460,12 @@ fi
 cd vllm
 echo "vLLM source cloned: $(git describe --tags --always 2>/dev/null || echo 'unknown')"
 
-# Safety check: if we're pinning a version older than the libtorch-stable
-# migration, the csrc/libtorch_stable directory won't exist and the disable
-# patch below is a no-op (which is what we want). If the directory DOES exist
-# on a pinned tag, our patch will silently drop ops like
-# `per_token_group_fp8_quant` that runtime code (deepseek_v2.py,
-# fp8_utils.py) unconditionally calls — producing a forward-pass AttributeError
-# later. Warn loudly so the operator can decide whether to proceed.
-if [[ -d "csrc/libtorch_stable" && "$VLLM_VERSION" != "main" ]]; then
-    echo ""
-    echo "================================================================"
-    echo "WARNING: vLLM ${VLLM_VERSION} ships csrc/libtorch_stable/."
-    echo "         Our NGC 25.12 patch disables that extension, which drops"
-    echo "         ops like per_token_group_fp8_quant (used by DeepSeek/GLM-"
-    echo "         family models at forward-pass time). The build will"
-    echo "         succeed but the resulting container will fail to load"
-    echo "         models that depend on those ops."
-    echo ""
-    echo "         Pin an older VLLM_VERSION that predates the stable-ABI"
-    echo "         migration, or switch to a build strategy that compiles"
-    echo "         _C_stable_libtorch (requires a newer NGC PyTorch with"
-    echo "         TORCH_BOX)."
-    echo "================================================================"
-    echo ""
-fi
+# vLLM's csrc/libtorch_stable holds the stable-ABI ops — including
+# per_token_group_fp8_quant, which DeepSeek/GLM/Kimi-family models call at
+# forward time. On NGC 26.01+ (we pin 26.03) this target compiles cleanly, so we
+# no longer disable it (see the NOTE below for the history). If you override
+# NGC_PYTORCH_TAG to an older tag lacking TORCH_BOX, _C_stable_libtorch fails to
+# COMPILE — a loud build error, not a silent op drop — so bump to NGC 26.03+.
 
 # NOTE: we previously patched out `_C_stable_libtorch` here because NGC 25.12's
 # PyTorch alpha (2025-11-04) predated the upstream TORCH_BOX macro (2025-11-11,

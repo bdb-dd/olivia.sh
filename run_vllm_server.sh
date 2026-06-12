@@ -265,6 +265,16 @@ if [[ "${MODEL}" == *"Kimi-K2"* ]] || [[ "${MODEL}" == *"kimi-k2"* ]]; then
     IS_KIMI=1
 fi
 
+# Kimi K2.6's fused MLA op (vllm.min_latency_fused_qkv_a_proj) has no fake/meta
+# dispatch, so vLLM's torch.compile/CUDAGraph path fails during profile_run on
+# this multi-node PP setup ("Multiple dispatch failed ... NotImplemented", from
+# kimi_k25.py forward under cuda_graph.py). Default to eager (mode=NONE), like
+# the multi-node glm51 path. Override CUDAGRAPH_MODE=PIECEWISE etc. to retry the
+# capture once upstream ships a meta impl for the op (decode-speedup TODO).
+if [[ "${IS_KIMI}" == "1" && -z "${CUDAGRAPH_MODE}" ]]; then
+    CUDAGRAPH_MODE="NONE"
+fi
+
 # Any GLM MoE model that uses the glm47/glm45 parser family
 IS_GLM_MOE=0
 if [[ "${IS_GLM47}" == "1" || "${IS_GLM51}" == "1" ]]; then

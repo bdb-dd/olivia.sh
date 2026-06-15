@@ -138,9 +138,13 @@ apply_preset() {
             # custom_code. vLLM 0.19.1 is the manually-verified stable release
             # per Moonshot's deploy guide; newer support is nightly-only.
             PRESET_VLLM_VERSION="v0.19.1"
-            # Hard requirement from the model card: transformers >=4.57.1,<5.0.0
-            # (NOT the 5.x line glm51 uses — that's why Kimi gets its own build).
-            PRESET_TRANSFORMERS=">=4.57.1,<5.0.0"
+            # Model card lists transformers >=4.57.1,<5.0.0 for STANDALONE HF use.
+            # But vLLM serves Kimi via its NATIVE kimi_k25.py (only imports
+            # BatchFeature), so transformers 5 works under vLLM — required for the
+            # vLLM 0.21+ MQ Ray executor that fixes the multi-node PP compiled-DAG
+            # wedge (ray#58426). Overridable via PRESET_TRANSFORMERS env for the
+            # 0.21 build experiment (PRESET_TRANSFORMERS='>=5').
+            PRESET_TRANSFORMERS="${PRESET_TRANSFORMERS:->=4.57.1,<5.0.0}"
             PRESET_NOTES="Kimi K2.6 (1T MoE, MLA, multimodal): native int4, multi-node TP=4 + PP=2, kimi_k2 parser"
             ;;
         devstral|mistral|Devstral|Mistral)
@@ -409,6 +413,19 @@ else
     SING_OPTS="--nv --writable"
 fi
 
+# Run the build in a PRIVATE IPC namespace (--ipc). On these GH200 nodes the
+# shared host IPC namespace has an exhausted/clobbered SysV semaphore space, so
+# parallel (MAX_JOBS>1) compiles die a few ninja steps into the vLLM kernel build
+# with `semop(1): encountered an error: Invalid argument` (NOT memory — observed
+# at ~58 GB). A private IPC namespace gives the build a fresh SysV semaphore space
+# so the default MAX_JOBS=8 builds clean (verified). Serial MAX_JOBS=1 also avoids
+# it but is far slower. Default ON; set BUILD_IPC=0 to disable (e.g. on a future
+# node/Apptainer that lacks --ipc, or once the host IPC space is fixed).
+if [[ "${BUILD_IPC:-1}" == "1" ]]; then
+    SING_OPTS="${SING_OPTS} --ipc"
+    echo "BUILD_IPC -> using a private IPC namespace (--ipc) for the build"
+fi
+
 # Export preset values for use inside the container.
 # PRESET_TRANSFORMERS is forwarded via the SINGULARITYENV_/APPTAINERENV_ prefix
 # rather than `singularity exec --env`: that flag splits a value on commas (and
@@ -544,6 +561,57 @@ else:
     print(f"{fp} not found (OK, may be a newer vLLM layout)")
 PYPATCH_FXREPR
 
+# Patch: disable the DeepSeek-V3 "min-latency" fused QKV-A GEMM so its custom op
+# is never emitted into the graph.
+# vllm/model_executor/models/deepseek_v2.py wraps the low-batch dsv3_fused_a_gemm
+# kernel in a custom op `torch.ops.vllm.min_latency_fused_qkv_a_proj` (used by
+# DeepSeek/Kimi-family MLA models, incl. Kimi K2.6, at batch <= 16, i.e. decode).
+# It registers a fake/meta via direct_register_custom_op(..., fake_impl=...), but
+# under NGC's torch alpha that fake never lands in the FakeTensor dispatch table,
+# so torch.compile's profile_run dies with:
+#   TypeError: Multiple dispatch failed for
+#     'torch._ops.vllm.min_latency_fused_qkv_a_proj.default';
+#     all __torch_dispatch__ handlers returned NotImplemented
+# That crash is independent of cudagraph_mode (it happens before capture), so it
+# blocks CUDAGraph entirely and forces eager (~5x slower decode). Forcing
+# `_use_min_latency_gemm = False` makes the layer fall back to its parent
+# MergedColumnParallelLinear.forward — the SAME merged matmul, identical output,
+# only without the low-batch kernel micro-opt — which torch.compile traces fine.
+# This is the fix that unblocks CUDAGraph for Kimi K2.6 on GH200. Revisit when
+# NGC ships a torch where the custom-op fake registration works (then this whole
+# block can go and the kernel micro-opt comes back). See the proposed plan
+# plans/proposed/kimi_serving_perf.md for the full investigation.
+echo "Patching vllm/model_executor/models/deepseek_v2.py: disable dsv3 min-latency gemm..."
+python3 << 'PYPATCH_MINLATENCY'
+import re
+from pathlib import Path
+fp = Path('vllm/model_executor/models/deepseek_v2.py')
+if not fp.exists():
+    print(f"{fp} not found (OK, may be a newer vLLM layout)")
+else:
+    src = fp.read_text()
+    if 'NGC-torch patch' in src and '_use_min_latency_gemm = (False and' in src:
+        print("Already patched (OK)")
+    else:
+        # Match only the original assignment: `(` immediately followed by newline.
+        # The patched form is `(False and  # ...`, so re-runs find 0 matches.
+        new_src, n = re.subn(
+            r'self\._use_min_latency_gemm = \(\n',
+            'self._use_min_latency_gemm = (False and  # NGC-torch patch: '
+            'no working fake for the dsv3 min-latency custom op under NGC torch '
+            'alpha; force off so torch.compile/CUDAGraph can trace MLA decode.\n',
+            src,
+        )
+        if n == 1:
+            fp.write_text(new_src)
+            print("Patched _use_min_latency_gemm -> forced False (min-latency gemm disabled)")
+        elif n == 0:
+            print("No `_use_min_latency_gemm = (` assignment found "
+                  "(OK, may be a newer vLLM that fixed this)")
+        else:
+            print(f"WARNING: expected 1 match, found {n} — patch skipped, inspect manually")
+PYPATCH_MINLATENCY
+
 # Get current NGC PyTorch version for constraints
 NGC_TORCH_VERSION=$(python3 -c "import torch; print(torch.__version__)")
 echo "NGC PyTorch version: ${NGC_TORCH_VERSION}"
@@ -609,7 +677,6 @@ pip install --no-cache-dir \
     pyyaml \
     pillow \
     blake3 \
-    compressed-tensors>=0.8.0 \
     depyf \
     cloudpickle \
     partial-json-parser \
@@ -634,8 +701,22 @@ pip install --no-cache-dir \
     opencv-python-headless>=4.11.0 \
     pybase64 \
     setproctitle \
-    lark==1.2.2 \
-    2>&1 | tail -30 || true
+    lark==1.2.2
+# Do NOT mask failures here (previously this ended with '2>&1 | tail -30 || true',
+# which swallowed a fatal ResolutionImpossible and shipped a container missing
+# ray/transformers/compressed-tensors — it still passed 'import vllm' but could
+# not serve). set -euo pipefail is active, so a resolver failure now aborts the
+# build loudly. See the NGC-26.05 incident (2026-06-14).
+
+# compressed-tensors must be installed --no-deps: it requires torch>=2.10.0, and
+# pip refuses to match that against NGC's *local prerelease* torch
+# (e.g. 2.12.0a0+...nv26.05) under PEP 440 prerelease rules — so leaving it in
+# the resolved batch above makes the whole batch ResolutionImpossible on newer
+# NGC bases. torch is already in the container, so --no-deps installs it cleanly
+# (vLLM/flashinfer/flash-attn are installed the same way for the same reason).
+echo ""
+echo "Installing compressed-tensors (--no-deps to preserve NGC PyTorch)..."
+pip install --no-cache-dir --root-user-action=ignore --no-deps "compressed-tensors>=0.8.0"
 
 # Try to install xgrammar (vLLM constraint grammar feature)
 pip install --no-cache-dir --root-user-action=ignore xgrammar 2>&1 | tail -5 || echo "xgrammar not available, continuing..."

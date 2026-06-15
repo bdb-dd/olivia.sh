@@ -617,7 +617,7 @@ cmd_build() {
                 info "To build a new container:"
                 echo "    ./olivia.sh build <preset>" >&2
                 echo "" >&2
-                echo "Available presets: glm51_v19 (alias: glm51), glm51_v20, glm47, kimi, devstral, llama, qwen, generic" >&2
+                echo "Available presets: glm51_v19 (alias: glm51), glm51_v20, glm47, kimi, kimi27, devstral, llama, qwen, generic" >&2
                 exit 0
                 ;;
             --presets|-p)
@@ -639,6 +639,13 @@ cmd_build() {
                 echo "  kimi       Kimi K2.6 (1T MoE, 32B active) MLA + multimodal"
                 echo "             vLLM: v0.19.1, transformers>=4.57.1,<5.0.0"
                 echo "             native int4 ~640GB, 8 GPUs (2×4-GPU nodes, TP=4 + PP=2)"
+                echo ""
+                echo "  kimi27     Kimi K2.7-Code (1T MoE, 32B active) coding-focused"
+                echo "             Same arch as K2.6 — reuses kimi container (index 4,"
+                echo "             eager vLLM 0.21), no rebuild. native int4 ~560GB,"
+                echo "             8 GPUs (2×4-GPU nodes, TP=4 + PP=2). Thinking-mode only."
+                echo "             Weights on /cluster/work scratch — serve with"
+                echo "             HF_HOME=/cluster/work/projects/nn10104k/huggingface"
                 echo ""
                 echo "  devstral   Devstral/Mistral models"
                 echo "             vLLM: main, transformers>=4.45.0"
@@ -861,6 +868,7 @@ normalize_preset() {
         glm51_v20)                      echo "glm51_v20" ;;
         glm47|glm-4.7)                  echo "glm47" ;;
         kimi|kimi26|kimi-k2.6|kimi_k26) echo "kimi" ;;
+        kimi27|kimi-k2.7|kimi_k27|kimi-k2.7-code|kimi27code) echo "kimi27" ;;
         devstral|mistral)               echo "devstral" ;;
         llama|llama3)                   echo "llama" ;;
         qwen|qwen2)                     echo "qwen" ;;
@@ -907,6 +915,19 @@ preset_field() {
             # native int4 (compressed-tensors, ~640GB) — there is no separate
             # -AWQ repo. ~640GB → 8 GPUs / 2 nodes, same TP=4 + PP=2 as glm51.
             model="moonshotai/Kimi-K2.6"
+            nodes="2"; gpus="4"; pp="2"
+            ;;
+        kimi27)
+            # Kimi K2.7-Code (1T MoE, 32B active): coding-focused successor to
+            # K2.6. SAME KimiK25ForConditionalGeneration arch + native int4
+            # (compressed-tensors ~560GB), so it reuses the "kimi" container
+            # (index 4 = the validated eager vLLM 0.21 build) with no rebuild.
+            # 8 GPUs / 2 nodes, TP=4 + PP=2. Thinking-mode only (temp 1.0,
+            # top_p 0.95). Weights live on /cluster/work scratch (the project
+            # quota is full with K2.6) -> serve with HF_HOME pointed at the
+            # scratch cache: HF_HOME=/cluster/work/projects/nn10104k/huggingface
+            prefix="kimi"; index="4"
+            model="moonshotai/Kimi-K2.7-Code"
             nodes="2"; gpus="4"; pp="2"
             ;;
         devstral)
@@ -1035,13 +1056,20 @@ start_server_job() {
     # Tool/reasoning knobs are forwarded so Claude Code and other OpenAI
     # tool-using clients can enable the GLM tool-call parser per-session
     # without editing run_vllm_server.sh.
+    # Cache-dir overrides (VLLM_CACHE*, *_CACHE_DIR) let several servers run
+    # concurrently from the same workdir without racing on the shared
+    # $PWD/cache/* compile/JIT caches — give each parallel experiment its own
+    # cache root. DISABLE_CUSTOM_ALL_REDUCE is forwarded so CUDAGraph capture
+    # experiments can pin the NCCL all-reduce fallback explicitly.
     for forward_var in VERBOSE VLLM_LOGGING_LEVEL RAY_BACKEND_LOG_LEVEL \
                        RAY_DEDUP_LOGS NCCL_DEBUG CUDAGRAPH_MODE \
                        ENABLE_AUTO_TOOL_CHOICE GLM_TOOL_PARSER \
                        GLM_REASONING_PARSER SERVED_MODEL_NAME \
                        MTP_SPECULATIVE_TOKENS ENABLE_SPECULATIVE \
                        MAX_MODEL_LEN GPU_MEM_UTIL RAY_CGRAPH_GET_TIMEOUT \
-                       VLLM_USE_RAY_V2_EXECUTOR_BACKEND; do
+                       VLLM_USE_RAY_V2_EXECUTOR_BACKEND DISABLE_CUSTOM_ALL_REDUCE \
+                       VLLM_CACHE VLLM_CACHE_ROOT TRITON_CACHE_DIR \
+                       DG_JIT_CACHE_DIR TORCHINDUCTOR_CACHE_DIR; do
         if [[ -n "${!forward_var:-}" ]]; then
             env_vars+=" ${forward_var}=${!forward_var}"
         fi
@@ -2055,6 +2083,56 @@ EOF
 # MODULE: Status
 # =============================================================================
 
+# Enriched job listing for `status`. Prints the base squeue line per job, then
+# for each RUNNING vLLM-server job a derived phase line — LOADING <shards>,
+# CAPTURING cudagraphs, SERVING (+ live throughput / KV usage / health), or
+# ERROR — plus build-job progress. All derived in a single remote pass over the
+# job logs so `status` stays one round trip.
+print_jobs_enriched() {
+    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+        "CDIR='${REMOTE_CONTAINER_DIR}' VPORT='${REMOTE_PORT}' bash -s" <<'REMOTE_JOBS' 2>/dev/null || true
+jobs=$(squeue -u "$USER" -h -o '%i|%j|%T|%M|%l|%R' 2>/dev/null)
+if [ -z "$jobs" ]; then echo "  (no jobs in queue)"; exit 0; fi
+printf '  %-9s %-18s %-10s %-13s %s\n' JOBID NAME STATE TIME/LIMIT NODES
+echo "$jobs" | while IFS='|' read -r jid name state etime tlimit nodes; do
+  printf '  %-9s %-18s %-10s %-13s %s\n' "$jid" "$name" "$state" "$etime/$tlimit" "$nodes"
+  [ "$state" = RUNNING ] || continue
+  case "$name" in
+    *vllm-server*)
+      head=$(scontrol show hostnames "$nodes" 2>/dev/null | head -1)
+      hl="$CDIR/logs/vllm_server_${jid}_head.log"; wl="$CDIR/logs/vllm_server_${jid}.log"
+      model=$(grep -oE 'Model: +[^[:space:]]+' "$wl" 2>/dev/null | head -1 | awk '{print $NF}')
+      mode=$(grep -oE 'CUDAGraph Mode: +[^[:space:]]+' "$wl" 2>/dev/null | head -1 | awk '{print $NF}')
+      tag="${model:-?} [cg=${mode:-?}]"
+      if [ -f "$hl" ] && grep -qE 'Application startup complete|Uvicorn running on' "$hl" 2>/dev/null; then
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://$head:${VPORT}/health" 2>/dev/null)
+        tp=$(grep -oE 'Avg generation throughput: [0-9.]+ tokens/s, Running: [0-9]+ reqs, Waiting: [0-9]+ reqs, GPU KV cache usage: [0-9.]+%' "$hl" 2>/dev/null | tail -1)
+        echo "             -> SERVING  $tag  http://$head:${VPORT} (health $code)"
+        [ -n "$tp" ] && echo "                ${tp#Avg }"
+      elif [ -f "$hl" ] && grep -qE 'illegal memory access|Traceback \(most recent call last\)|EngineDeadError|Engine core initialization failed|Fatal Python error' "$hl" 2>/dev/null; then
+        echo "             -> ERROR  $tag  (engine failed; tail logs/vllm_server_${jid}_head.log)"
+      elif [ -f "$hl" ] && grep -qE 'Capturing cudagraph|Capturing CUDA graph' "$hl" 2>/dev/null; then
+        echo "             -> CAPTURING cudagraphs  $tag  (weights loaded)"
+      elif [ -f "$hl" ]; then
+        sh=$(grep -oE 'Loading safetensors checkpoint shards: +[0-9]+% Completed \| [0-9]+/[0-9]+' "$hl" 2>/dev/null | tail -1)
+        if [ -n "$sh" ]; then
+          nn=$(echo "$sh" | grep -oE '[0-9]+/[0-9]+' | head -1); pct=$(echo "$sh" | grep -oE '[0-9]+%' | head -1)
+          echo "             -> LOADING weights ${nn} (${pct})  $tag"
+        else echo "             -> INIT / Ray bootstrap  $tag"; fi
+      else echo "             -> starting (no head log yet)  $tag"; fi
+      ;;
+    *build-vllm*)
+      bl="$CDIR/build_vllm_${jid}.log"
+      if [ -f "$bl" ]; then
+        if grep -qE 'Build Complete!' "$bl" 2>/dev/null; then echo "             -> build COMPLETE"
+        else stp=$(grep -oE '\[[0-9]+/[0-9]+\]' "$bl" 2>/dev/null | tail -1); echo "             -> building ${stp:-(deps/clone phase)}"; fi
+      fi
+      ;;
+  esac
+done
+REMOTE_JOBS
+}
+
 cmd_status() {
     header "Olivia Status"
 
@@ -2084,7 +2162,7 @@ cmd_status() {
     # Remote jobs (if connected)
     if is_master_alive || ensure_master_connection 2>/dev/null; then
         info "Jobs on Olivia:"
-        ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "squeue -u \$USER" 2>/dev/null || true
+        print_jobs_enriched
     fi
 }
 
@@ -2163,7 +2241,42 @@ pending_count=$(squeue -h -u "$USER" -t PENDING -o "%i" | wc -l)
 if [ "$running_count" -eq 0 ] && [ "$pending_count" -eq 0 ]; then
     printf "    (none)\n"
 else
-    squeue -u "$USER" -o "  %.8i  %.14j  %.8T  %.5D  %.10M  %.10l  %R" | tail -n +1
+    squeue -u "$USER" -h -o '%i|%j|%T|%M|%l|%R' | while IFS='|' read -r jid name state etime tlimit nodes; do
+        printf "  ${BLD}%-8s${RST} %-16s %-9s %-13s %s\n" "$jid" "$name" "$state" "$etime/$tlimit" "$nodes"
+        [ "$state" = RUNNING ] || continue
+        case "$name" in
+          (*vllm-server*)
+            head=$(scontrol show hostnames "$nodes" 2>/dev/null | head -1)
+            hl="$CDIR/logs/vllm_server_${jid}_head.log"; wl="$CDIR/logs/vllm_server_${jid}.log"
+            model=$(grep -oE 'Model: +[^[:space:]]+' "$wl" 2>/dev/null | head -1 | awk '{print $NF}')
+            mode=$(grep -oE 'CUDAGraph Mode: +[^[:space:]]+' "$wl" 2>/dev/null | head -1 | awk '{print $NF}')
+            tag="${model:-?} [cg=${mode:-?}]"
+            if [ -f "$hl" ] && grep -qE 'Application startup complete|Uvicorn running on' "$hl" 2>/dev/null; then
+                code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://$head:${VPORT}/health" 2>/dev/null)
+                tp=$(grep -oE 'Avg generation throughput: [0-9.]+ tokens/s, Running: [0-9]+ reqs, Waiting: [0-9]+ reqs, GPU KV cache usage: [0-9.]+%' "$hl" 2>/dev/null | tail -1)
+                printf "           ${GRN}SERVING${RST}  %s  http://%s:%s (health %s)\n" "$tag" "$head" "$VPORT" "$code"
+                [ -n "$tp" ] && printf "             %s\n" "${tp#Avg }"
+            elif [ -f "$hl" ] && grep -qE 'illegal memory access|Traceback \(most recent call last\)|EngineDeadError|Engine core initialization failed|Fatal Python error' "$hl" 2>/dev/null; then
+                printf "           ${RED}ERROR${RST}  %s  (engine failed; tail logs/vllm_server_%s_head.log)\n" "$tag" "$jid"
+            elif [ -f "$hl" ] && grep -qE 'Capturing cudagraph|Capturing CUDA graph' "$hl" 2>/dev/null; then
+                printf "           ${YEL}CAPTURING${RST} cudagraphs  %s  (weights loaded)\n" "$tag"
+            elif [ -f "$hl" ]; then
+                shd=$(grep -oE 'Loading safetensors checkpoint shards: +[0-9]+% Completed \| [0-9]+/[0-9]+' "$hl" 2>/dev/null | tail -1)
+                if [ -n "$shd" ]; then
+                    nn=$(echo "$shd" | grep -oE '[0-9]+/[0-9]+' | head -1); pct=$(echo "$shd" | grep -oE '[0-9]+%' | head -1)
+                    printf "           ${YEL}LOADING${RST} weights %s (%s)  %s\n" "$nn" "$pct" "$tag"
+                else printf "           ${YEL}INIT${RST} / Ray bootstrap  %s\n" "$tag"; fi
+            else printf "           starting (no head log yet)  %s\n" "$tag"; fi
+            ;;
+          (*build-vllm*)
+            bl="$CDIR/build_vllm_${jid}.log"
+            if [ -f "$bl" ]; then
+                if grep -qE 'Build Complete!' "$bl" 2>/dev/null; then printf "           ${GRN}build COMPLETE${RST}\n"
+                else stp=$(grep -oE '\[[0-9]+/[0-9]+\]' "$bl" 2>/dev/null | tail -1); printf "           ${YEL}building${RST} %s\n" "${stp:-(deps/clone phase)}"; fi
+            fi
+            ;;
+        esac
+    done
     if [ "$pending_count" -gt 0 ]; then
         printf "\n  ${BLD}Estimated start (PENDING):${RST}\n"
         squeue --start -h -u "$USER" -o "  %.8i  %.20S  %R" 2>/dev/null || true
@@ -2433,7 +2546,7 @@ REMOTE_SCRIPT
     # (with line-buffered flushes so --watch feels instant); the __METRICS__
     # sentinel line is diverted into the sample file, prefixed with the local
     # timestamp. Single SSH round-trip, no stderr juggling.
-    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "$remote_script" \
+    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "CDIR='${REMOTE_CONTAINER_DIR}' VPORT='${REMOTE_PORT}'; $remote_script" \
         | awk -v f="$sample_file" -v ts="$local_ts" '
             /^__METRICS__\t/ {
                 sub(/^__METRICS__\t/, "")

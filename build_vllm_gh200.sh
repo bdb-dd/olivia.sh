@@ -96,6 +96,11 @@ apply_preset() {
     # NGC_PYTORCH_TAG after this function runs.
     PRESET_NGC_TAG=""
 
+    # Default: no preset-specific DeepGEMM ref (build falls back to 59f2c07). A
+    # preset can pin a newer commit (e.g. glm52 needs fp8_fp4_mqa_logits for
+    # GLM-5.2's DSA sparse-attention indexer). Resolved into DEEPGEMM_REF below.
+    PRESET_DEEPGEMM_REF=""
+
     case "${preset}" in
         glm51_v19|GLM51_V19|glm51|GLM51|glm-5.1|GLM-5.1)
             # MODEL_ID stays "glm51" so the container name is vllm-glm51-<index>-sandbox
@@ -151,6 +156,12 @@ apply_preset() {
             PRESET_VLLM_VERSION="main"
             PRESET_TRANSFORMERS=">=5.4.0"
             PRESET_VLLM_PATCHES="45895"
+            # GLM-5.2's DSA sparse-attention indexer calls fp8_fp4_mqa_logits at
+            # decode (sparse_attn_indexer.py); the default pin 59f2c07 (Sep 2025)
+            # predates it → "DeepGEMM backend not available or outdated" RuntimeError
+            # that kills the engine on the first request. 88965b0781 (2026-06-01)
+            # has it (FP4 Indexer landed 7f2a703e, 2026-04-17) and matches vLLM main.
+            PRESET_DEEPGEMM_REF="88965b0781"
             # vLLM main's csrc/libtorch_stable (cuda_view.cu) uses torch::stable
             # APIs (Tensor::layout(), newer from_blob) absent from NGC 26.03's
             # torch 2.11.0a0 alpha — the build fails at the CUDA compile. 26.05
@@ -255,6 +266,10 @@ VLLM_VERSION="${VLLM_VERSION:-${PRESET_VLLM_VERSION}}"
 NGC_PYTORCH_TAG="${NGC_PYTORCH_TAG:-${PRESET_NGC_TAG:-26.03-py3}}"
 NGC_IMAGE="${NGC_IMAGE:-docker://nvcr.io/nvidia/pytorch:${NGC_PYTORCH_TAG}}"
 
+# Resolve DeepGEMM ref: explicit env > preset pin > 59f2c07 default. Forwarded
+# into the Phase 3 build container below.
+DEEPGEMM_REF="${DEEPGEMM_REF:-${PRESET_DEEPGEMM_REF:-59f2c07}}"
+
 # Upstream vLLM PRs to graft onto the cloned source during Phase 3 (space-
 # separated PR numbers). Defaults to the preset's list; override with
 # VLLM_PATCHES="..." or disable with VLLM_PATCHES="".
@@ -295,6 +310,7 @@ echo "  Sandbox:        ${SANDBOX_NAME}"
 echo "  Sandbox path:   ${SANDBOX_PATH}"
 echo "  vLLM version:   ${VLLM_VERSION}"
 echo "  vLLM patches:   ${VLLM_PATCHES:-<none>}"
+echo "  DeepGEMM ref:   ${DEEPGEMM_REF}"
 echo "  NGC base:       ${NGC_IMAGE}"
 echo ""
 
@@ -445,11 +461,13 @@ fi
 export PRESET_TRANSFORMERS="${PRESET_TRANSFORMERS}"
 export VLLM_VERSION="${VLLM_VERSION}"
 export VLLM_PATCHES="${VLLM_PATCHES}"
+export DEEPGEMM_REF="${DEEPGEMM_REF}"
 
 singularity exec ${SING_OPTS} \
     --env "PRESET_TRANSFORMERS=${PRESET_TRANSFORMERS}" \
     --env "VLLM_VERSION=${VLLM_VERSION}" \
     --env "VLLM_PATCHES=${VLLM_PATCHES}" \
+    --env "DEEPGEMM_REF=${DEEPGEMM_REF}" \
     --bind "${PIP_CACHE}:/root/.cache/pip" \
     "${SANDBOX_PATH}" /bin/bash << 'BUILDSCRIPT'
 

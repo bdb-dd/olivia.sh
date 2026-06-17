@@ -48,6 +48,14 @@ show_presets() {
     echo "               Same multi-node PP wedge as glm51_v19 reproduced — kept for"
     echo "               diagnostic work only, not for routine use. Builds to index 2."
     echo ""
+    echo "  glm52      - GLM-5.2 (744B, 40B active) MoE+DSA, successor to GLM-5.1"
+    echo "               vLLM: main + PR#45895 (auto-grafted), transformers>=5.4.0"
+    echo "               FP8 ~755GB, 12 GPUs (3 nodes × 4× GH200, TP=4 + PP=3)"
+    echo "               NEW skip-topk DSA indexer (index_topk_freq/skip_topk_offset)"
+    echo "               needs PR#45895 — NOT in any release (incl. v0.23.0); the build"
+    echo "               git-applies it (VLLM_PATCHES=45895). Drop it once PR merges."
+    echo "               Same multi-node PP decode wedge as glm51; use proxy serialization."
+    echo ""
     echo "  glm47      - GLM-4.7 (358B) - Latest flagship model from THUDM"
     echo "               vLLM: main, transformers>=5.0.0rc0"
     echo "               Requires ~358GB VRAM (FP8) or ~716GB (BF16)"
@@ -77,6 +85,11 @@ show_presets() {
 # Apply preset configuration
 apply_preset() {
     local preset="$1"
+
+    # Default: no upstream PRs to graft. A preset sets PRESET_VLLM_PATCHES to a
+    # space-separated list of vLLM PR numbers it needs that aren't in a release
+    # yet (applied during build — see the VLLM_PATCHES step in Phase 3).
+    PRESET_VLLM_PATCHES=""
 
     case "${preset}" in
         glm51_v19|GLM51_V19|glm51|GLM51|glm-5.1|GLM-5.1)
@@ -111,6 +124,29 @@ apply_preset() {
             PRESET_VLLM_VERSION="v0.20.0"
             PRESET_TRANSFORMERS=">=5.4.0"
             PRESET_NOTES="GLM-5.1 on vLLM v0.20.0 + RayExecutorV2 — quarantined, same multi-node PP wedge as v0.19.0"
+            ;;
+        glm52|GLM52|glm-5.2|GLM-5.2)
+            # GLM-5.2 reuses GLM-5.1's GlmMoeDsaForCausalLM arch (shipped since
+            # ~v0.19.0), BUT adds a new periodic/skip-topk DSA indexer
+            # (index_topk_freq=4, index_skip_topk_offset=3) that GLM-5.1 lacks.
+            # That path is fixed by upstream PR#45895 ("Indexer init skip and MTP
+            # TopK share for iteration"), created 2026-06-17 and NOT yet merged —
+            # so it is in NO tagged release (v0.23.0 was cut two days before it).
+            #
+            # We graft PR#45895 onto vLLM main at build time via PRESET_VLLM_PATCHES
+            # below (the Phase 3 VLLM_PATCHES step git-applies it to the cloned
+            # source before compiling; it's pure Python, 9 files). The apply is
+            # idempotent — once PR#45895 merges into main, drop "45895" here (and
+            # the snapshot in patches/). A newer vLLM main may need
+            # NGC_PYTORCH_TAG=26.04-py3+.
+            #
+            # Quant is block-FP8 (zai-org / RedHatAI, [128,128], e4m3, dynamic) →
+            # DeepGEMM path on Hopper. Default model = RedHatAI/GLM-5.2-FP8.
+            MODEL_ID="glm52"
+            PRESET_VLLM_VERSION="main"
+            PRESET_TRANSFORMERS=">=5.4.0"
+            PRESET_VLLM_PATCHES="45895"
+            PRESET_NOTES="GLM-5.2 (744B MoE+DSA) FP8. Builds vLLM main + PR#45895 (skip-topk indexer, grafted via VLLM_PATCHES); not in any release. Multi-node PP wedge as glm51 — pair with proxy serialization."
             ;;
         glm47|GLM47|glm-4.7|GLM-4.7)
             MODEL_ID="glm47"
@@ -204,6 +240,11 @@ apply_preset "${MODEL_ID}"
 # Allow override of preset defaults
 VLLM_VERSION="${VLLM_VERSION:-${PRESET_VLLM_VERSION}}"
 
+# Upstream vLLM PRs to graft onto the cloned source during Phase 3 (space-
+# separated PR numbers). Defaults to the preset's list; override with
+# VLLM_PATCHES="..." or disable with VLLM_PATCHES="".
+VLLM_PATCHES="${VLLM_PATCHES-${PRESET_VLLM_PATCHES}}"
+
 # Build index (for multiple builds of same model type)
 BUILD_INDEX="${BUILD_INDEX:-1}"
 
@@ -238,6 +279,7 @@ echo "  Build index:    ${BUILD_INDEX}"
 echo "  Sandbox:        ${SANDBOX_NAME}"
 echo "  Sandbox path:   ${SANDBOX_PATH}"
 echo "  vLLM version:   ${VLLM_VERSION}"
+echo "  vLLM patches:   ${VLLM_PATCHES:-<none>}"
 echo "  NGC base:       ${NGC_IMAGE}"
 echo ""
 
@@ -387,10 +429,12 @@ fi
 # Export preset values for use inside container
 export PRESET_TRANSFORMERS="${PRESET_TRANSFORMERS}"
 export VLLM_VERSION="${VLLM_VERSION}"
+export VLLM_PATCHES="${VLLM_PATCHES}"
 
 singularity exec ${SING_OPTS} \
     --env "PRESET_TRANSFORMERS=${PRESET_TRANSFORMERS}" \
     --env "VLLM_VERSION=${VLLM_VERSION}" \
+    --env "VLLM_PATCHES=${VLLM_PATCHES}" \
     --bind "${PIP_CACHE}:/root/.cache/pip" \
     "${SANDBOX_PATH}" /bin/bash << 'BUILDSCRIPT'
 
@@ -529,6 +573,57 @@ if fp.exists():
 else:
     print(f"{fp} not found (OK, may be a newer vLLM layout)")
 PYPATCH_FXREPR
+
+# -----------------------------------------------------------------------------
+# Graft requested upstream vLLM PRs (patch-during-build)
+# -----------------------------------------------------------------------------
+# VLLM_PATCHES (space-separated PR numbers, passed via --env) lists upstream vLLM
+# PRs a preset needs that aren't in a release yet. Each PR's cumulative diff is
+# fetched from GitHub and git-applied to the cloned source HERE — before the
+# `pip install .` compile below — so the fix is baked into the container.
+# The glm52 preset uses this for PR#45895 (GLM-5.2's new skip-topk DSA indexer +
+# MTP final-norm recycle; pure Python). cwd is /opt/vllm.
+#
+# Idempotent: a reverse-apply check skips PRs already present (e.g. once the PR
+# merges into the pinned ref, or on a --force rebuild). A diff that no longer
+# applies fails the build loudly rather than compiling a half-patched tree.
+if [[ -n "${VLLM_PATCHES:-}" ]]; then
+    echo ""
+    echo "Grafting upstream vLLM PR(s): ${VLLM_PATCHES}"
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "ERROR: curl not found in container; cannot fetch PR diffs."
+        exit 1
+    fi
+    for PR in ${VLLM_PATCHES}; do
+        DIFF="/tmp/vllm-pr-${PR}.diff"
+        echo "  PR #${PR}: fetching diff from GitHub..."
+        if ! curl -fsSL "https://github.com/vllm-project/vllm/pull/${PR}.diff" -o "${DIFF}"; then
+            echo "  ERROR: failed to download PR #${PR} diff."
+            exit 1
+        fi
+        if ! grep -q '^diff --git ' "${DIFF}"; then
+            echo "  ERROR: PR #${PR} download is not a valid diff ($(wc -c < "${DIFF}") bytes)."
+            exit 1
+        fi
+        N_FILES=$(grep -c '^diff --git ' "${DIFF}")
+        if git apply --reverse --check "${DIFF}" 2>/dev/null; then
+            echo "  PR #${PR}: already present (merged or re-run) — skipping (${N_FILES} files)"
+        elif git apply --check "${DIFF}" 2>/dev/null; then
+            git apply "${DIFF}"
+            echo "  PR #${PR}: applied cleanly (${N_FILES} files)"
+        else
+            echo ""
+            echo "  ERROR: PR #${PR} does not apply cleanly to vLLM ${VLLM_VERSION}."
+            echo "         Upstream main likely drifted, or the PR was updated/merged"
+            echo "         with changes. Writing .rej files under /opt/vllm for inspection..."
+            git apply --reject "${DIFF}" || true
+            echo "         Inspect: https://github.com/vllm-project/vllm/pull/${PR}"
+            echo "         If the PR has merged into main, rebuild with VLLM_PATCHES=\"\"."
+            exit 1
+        fi
+    done
+    echo ""
+fi
 
 # Get current NGC PyTorch version for constraints
 NGC_TORCH_VERSION=$(python3 -c "import torch; print(torch.__version__)")

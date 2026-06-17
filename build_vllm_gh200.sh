@@ -690,6 +690,8 @@ pip install --no-cache-dir \
     sentencepiece \
     fastapi \
     uvicorn[standard] \
+    uvloop \
+    loguru \
     pydantic>=2.0 \
     prometheus-client \
     prometheus-fastapi-instrumentator>=7.0.0 \
@@ -709,7 +711,6 @@ pip install --no-cache-dir \
     pyyaml \
     pillow \
     blake3 \
-    compressed-tensors>=0.8.0 \
     depyf \
     cloudpickle \
     partial-json-parser \
@@ -737,8 +738,29 @@ pip install --no-cache-dir \
     lark==1.2.2 \
     2>&1 | tail -30 || true
 
-# Try to install xgrammar (vLLM constraint grammar feature)
-pip install --no-cache-dir --root-user-action=ignore xgrammar 2>&1 | tail -5 || echo "xgrammar not available, continuing..."
+# compressed-tensors and xgrammar are torch-dependent, so they live OUTSIDE the
+# bulk install above. On newer NGC bases (e.g. 26.05's torch 2.12.0a0 pre-
+# release) pip's resolver can't match their torch>=2.10 / torch<2.11 metadata
+# against the pinned pre-release version, which fails the ENTIRE resolve — if
+# they were in the bulk list that would silently take fastapi/uvloop/etc. down
+# with them (exactly the glm52-on-26.05 failure). Install with deps first (works
+# on 26.03, preserving glm51/kimi), then fall back to --no-deps. Their non-torch
+# deps are supplied explicitly: loguru (compressed-tensors) is in the bulk list;
+# apache-tvm-ffi (xgrammar's tvm_ffi backend) is installed just below.
+echo ""
+echo "Installing compressed-tensors..."
+pip install --no-cache-dir --root-user-action=ignore --constraint /tmp/constraints.txt "compressed-tensors>=0.8.0" 2>&1 | tail -5 \
+    || pip install --no-cache-dir --root-user-action=ignore --no-deps "compressed-tensors>=0.8.0" 2>&1 | tail -5 \
+    || echo "compressed-tensors not available, continuing..."
+
+echo ""
+echo "Installing xgrammar (+ apache-tvm-ffi backend)..."
+pip install --no-cache-dir --root-user-action=ignore --constraint /tmp/constraints.txt xgrammar 2>&1 | tail -5 \
+    || pip install --no-cache-dir --root-user-action=ignore --no-deps xgrammar 2>&1 | tail -5 \
+    || echo "xgrammar not available, continuing..."
+# tvm_ffi backend for xgrammar (no torch dep → installs cleanly with deps).
+# Needed when xgrammar went in via --no-deps; a harmless no-op otherwise.
+pip install --no-cache-dir --root-user-action=ignore apache-tvm-ffi 2>&1 | tail -3 || echo "apache-tvm-ffi not available, continuing..."
 
 # Install flashinfer (use --no-deps to avoid pulling torch)
 echo ""
@@ -937,6 +959,21 @@ else:
 # Check vLLM
 import vllm
 print(f"\nvLLM: {vllm.__version__}")
+
+# Check the OpenAI serving stack. `import vllm` succeeding is NOT enough — the
+# api_server pulls runtime deps (uvloop, fastapi, compressed_tensors, xgrammar)
+# that --no-deps / a poisoned resolver can silently drop, yielding a container
+# that builds but can't `vllm serve`. Fail the build loudly instead of shipping
+# that (this is exactly how the glm52-on-26.05 dep break slipped through once).
+try:
+    import vllm.entrypoints.openai.api_server  # noqa: F401  (pulls uvloop+fastapi)
+    import compressed_tensors  # noqa: F401
+    import xgrammar  # noqa: F401
+    print("Serving stack (api_server + compressed_tensors + xgrammar): ✓")
+except Exception as e:
+    print(f"\n✗ FATAL: serving-stack import failed: {e!r}")
+    print("  Container builds but cannot serve — check the dependency-install phase.")
+    sys.exit(1)
 
 # Check if CUDA graphs work (this is the key test)
 try:

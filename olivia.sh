@@ -1007,7 +1007,7 @@ start_server_job() {
                        MTP_SPECULATIVE_TOKENS ENABLE_SPECULATIVE \
                        MAX_MODEL_LEN GPU_MEM_UTIL RAY_CGRAPH_GET_TIMEOUT \
                        VLLM_USE_RAY_V2_EXECUTOR_BACKEND \
-                       VLLM_PP_LAYER_PARTITION; do
+                       VLLM_PP_LAYER_PARTITION EXTRA_VLLM_ARGS; do
         if [[ -n "${!forward_var:-}" ]]; then
             env_vars+=" ${forward_var}=${!forward_var}"
         fi

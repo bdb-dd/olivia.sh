@@ -373,12 +373,14 @@ if [[ "${IS_GLM52}" == "1" && "${IS_AWQ}" == "0" ]]; then
     #   FLASHMLA_SPARSE: [kv_cache_dtype not supported]
     # Override KV_CACHE_DTYPE explicitly only if you know your backend supports it.
     : # (no fp8 KV default for glm52 on GH200)
-    # GLM-5.2 runs on vLLM main, where RayExecutorV2 + our external multi-node Ray
-    # bootstrap fails at engine-core init (ActorHandleNotFoundError across Ray
-    # sessions). The legacy RayDistributedExecutor avoids it. Default to legacy
-    # unless the user pinned VLLM_USE_RAY_V2_EXECUTOR_BACKEND explicitly.
+    # GLM-5.2 multi-node uses RayExecutorV2 (no Ray Compiled Graph). The legacy
+    # executor's Compiled Graph wedges decode at 0 tok/s here; V2 decodes cleanly.
+    # V2 with our external Ray bootstrap only works in engine-as-Ray-actor mode
+    # (--data-parallel-backend=ray), wired in the multi-node launch below — a
+    # plain subprocess EngineCore + V2 fails init (ActorHandleNotFoundError).
+    # Default to V2 unless the user pinned VLLM_USE_RAY_V2_EXECUTOR_BACKEND.
     if [[ "${_RAYV2_EXPLICIT}" == "0" ]]; then
-        VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0
+        VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1
     fi
     # Custom PP layer partition (PP=3 only). GLM-5.2's DSA skip-topk layer at a
     # pipeline-stage boundary trips `KeyError: model.layers.<N>.self_attn.attn`
@@ -829,6 +831,14 @@ if [[ -n "${LORA_MODULES:-}" ]]; then
     VLLM_ARGS+=("--enable-lora" "--lora-modules" "${LORA_MODULES}")
 fi
 
+# Optional: extra raw vLLM args (space-separated), appended verbatim. An escape
+# hatch for experiments without editing this script — e.g.
+# EXTRA_VLLM_ARGS="--data-parallel-backend ray" to run the engine as a Ray actor.
+if [[ -n "${EXTRA_VLLM_ARGS:-}" ]]; then
+    # word-split intentionally so "--flag value" becomes two args
+    VLLM_ARGS+=(${EXTRA_VLLM_ARGS})
+fi
+
 # IMPORTANT: Do NOT use --enforce-eager (this disables CUDA graphs!)
 # If you get errors, check that NGC PyTorch is intact
 
@@ -1248,6 +1258,34 @@ else
     echo "[$(date '+%H:%M:%S')] Launching vLLM on ${HEAD_NODE} with TP=${TP_SIZE} PP=${PP_SIZE}..."
     echo ""
     VLLM_ARGS+=("--distributed-executor-backend" "ray")
+
+    # Engine-as-Ray-actor mode. CoreEngineActorManager runs the EngineCore as a
+    # Ray actor in the cluster's single Ray job — avoiding the subprocess
+    # EngineCore's second ray.init() (ActorHandleNotFoundError) AND using
+    # RayExecutorV2 (no Ray Compiled Graph → no multi-node PP decode wedge). This
+    # is what makes GLM-5.2 multi-node actually decode tokens (verified: it
+    # answers, vs. the legacy executor wedging at 0 tok/s), so it is AUTO-ON for
+    # GLM-5.2 (also triggerable via EXTRA_VLLM_ARGS="--data-parallel-backend ray").
+    # HEAD_NODE_IP is known here.
+    if [[ "${IS_GLM52}" == "1" || "${EXTRA_VLLM_ARGS:-}" == *"data-parallel-backend"* ]]; then
+        # Add the backend flag unless the user already supplied it via EXTRA_VLLM_ARGS.
+        if [[ "${EXTRA_VLLM_ARGS:-}" != *"data-parallel-backend"* ]]; then
+            VLLM_ARGS+=("--data-parallel-backend" "ray")
+        fi
+        VLLM_ARGS+=("--data-parallel-address" "${HEAD_NODE_IP}")
+        # ParallelConfig.__post_init__ OVERRIDES --data-parallel-address with the
+        # env VLLM_DP_MASTER_IP (default 127.0.0.1) in the DP=1 path we hit, so
+        # create_dp_placement_groups asserts node:127.0.0.1 is missing. The env
+        # is the actual lever — forward it (into the vLLM srun via SING_CMD).
+        SING_CMD+=(--env "VLLM_DP_MASTER_IP=${HEAD_NODE_IP}")
+        # Our single DP rank's workers (world_size = TP*PP = 12) span 3 nodes.
+        # Default pack strategy "strict" computes dp_size_available =
+        # gpus_per_node // world_size = 4 // 12 = 0 ("not enough resources").
+        # "span" collects the rank's bundles ACROSS nodes (dp_size_available=1) —
+        # exactly a multi-node TP*PP engine.
+        SING_CMD+=(--env "VLLM_RAY_DP_PACK_STRATEGY=span")
+        echo "[$(date '+%H:%M:%S')] engine-as-actor: DP master=${HEAD_NODE_IP}, pack=span"
+    fi
 
     # Force vLLM's host-IP detection to use the Slingshot IP we bootstrapped
     # Ray with. Without this, vLLM's placement group spec pins bundle 0 to

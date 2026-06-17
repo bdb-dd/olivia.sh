@@ -231,6 +231,10 @@ VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-}"
 # These help with AWQ-quantized MoE models on Hopper GPUs.
 # Note: GLM-4.7-AWQ uses FLASHINFER_MOE_FP8=1; GLM-5.1-AWQ uses FLASHINFER_MOE_FP16=1
 # instead. We adjust these below after detecting GLM-5.1.
+# VLLM_USE_DEEP_GEMM's default is model-aware (GLM-5.2 block-FP8 wants it on),
+# resolved after model detection below. Record whether the user pinned it first
+# so an explicit VLLM_USE_DEEP_GEMM=0 is never silently overridden.
+if [[ -n "${VLLM_USE_DEEP_GEMM+x}" ]]; then VLLM_USE_DEEP_GEMM_EXPLICIT=1; else VLLM_USE_DEEP_GEMM_EXPLICIT=0; fi
 export VLLM_USE_DEEP_GEMM="${VLLM_USE_DEEP_GEMM:-0}"
 export VLLM_USE_FLASHINFER_MOE_FP8="${VLLM_USE_FLASHINFER_MOE_FP8:-1}"
 export VLLM_USE_FLASHINFER_MOE_FP16="${VLLM_USE_FLASHINFER_MOE_FP16:-0}"
@@ -249,9 +253,25 @@ if [[ "${MODEL}" == *"GLM-5.1"* ]] || [[ "${MODEL}" == *"glm-5.1"* ]]; then
     IS_GLM51=1
 fi
 
+# Detect GLM-5.2 model (same GlmMoeDsaForCausalLM arch as 5.1, plus a new
+# skip-topk DSA indexer — needs vLLM main + PR#45895). Default quant is block-FP8.
+IS_GLM52=0
+if [[ "${MODEL}" == *"GLM-5.2"* ]] || [[ "${MODEL}" == *"glm-5.2"* ]]; then
+    IS_GLM52=1
+fi
+
+# GLM-5.x family: everything 5.1 and 5.2 share — sparse-MLA attention backend,
+# --trust-remote-code, and the generous 128K default context. (5.1-only and
+# 5.2-only specifics, e.g. the cyankiwi chat-template fix or the FP8 DeepGEMM
+# path, stay keyed on IS_GLM51 / IS_GLM52 individually.)
+IS_GLM5=0
+if [[ "${IS_GLM51}" == "1" || "${IS_GLM52}" == "1" ]]; then
+    IS_GLM5=1
+fi
+
 # Any GLM MoE model that uses the glm47/glm45 parser family
 IS_GLM_MOE=0
-if [[ "${IS_GLM47}" == "1" || "${IS_GLM51}" == "1" ]]; then
+if [[ "${IS_GLM47}" == "1" || "${IS_GLM5}" == "1" ]]; then
     IS_GLM_MOE=1
 fi
 
@@ -272,7 +292,11 @@ fi
 # matches typical Claude Code usage (which requests max_tokens=32000).
 # Other models keep the conservative 32K default.
 if [[ -z "${MAX_MODEL_LEN+x}" ]]; then
-    if [[ "${IS_GLM51}" == "1" ]]; then
+    if [[ "${IS_GLM5}" == "1" ]]; then
+        # 5.1 (205K native) and 5.2 (1M native) both ship far larger windows,
+        # but 128K is the safe default within our KV budget. On glm52's 3-node
+        # FP8 (~18 GB/GPU KV), 128K holds a few concurrent sequences; raise it
+        # with --kv-cache-dtype fp8 (see KV_CACHE_DTYPE below) or fewer seqs.
         MAX_MODEL_LEN=131072
     else
         MAX_MODEL_LEN=32768
@@ -318,6 +342,20 @@ if [[ "${IS_GLM51}" == "1" && "${IS_AWQ}" == "1" ]]; then
     export VLLM_USE_FLASHINFER_MOE_FP16=1
 fi
 
+# GLM-5.2 FP8: block-wise FP8 ([128,128], e4m3) is the DeepSeek-style quant, so
+# it runs through DeepGEMM on Hopper rather than the AWQ flashinfer-MoE path.
+# Enable DeepGEMM and keep the FP8 (not FP16) MoE kernel. DeepGEMM JIT warmup
+# adds a long startup phase; PR#45895's test plan skips it with
+# VLLM_DEEP_GEMM_WARMUP=skip — we default to that (override to "" to warm up).
+# fp8 KV cache roughly doubles the context/concurrency we can fit at FP8.
+if [[ "${IS_GLM52}" == "1" && "${IS_AWQ}" == "0" ]]; then
+    if [[ "${VLLM_USE_DEEP_GEMM_EXPLICIT}" == "0" ]]; then
+        export VLLM_USE_DEEP_GEMM=1
+    fi
+    export VLLM_DEEP_GEMM_WARMUP="${VLLM_DEEP_GEMM_WARMUP:-skip}"
+    KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
+fi
+
 # Resolve attention backend default. FLASH_ATTN is the right choice for
 # everything except MLA models. GLM-5.1's GlmMoeDsaForCausalLM uses DeepSeek
 # *sparse* MLA (DSA): FLASH_ATTN rejects it (`['MLA not supported']`) AND
@@ -327,8 +365,8 @@ fi
 # from whatever is installed — if nothing works, the error will tell us what
 # to install.
 if [[ -z "${VLLM_ATTENTION_BACKEND}" ]]; then
-    if [[ "${IS_GLM51}" == "1" ]]; then
-        VLLM_ATTENTION_BACKEND=""   # auto-select
+    if [[ "${IS_GLM5}" == "1" ]]; then
+        VLLM_ATTENTION_BACKEND=""   # auto-select (sparse MLA; 5.1 and 5.2 alike)
     else
         VLLM_ATTENTION_BACKEND="FLASH_ATTN"
     fi
@@ -404,7 +442,9 @@ fi
 
 if [[ "${IS_GLM_MOE}" == "1" ]]; then
     echo ""
-    if [[ "${IS_GLM51}" == "1" ]]; then
+    if [[ "${IS_GLM52}" == "1" ]]; then
+        echo "GLM-5.2 Settings:"
+    elif [[ "${IS_GLM51}" == "1" ]]; then
         echo "GLM-5.1 Settings:"
     else
         echo "GLM-4.7 Settings:"
@@ -415,6 +455,9 @@ if [[ "${IS_GLM_MOE}" == "1" ]]; then
     if [[ "${IS_AWQ}" == "1" ]]; then
         echo "  Quantization:     AWQ (Hopper-compatible)"
         echo "  Expert Parallel:  ${USE_EXPERT_PARALLEL}"
+    elif [[ "${IS_GLM52}" == "1" ]]; then
+        echo "  Quantization:     block-FP8 (DeepGEMM=${VLLM_USE_DEEP_GEMM}, warmup=${VLLM_DEEP_GEMM_WARMUP:-<default>})"
+        echo "  KV cache dtype:   ${KV_CACHE_DTYPE:-<default>}"
     fi
 fi
 
@@ -696,9 +739,15 @@ if [[ "${IS_GLM_MOE}" == "1" ]]; then
     if [[ -n "${SERVED_MODEL_NAME}" ]]; then
         VLLM_ARGS+=("--served-model-name" "${SERVED_MODEL_NAME}")
     fi
-    # GLM-5.1 requires trust-remote-code for its custom attention config
-    if [[ "${IS_GLM51}" == "1" ]]; then
+    # GLM-5.1 / GLM-5.2 (GlmMoeDsaForCausalLM) require trust-remote-code for
+    # their custom attention/indexer config.
+    if [[ "${IS_GLM5}" == "1" ]]; then
         VLLM_ARGS+=("--trust-remote-code")
+    fi
+    # Chat-template override is GLM-5.1-only: it fixes a bug in the *cyankiwi*
+    # AWQ fork's template. The GLM-5.2 FP8 repos (zai-org / RedHatAI) ship the
+    # correct base template, so no override there.
+    if [[ "${IS_GLM51}" == "1" ]]; then
         # Override the shipped chat template. cyankiwi/GLM-5.1-AWQ-4bit's
         # chat_template.jinja has a bug in the role:tool handler — the
         # else-branch expects content items with a .name field (Anthropic's
@@ -731,6 +780,12 @@ fi
 # Optional: Quantization
 if [[ -n "${QUANTIZATION:-}" ]]; then
     VLLM_ARGS+=("--quantization" "${QUANTIZATION}")
+fi
+
+# Optional: KV cache dtype (defaults to fp8_e4m3 for GLM-5.2 FP8 to extend the
+# context/concurrency we can fit; unset elsewhere → vLLM uses the model dtype).
+if [[ -n "${KV_CACHE_DTYPE:-}" ]]; then
+    VLLM_ARGS+=("--kv-cache-dtype" "${KV_CACHE_DTYPE}")
 fi
 
 # Optional: LoRA
@@ -934,6 +989,13 @@ SING_CMD=(
     # files we deploy alongside run_vllm_server.sh).
     --bind "${CONTAINER_DIR}:${CONTAINER_DIR}"
 )
+
+# GLM-5.2 block-FP8 sets VLLM_DEEP_GEMM_WARMUP=skip to avoid the multi-minute
+# DeepGEMM JIT warmup at startup. Only forward it when set so other models keep
+# vLLM's default warmup behaviour (empty value would read as "disabled").
+if [[ -n "${VLLM_DEEP_GEMM_WARMUP:-}" ]]; then
+    SING_CMD+=(--env "VLLM_DEEP_GEMM_WARMUP=${VLLM_DEEP_GEMM_WARMUP}")
+fi
 
 if [[ "${NUM_NODES}" -le 1 ]]; then
     # -------------------------------------------------------------------------

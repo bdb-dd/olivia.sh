@@ -126,12 +126,13 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 |--------|---------------|------|-------|
 | `glm51_v19` (alias `glm51`) | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | TP=4 + PP=2, vLLM v0.19.0, container index 1. Pair with `anthropic_proxy.py` serialization to work around multi-node PP decode wedge. |
 | `glm51_v20` | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | Same as glm51_v19 but on vLLM v0.20.0 + RayExecutorV2, container index 2. **Quarantined** — same wedge as v0.19.0; kept for diagnostic work only. |
+| `glm52` | `RedHatAI/GLM-5.2-FP8` | 12 (3 nodes × 4) | TP=4 + PP=3. Block-FP8 (~755 GB) — does **not** fit 8 GPUs, hence 3 nodes. **Needs vLLM main + PR#45895** (new skip-topk DSA indexer); not in any release. Same multi-node PP wedge as glm51 → proxy serialization. fp8 KV cache + DeepGEMM (`VLLM_DEEP_GEMM_WARMUP=skip`). |
 | `glm47` | `QuantTrio/GLM-4.7-AWQ` | 4 | TP=4, MTP speculative |
 | `devstral` | `mistralai/Devstral-2-123B-Instruct-2512` | 4 | TP=4 |
 | `llama` | `meta-llama/Llama-3.3-70B-Instruct` | 4 | TP=4 |
 | `qwen` | `Qwen/Qwen2.5-72B-Instruct` | 4 | TP=4 |
 
-**Per-preset GPU allocation:** `olivia.sh server start` reads resources from `get_preset_resources()` in `olivia.sh` and passes corresponding `--nodes`, `--gpus-per-node`, `--cpus-per-task` overrides to `sbatch`. The `glm51` preset is the only one today that crosses a node boundary (2 nodes × 4 GPUs); everything else runs single-node 4 GPUs.
+**Per-preset GPU allocation:** `olivia.sh server start` reads resources from `get_preset_resources()` in `olivia.sh` and passes corresponding `--nodes`, `--gpus-per-node`, `--cpus-per-task` overrides to `sbatch`. `glm51` (2 nodes × 4) and `glm52` (3 nodes × 4) cross node boundaries; everything else runs single-node 4 GPUs. The `cluster` snapshot reports start-time/feasibility for 1-, 2-, and 3-node × 4-GPU shapes.
 
 #### Prefetch Module
 ```bash
@@ -239,6 +240,7 @@ The build script includes predefined configurations for common models. Run witho
 |--------|-------------|------|--------------|
 | `glm51_v19` (alias `glm51`) | GLM-5.1 (744B / 40B active) MoE+DSA flagship, recipe-default | v0.19.0 | >=5.4.0 |
 | `glm51_v20` | GLM-5.1 on RayExecutorV2 — **quarantined**, same multi-node PP wedge as v0.19.0 | v0.20.0 | >=5.4.0 |
+| `glm52` | GLM-5.2 (744B / 40B active) MoE+DSA, successor to 5.1 — FP8. Builds vLLM main + auto-grafts PR#45895 (`VLLM_PATCHES`); not in any release | main + PR#45895 | >=5.4.0 |
 | `glm47` | GLM-4.7 (358B) flagship model | main | >=5.0.0rc0 |
 | `devstral` | Devstral/Mistral models | main | >=4.45.0 |
 | `llama` | Llama 3.x models | main | >=4.45.0 |
@@ -433,6 +435,49 @@ CONTAINER=vllm-glm51-1-sandbox MODEL=cyankiwi/GLM-5.1-AWQ-4bit \
 ```
 
 The Ray cluster is bootstrapped at job start via `srun`, torn down on exit via a trap. vLLM discovers GPUs across both nodes through Ray and assigns the pipeline stages accordingly.
+
+### GLM-5.2 (preset `glm52`) — FP8, 3-node, bleeding edge
+
+GLM-5.2 is the successor to GLM-5.1: same `GlmMoeDsaForCausalLM` MoE+DSA architecture and 744B / ~40B-active scale, but with a **1M-token native context** and a **new periodic / skip-topk DSA indexer** (`index_topk_freq=4`, `index_skip_topk_offset=3`, `index_topk_pattern`) that GLM-5.1 does not have.
+
+**Upstream status (as of 2026-06-17): not in any vLLM release.** The skip-topk indexer path is implemented by upstream **PR#45895** ("Indexer init skip and MTP TopK share for iteration"), created 2026-06-17 and still unmerged. v0.23.0 was tagged two days before it. The build preset pins `VLLM_VERSION=main` and **grafts PR#45895 at build time** via the `VLLM_PATCHES` mechanism (`PRESET_VLLM_PATCHES="45895"`), so `./olivia.sh build glm52` is **not blocked on the merge** — see "Patch-during-build" below. A newer vLLM main may also require `NGC_PYTORCH_TAG=26.04-py3` or later. Our multi-node PP decode wedge workaround (proxy serialization) is **not** superseded — the upstream wedge issues (#26318, #30044, #24689) all went stale/closed-unfixed.
+
+**Patch-during-build (`VLLM_PATCHES`):** `build_vllm_gh200.sh` takes a space-separated list of vLLM PR numbers (`VLLM_PATCHES`, defaulting to the preset's `PRESET_VLLM_PATCHES`). In Phase 3, after cloning vLLM and before the `pip install .` compile, it fetches each PR's cumulative diff from `github.com/vllm-project/vllm/pull/<N>.diff` and `git apply`s it to `/opt/vllm` (the build container has GitHub egress — it already clones vLLM there). The step is **idempotent** (a reverse-apply check skips PRs already present — e.g. once one merges into main) and **fails the build loudly** if a diff no longer applies cleanly (rather than compiling a half-patched tree). PR#45895 is pure Python (9 files), so no kernel recompile is triggered. Validated 2026-06-17: the diff applies cleanly to main `68ff30d`. A reviewable snapshot lives at `patches/vllm-pr45895-glm52-indexer.diff` (the build fetches the **live** PR; the snapshot is for offline/manual use). **When PR#45895 merges:** drop `"45895"` from `PRESET_VLLM_PATCHES` (the idempotent apply tolerates it in the meantime), or build with `VLLM_PATCHES=""`.
+
+**Why 3 nodes (not 2 like glm51):** the only quant available today is block-FP8 (`zai-org/GLM-5.2-FP8`, or the byte-identical re-host `RedHatAI/GLM-5.2-FP8`), ~755 GB. At ~94 GB/GPU that does **not** fit 8×GH200 (96 GB cards). Spreading across **3 nodes × 4 GPUs (TP=4 + PP=3 = 12 GPUs)** drops weights to ~63 GB/GPU, leaving ~18 GB/GPU for KV. When a `GLM-5.2-AWQ-4bit` (~430 GB) is eventually published, the 8-GPU / 2-node path returns and is preferred — repoint the preset model and set `nodes=2 pp=2`.
+
+| Quantization | Model | Size | Olivia fit |
+|--------------|-------|------|------------|
+| block-FP8 (e4m3, [128,128]) | `zai-org/GLM-5.2-FP8` / `RedHatAI/GLM-5.2-FP8` | ~755 GB | **3 nodes × 4 GH200** (TP=4 + PP=3); 8 GPUs won't fit |
+| AWQ-4bit | — | ~430 GB | Does **not exist yet** (would be the preferred 2-node / 8-GPU path) |
+| NVFP4 | `Lorbus/GLM-5.2-NVFP4` etc. | — | **No** — needs Blackwell FP4 tensor cores |
+| BF16 | `zai-org/GLM-5.2` | ~1.5 TB | No — 16+ GPUs |
+
+**Runtime specifics auto-applied by `run_vllm_server.sh` when `MODEL` contains `GLM-5.2`** (`IS_GLM52`): `--trust-remote-code`, glm47 tool parser + glm45 reasoning parser, auto tool choice, sparse-MLA attention backend (auto-select), `MAX_MODEL_LEN=131072` default, **block-FP8 path** — `VLLM_USE_DEEP_GEMM=1`, `VLLM_DEEP_GEMM_WARMUP=skip` (avoids the multi-minute DeepGEMM JIT warmup; override with `VLLM_DEEP_GEMM_WARMUP=""`), and `--kv-cache-dtype fp8_e4m3` (roughly doubles fittable context/concurrency). MTP speculative decoding is auto-disabled because `PP_SIZE>1` (the existing PP+MTP guard). The cyankiwi chat-template override is **5.1-only** and is skipped for 5.2 (the FP8 repos ship a correct base template). PR#45895's validated flag set is the source of these defaults.
+
+**Weights storage:** prefetched to the at-risk-but-spacious work cache, not the quota-bound project area — the 703.7 GiB FP8 does not fit the ~462 GiB free on `/cluster/projects/nn10104k` (1 TiB quota). Override `HF_HOME` to `/cluster/work/projects/nn10104k/huggingface` for both prefetch and serving (see [[project_hf_storage_split]]):
+```bash
+HF_HOME=/cluster/work/projects/nn10104k/huggingface ./olivia.sh prefetch RedHatAI/GLM-5.2-FP8
+```
+
+### GLM-5.2 Usage
+
+```bash
+# 1. Prefetch FP8 weights to the work cache (HF_HOME override; detached, resumable)
+HF_HOME=/cluster/work/projects/nn10104k/huggingface ./olivia.sh prefetch RedHatAI/GLM-5.2-FP8
+
+# 2. Build the container. The glm52 preset builds vLLM main and auto-grafts
+#    PR#45895 (VLLM_PATCHES=45895) for GLM-5.2's skip-topk indexer — no need to
+#    wait for the upstream merge. Disable the graft with VLLM_PATCHES="" if the
+#    PR has since merged into main.
+./olivia.sh build glm52
+
+# 3. Start the server (preset auto-allocates 3 nodes × 4 GPUs, TP=4 + PP=3)
+HF_HOME=/cluster/work/projects/nn10104k/huggingface ./olivia.sh server start glm52
+
+# Check whether a 3-node shape can schedule right now
+./olivia.sh cluster
+```
 
 ### Batching Proxy for SSH Tunnels
 

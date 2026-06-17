@@ -577,7 +577,7 @@ cmd_build() {
                 info "To build a new container:"
                 echo "    ./olivia.sh build <preset>" >&2
                 echo "" >&2
-                echo "Available presets: glm51_v19 (alias: glm51), glm51_v20, glm47, devstral, llama, qwen, generic" >&2
+                echo "Available presets: glm51_v19 (alias: glm51), glm51_v20, glm52, glm47, devstral, llama, qwen, generic" >&2
                 exit 0
                 ;;
             --presets|-p)
@@ -592,6 +592,11 @@ cmd_build() {
                 echo "  glm51_v20  GLM-5.1 on vLLM v0.20.0 + RayExecutorV2 (QUARANTINED)"
                 echo "             vLLM: v0.20.0, transformers>=5.4.0, container index 2"
                 echo "             Same wedge as glm51_v19; kept for diagnostics only."
+                echo ""
+                echo "  glm52      GLM-5.2 (744B/40B) FP8 — bleeding edge"
+                echo "             vLLM: main + PR#45895 (skip-topk indexer); NO release yet"
+                echo "             FP8 ~755GB, 12 GPUs (3×4-GPU nodes, TP=4 + PP=3)"
+                echo "             RedHatAI/GLM-5.2-FP8 (== zai-org). Same PP wedge as glm51."
                 echo ""
                 echo "  glm47      GLM-4.7 (358B) flagship model"
                 echo "             vLLM: main, transformers>=5.0.0rc0"
@@ -815,6 +820,7 @@ normalize_preset() {
     case "$p" in
         glm51|glm-5.1|glm5.1|glm51_v19) echo "glm51_v19" ;;
         glm51_v20)                      echo "glm51_v20" ;;
+        glm52|glm-5.2|glm5.2)           echo "glm52" ;;
         glm47|glm-4.7)                  echo "glm47" ;;
         devstral|mistral)               echo "devstral" ;;
         llama|llama3)                   echo "llama" ;;
@@ -853,6 +859,17 @@ preset_field() {
             prefix="glm51"; index="2"
             model="cyankiwi/GLM-5.1-AWQ-4bit"
             nodes="2"; gpus="4"; pp="2"
+            ;;
+        glm52)
+            # GLM-5.2 (744B MoE+DSA, successor to 5.1). No AWQ-4bit quant exists
+            # yet, so the runnable quant today is block-FP8 (~755 GB). At
+            # ~94 GB/GPU it does NOT fit 8×GH200, so glm52 spans 3 nodes:
+            # TP=4 intra-node (NVLink) + PP=3 cross-node (Slingshot) = 12 GPUs.
+            # Default model is the RedHatAI re-host (byte-identical to the
+            # official zai-org/GLM-5.2-FP8). Swap to an AWQ-4bit repo + 2-node
+            # PP=2 once one is published (mirrors glm51).
+            model="RedHatAI/GLM-5.2-FP8"
+            nodes="3"; gpus="4"; pp="3"
             ;;
         glm47)
             model="QuantTrio/GLM-4.7-AWQ"
@@ -1710,6 +1727,7 @@ Actions:
 
 Presets (with default models):
     glm51               GLM-5.1-AWQ (cyankiwi/GLM-5.1-AWQ-4bit) — 2 nodes × 4 GPUs, TP=4 + PP=2
+    glm52               GLM-5.2-FP8 (RedHatAI/GLM-5.2-FP8) — 3 nodes × 4 GPUs, TP=4 + PP=3 (needs vLLM main + PR#45895)
     glm47               GLM-4.7-AWQ (QuantTrio/GLM-4.7-AWQ)
     devstral            Devstral 123B (mistralai/Devstral-2-123B-Instruct-2512)
     llama               Llama 3.3 70B (meta-llama/Llama-3.3-70B-Instruct)
@@ -2203,11 +2221,17 @@ for k in 4 3 2 1; do
     printf "    %s  %b%s%b%s %3d\n" "$label" "$color" "$bar" "$RST" "$pad" "$c"
 done
 [ "$any_free" -eq 0 ] && printf "    (no free slots on schedulable nodes)\n"
-# Multi-node feasibility callout: PP=2 shape (glm51) needs 2 full nodes.
+# Multi-node feasibility callouts: glm51 (PP=2) needs 2 full nodes; glm52
+# (PP=3) needs 3 full nodes.
 if [ "$full4" -ge 2 ]; then
-    printf "    ${GRN}→${RST} 2-node × 4-GPU shape can start now (%d full nodes available)\n" "$full4"
+    printf "    ${GRN}→${RST} 2-node × 4-GPU shape (glm51) can start now (%d full nodes available)\n" "$full4"
 else
-    printf "    ${YEL}→${RST} 2-node × 4-GPU shape cannot start now (%d/2 full nodes available)\n" "$full4"
+    printf "    ${YEL}→${RST} 2-node × 4-GPU shape (glm51) cannot start now (%d/2 full nodes available)\n" "$full4"
+fi
+if [ "$full4" -ge 3 ]; then
+    printf "    ${GRN}→${RST} 3-node × 4-GPU shape (glm52) can start now (%d full nodes available)\n" "$full4"
+else
+    printf "    ${YEL}→${RST} 3-node × 4-GPU shape (glm52) cannot start now (%d/3 full nodes available)\n" "$full4"
 fi
 echo
 
@@ -2338,6 +2362,7 @@ estimate_start() {
 
 estimate_start 1 4 "1 node  × 4 GPUs:"
 estimate_start 2 4 "2 nodes × 4 GPUs:"
+estimate_start 3 4 "3 nodes × 4 GPUs:"
 echo
 
 # --- 6. Hint -----------------------------------------------------------------

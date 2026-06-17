@@ -380,6 +380,16 @@ if [[ "${IS_GLM52}" == "1" && "${IS_AWQ}" == "0" ]]; then
     if [[ "${_RAYV2_EXPLICIT}" == "0" ]]; then
         VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0
     fi
+    # Custom PP layer partition (PP=3 only). GLM-5.2's DSA skip-topk layer at a
+    # pipeline-stage boundary trips `KeyError: model.layers.<N>.self_attn.attn`
+    # in get_attn_backends_for_group on the default even split (78/3 → boundary
+    # at layer 52, a skip-topk layer). 26/24/28 moves the boundaries to layers
+    # 0/26/50 — all FULL-indexer layers (full when max(L-2,0) % index_topk_freq
+    # == 0) — which gets init all the way to a live server. (Decode then still
+    # hits the multi-node PP wedge; see CLAUDE.md. Necessary, not sufficient.)
+    if [[ "${PP_SIZE}" == "3" ]]; then
+        VLLM_PP_LAYER_PARTITION="${VLLM_PP_LAYER_PARTITION:-26,24,28}"
+    fi
 fi
 
 # Resolve attention backend default. FLASH_ATTN is the right choice for
@@ -1021,6 +1031,15 @@ SING_CMD=(
 # vLLM's default warmup behaviour (empty value would read as "disabled").
 if [[ -n "${VLLM_DEEP_GEMM_WARMUP:-}" ]]; then
     SING_CMD+=(--env "VLLM_DEEP_GEMM_WARMUP=${VLLM_DEEP_GEMM_WARMUP}")
+fi
+
+# Manual pipeline-parallel layer partition (comma-separated per-stage layer
+# counts, must sum to num_hidden_layers). Forwarded only when set so vLLM's
+# even split is the default. Used to land PP stage boundaries on full-indexer
+# layers for GLM-5.2 (its skip-topk DSA layer at a stage boundary trips a
+# KeyError in get_attn_backends_for_group on the default even split).
+if [[ -n "${VLLM_PP_LAYER_PARTITION:-}" ]]; then
+    SING_CMD+=(--env "VLLM_PP_LAYER_PARTITION=${VLLM_PP_LAYER_PARTITION}")
 fi
 
 if [[ "${NUM_NODES}" -le 1 ]]; then

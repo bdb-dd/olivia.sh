@@ -1006,7 +1006,8 @@ start_server_job() {
                        GLM_REASONING_PARSER SERVED_MODEL_NAME \
                        MTP_SPECULATIVE_TOKENS ENABLE_SPECULATIVE \
                        MAX_MODEL_LEN GPU_MEM_UTIL RAY_CGRAPH_GET_TIMEOUT \
-                       VLLM_USE_RAY_V2_EXECUTOR_BACKEND; do
+                       VLLM_USE_RAY_V2_EXECUTOR_BACKEND \
+                       VLLM_PP_LAYER_PARTITION; do
         if [[ -n "${!forward_var:-}" ]]; then
             env_vars+=" ${forward_var}=${!forward_var}"
         fi
@@ -1023,6 +1024,15 @@ start_server_job() {
         # Single-node: keep backward-compatible behavior but still pass --gpus and
         # --cpus-per-task so per-preset overrides work.
         sbatch_opts="--gpus=${gpus_per_node} --cpus-per-task=$((gpus_per_node * 8))"
+    fi
+
+    # Optional walltime override (TIME_LIMIT, e.g. "3:00:00" or "180"). Overrides
+    # the #SBATCH --time in run_vllm_server.sh. Useful to cap a large multi-node
+    # allocation so it doesn't sit idle for the full default if left unattended.
+    # (A running job's limit can also be shortened live: scontrol update jobid=N
+    # TimeLimit=HH:MM:SS.)
+    if [[ -n "${TIME_LIMIT:-}" ]]; then
+        sbatch_opts+=" --time=${TIME_LIMIT}"
     fi
 
     # Debug: echo the exact command being submitted so regressions like

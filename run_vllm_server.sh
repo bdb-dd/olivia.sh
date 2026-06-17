@@ -73,7 +73,17 @@ RAY_CGRAPH_GET_TIMEOUT="${RAY_CGRAPH_GET_TIMEOUT:-1800}"
 # entirely — structurally avoids the MutableObjectProvider deadlock on
 # cross-node PP (ray#58426, vllm#26318, #26899). Required in vLLM v0.20.0+
 # where V2 exists but is off by default (upstream TODO to flip).
+# NOTE: on vLLM main, V2 breaks with our external multi-node Ray bootstrap —
+# the subprocess EngineCore re-inits Ray as a new job, so the API server's
+# worker ActorHandles are invalid across sessions (ActorHandleNotFoundError).
+# GLM-5.2 therefore defaults to the legacy executor below. Capture whether the
+# user pinned this so that default isn't silently overridden.
+if [[ -n "${VLLM_USE_RAY_V2_EXECUTOR_BACKEND+x}" ]]; then _RAYV2_EXPLICIT=1; else _RAYV2_EXPLICIT=0; fi
 VLLM_USE_RAY_V2_EXECUTOR_BACKEND="${VLLM_USE_RAY_V2_EXECUTOR_BACKEND:-1}"
+# (We tried VLLM_ENABLE_V1_MULTIPROCESSING=0 to run the EngineCore in-process and
+# share one Ray session — but vLLM main ignores it; the V1 engine always forks a
+# subprocess EngineCore. The legacy executor below is what actually avoids the
+# cross-session ActorHandle failure.)
 # MAX_MODEL_LEN default is model-dependent and gets resolved after GLM
 # detection below: 131072 for GLM-5.1 (native 205K context, plenty of KV
 # cache headroom on 8×GH200 AWQ), 32768 elsewhere.
@@ -353,7 +363,23 @@ if [[ "${IS_GLM52}" == "1" && "${IS_AWQ}" == "0" ]]; then
         export VLLM_USE_DEEP_GEMM=1
     fi
     export VLLM_DEEP_GEMM_WARMUP="${VLLM_DEEP_GEMM_WARMUP:-skip}"
-    KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
+    # KV cache dtype: leave at the model dtype (bf16). GLM-5.2's DSA needs a
+    # SPARSE MLA backend; on Hopper (sm_90) the only one is FLASHMLA_SPARSE,
+    # which does NOT support fp8 KV cache. (FlashInfer-MLA supports sparse+fp8
+    # but only on Blackwell — "compute capability not supported" on GH200, which
+    # is why PR#45895's fp8-KV test plan worked for them but not here.) Forcing
+    # fp8_e4m3 makes the attention selector reject every backend:
+    #   ValueError: No valid attention backend found ... use_sparse=True ...
+    #   FLASHMLA_SPARSE: [kv_cache_dtype not supported]
+    # Override KV_CACHE_DTYPE explicitly only if you know your backend supports it.
+    : # (no fp8 KV default for glm52 on GH200)
+    # GLM-5.2 runs on vLLM main, where RayExecutorV2 + our external multi-node Ray
+    # bootstrap fails at engine-core init (ActorHandleNotFoundError across Ray
+    # sessions). The legacy RayDistributedExecutor avoids it. Default to legacy
+    # unless the user pinned VLLM_USE_RAY_V2_EXECUTOR_BACKEND explicitly.
+    if [[ "${_RAYV2_EXPLICIT}" == "0" ]]; then
+        VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0
+    fi
 fi
 
 # Resolve attention backend default. FLASH_ATTN is the right choice for

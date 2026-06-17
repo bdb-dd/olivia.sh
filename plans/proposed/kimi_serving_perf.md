@@ -1,11 +1,93 @@
 # Kimi K2.6 serving performance — re-enable CUDAGraph for single-stream decode
 
-**Status:** proposed · **Created:** 2026-06-12 · **Branch:** `add-kimi-k26`
+**Status:** ⚠️ SUPERSEDED 2026-06-15 — the "PIECEWISE works" resolution below was measured on the now-retired vLLM **0.19.1** container; the current vLLM **0.21** deployment (`vllm-kimi-4-sandbox`) **cannot capture CUDAGraph (IMA, campaign exhausted) and runs eager**. See the corrected resolution and `plans/proposed/kimi_k27_results.md`. · **Created:** 2026-06-12 · **Branch:** `add-kimi-k26`
 
 A fresh-context pickup doc. The Kimi K2.6 multi-node deployment works end to end,
 but single-stream decode is slow (~10 tok/s) because we run **eager** (CUDAGraph
 disabled). This plan is about getting CUDAGraph back on. None of this is urgent —
 the server is fully usable for batched/multi-user work today.
+
+---
+
+## ⚠️ Corrected resolution (2026-06-15) — deploy eager
+
+**The 2026-06-13 "PIECEWISE works / ~34 tok/s" resolution (preserved below) was on
+the vLLM 0.19.1 container and no longer describes the deployment.** The current
+deployment moved to **vLLM 0.21** (`vllm-kimi-4-sandbox`, NGC 26.03) for the
+reasoning_tokens patches + K2.7-Code support, and on 0.21 CUDAGraph *capture* fails
+with an illegal-memory-access; the recovery campaign is now **exhausted**. Kimi K2.x
+multi-node on GH200 ships **eager** (`CUDAGRAPH_MODE=NONE`, the `run_vllm_server.sh`
+default for Kimi). Both K2.6 (`:8010`) and K2.7 (`:8020`) run eager and stable. Full
+capture campaign + numbers: `plans/proposed/kimi_k27_results.md`.
+
+**Two distinct failures — do not conflate them.** The 06-13 doc fixed the first and
+(on 0.19.1) genuinely captured; on 0.21 the second bug bites:
+
+1. **profile_run dispatch crash — FIXED, still required.** `torch.compile`
+   profile_run aborts *before* capture with `Multiple dispatch failed for
+   'torch._ops.vllm.min_latency_fused_qkv_a_proj' … NotImplemented`. The op has a
+   registered fake, but under NGC's torch alpha it **never lands in the FakeTensor
+   dispatch table**, so tracing can't proceed — independent of `cudagraph_mode`.
+   **Fix:** force `_use_min_latency_gemm=False` in `deepseek_v2.py` so the
+   un-fakeable op is never emitted; the layer falls back to
+   `MergedColumnParallelLinear` (identical math, minus a low-batch kernel micro-opt).
+   Codified as `PYPATCH_MINLATENCY` in `build_vllm_gh200.sh`. This only lets compile
+   *reach* capture — it is **not** the capture bug.
+
+2. **CUDAGraph capture IMA — UNFIXED on 0.21 (the real blocker → eager).** With
+   profile_run fixed, capture itself dies with `CUDA error: an illegal memory access`
+   (`cudaErrorIllegalAddress`) inside a **miscompiled inductor kernel**:
+   `_capture_cudagraphs` → `torch/_inductor/runtime/triton_heuristics.py
+   :autotune_to_one_config`. A bad kernel, not a config knob, and **mode-independent**
+   (`PIECEWISE` and `FULL_AND_PIECEWISE` both IMA). Both escape axes are exhausted:
+   - **Config axis:** `inductor_compile_config.combo_kernels=false`,
+     `use_inductor_graph_partition`, `max_cudagraph_capture_size`, mode changes — all
+     still IMA.
+   - **Torch axis:** rebuilt vLLM 0.21 on **NGC 26.05** (newer inductor, torch
+     `2.12.0a0`) — capture reached **30/51 PIECEWISE graphs** then the **identical
+     IMA**. (26.05 also resolves a FastAPI/Starlette combo that 500s every request,
+     so that container can't serve regardless.)
+   - **Remaining (low priority):** upstream bug report with the capture repro; or a
+     non-NGC stable torch wheel (forfeits NGC's tuned GH200 kernels + CUDA stack).
+
+**Eager performance (the price).** Single-stream decode ~17 tok/s (overhead-bound:
+per-token kernel launches + cross-node PP bubble). Per-stream stays flat under load
+and aggregate scales near-linearly — ~267 tok/s at 16-way, ~600 at 32-way, ~830 at
+48-way in production. Batched/multi-user throughput is good; only solo-interactive
+latency suffers.
+
+**Still-valid side fixes (separate from capture), kept:**
+- **Build IPC:** parallel vLLM builds (`MAX_JOBS>1`) on these GH200 nodes die at
+  kernel compile with `semop(1): … Invalid argument` (shared host IPC SysV semaphore
+  exhaustion). Fix: build in a private IPC namespace (`--ipc`), default-on in
+  `build_vllm_gh200.sh` (`BUILD_IPC`).
+- **Idle NCCL abort:** an idle multi-node server can die on an idle→active NCCL abort
+  regardless of mode — keep a keepalive pinging during idle windows
+  (`anthropic_proxy.py --keepalive-interval`).
+
+> **Note:** the original 2026-06-13 resolution and benchmark numbers below were
+> measured on vLLM **0.19.1** (`vllm-kimi-3-sandbox`) and are retained as history.
+> Its "PIECEWISE is the deployed default" conclusion is **superseded** by the above.
+
+### Original 2026-06-13 resolution (vLLM 0.19.1 — superseded, kept for the numbers)
+
+On the **0.19.1** container, with `PYPATCH_MINLATENCY` applied, CUDAGraph capture
+*succeeded* and PIECEWISE was the deployed default. Decode benchmark (instant mode,
+`max_tokens=256`, direct login→head):
+
+| Concurrency | Eager | PIECEWISE | FULL_AND_PIECEWISE |
+|---|---|---|---|
+| 1 (per-stream) | 10.0 | 34.3 | 62.8 |
+| 16 (per-stream / agg) | 9.9 / 158 | 31.3 / 502 | 42.8 / 686 |
+
+On 0.19.1, `FULL_AND_PIECEWISE` *wedged* under real staggered concurrent traffic
+(Running≥2 mid-decode → 0 tok/s → NCCL watchdog abort; the full-CUDAGraph cross-rank
+wedge, vllm#24689), while `PIECEWISE` survived a sustained 6-way stress (269 reqs, 0
+failures, ~200 tok/s aggregate) — which is why PIECEWISE was the 0.19.1 default.
+**None of this carries to the 0.21 deployment, which cannot capture at all (the
+capture IMA above).**
+
+The original investigation (still useful context) follows unchanged.
 
 ---
 

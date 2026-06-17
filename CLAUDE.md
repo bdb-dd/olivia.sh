@@ -302,6 +302,11 @@ Runs vLLM server with GH200-optimized settings:
 - `KIMI_TOOL_PARSER`: Tool call parser (default: `kimi_k2`)
 - `KIMI_REASONING_PARSER`: Reasoning parser (default: `kimi_k2`; set to empty to omit, e.g. instant mode). Thinking mode is on by default, so this is normally required.
 - Kimi K2.6 also passes `--trust-remote-code` (custom `KimiK25ForConditionalGeneration`) and `--mm-encoder-tp-mode data` (MoonViT vision encoder replicated across the TP group), auto-selects an MLA attention backend, and enables expert parallel. No `--quantization` flag — the native int4 is `compressed-tensors`, which vLLM auto-detects.
+- **CUDAGraph (decode speedup) — not available; Kimi runs eager (`CUDAGRAPH_MODE=NONE`, the default).** CUDAGraph *capture* is unrecoverable on the deployed vLLM 0.21 + NGC-torch GH200 stack and the recovery campaign is **exhausted** (2026-06-15); both K2.6 (`:8010`) and K2.7 (`:8020`) on `vllm-kimi-4-sandbox` run eager and stable. Eager single-stream decode is ~17 tok/s (overhead-bound), but per-stream stays flat under load and aggregate scales near-linearly (~267 tok/s at 16-way, ~600 at 32-way, ~830 at 48-way in production), so batched/multi-user throughput is good. **Two distinct failures — do not conflate them:**
+    - *profile_run dispatch crash — FIXED (still required).* `torch.compile` profile_run aborts *before* capture with `Multiple dispatch failed for 'torch._ops.vllm.min_latency_fused_qkv_a_proj' … NotImplemented`: that MLA op has a registered fake, but under NGC's torch alpha it never lands in the FakeTensor dispatch table. `build_vllm_gh200.sh` (`PYPATCH_MINLATENCY`) forces `_use_min_latency_gemm=False` in `deepseek_v2.py`, so the op is never emitted and the layer falls back to `MergedColumnParallelLinear` (identical math). Baked into the build; it only lets compile *reach* capture — it is **not** the capture bug.
+    - *CUDAGraph capture IMA — UNFIXED (the blocker).* With profile_run fixed, capture itself dies with `CUDA error: an illegal memory access` (`cudaErrorIllegalAddress`) inside a **miscompiled inductor kernel** (`_capture_cudagraphs` → `torch/_inductor/runtime/triton_heuristics.py:autotune_to_one_config`). It is **mode-independent** (`PIECEWISE` and `FULL_AND_PIECEWISE` both IMA) and both escape axes are exhausted: config (`combo_kernels=false`, `use_inductor_graph_partition`, `max_cudagraph_capture_size`) and torch (rebuilt on NGC 26.05 with a newer inductor — capture reached 30/51 graphs then the identical IMA; 26.05 separately breaks the FastAPI server). Remaining low-priority options: an upstream bug report, or a non-NGC stable torch (forfeits NGC's tuned GH200 kernels).
+
+  Do **not** set `CUDAGRAPH_MODE=PIECEWISE`/`FULL_AND_PIECEWISE` on the current containers — capture will crash. (Historical note: PIECEWISE *did* capture and run ~34 tok/s on the earlier vLLM **0.19.1** container; moving to 0.21 for reasoning_tokens + K2.7 lost it to the capture IMA above.) Separately, idle multi-node servers can die on an idle→active NCCL abort regardless of mode — keep a keepalive pinging during idle windows (`anthropic_proxy.py --keepalive-interval`). Full account: `plans/proposed/kimi_k27_results.md`; superseded history: `plans/proposed/kimi_serving_perf.md`.
 
 **Multi-node Distributed Inference (GLM-5.1):**
 - `NUM_NODES`: Number of nodes to use (default: `1`). When `>1`, `run_vllm_server.sh` bootstraps a Ray cluster via `srun`, starts head on node 0, workers on remaining nodes, waits for the cluster to register the expected GPU count, then launches vLLM with `--distributed-executor-backend ray`
@@ -476,7 +481,7 @@ Kimi K2.6 (Moonshot) is a 1T-parameter MoE (~32B active) with 384 experts, MLA a
 # or direct: MAX_MODEL_LEN=262144 ... run_vllm_server.sh
 
 # Force instant mode (no reasoning extraction) by dropping the reasoning parser
-KIMI_REASONING_PARSER="" CONTAINER=vllm-kimi-1-sandbox MODEL=moonshotai/Kimi-K2.6 \
+KIMI_REASONING_PARSER="" CONTAINER=vllm-kimi-4-sandbox MODEL=moonshotai/Kimi-K2.6 \
     NUM_NODES=2 TP_SIZE=4 PP_SIZE=2 ./run_vllm_server.sh
 ```
 

@@ -612,6 +612,164 @@ else:
             print(f"WARNING: expected 1 match, found {n} — patch skipped, inspect manually")
 PYPATCH_MINLATENCY
 
+# Patch: make the Kimi K2 reasoning parser actually count reasoning tokens.
+# vLLM's base ReasoningParser.count_reasoning_tokens() returns 0 unless a parser
+# opts in, and kimi_k2 never overrides it -> usage reasoning_tokens is always 0.
+# Kimi K2/K2.7 also typically omit the <think> start token (reasoning begins at
+# the start, ended by </think> or a tool-call section), so a naive start/end
+# depth counter would also be 0. Mirror the parser's own extract_reasoning().
+echo "Patching vllm/reasoning/kimi_k2_reasoning_parser.py: count reasoning tokens..."
+python3 << 'PYPATCH_REASONING_COUNT'
+from pathlib import Path
+fp = Path('vllm/reasoning/kimi_k2_reasoning_parser.py')
+if not fp.exists():
+    print(f"{fp} not found (OK, may be a different vLLM layout)")
+else:
+    src = fp.read_text()
+    if 'def count_reasoning_tokens' in src:
+        print("Already patched (OK)")
+    else:
+        method = (
+            "    def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:\n"
+            "        # Olivia patch: base default returns 0; Kimi K2 omits the\n"
+            "        # <think> start token, so count tokens before the first\n"
+            "        # </think>/tool-call-section marker, dropping a leading\n"
+            "        # <think>. Mirrors extract_reasoning.\n"
+            "        if self._identity_parser is not None:\n"
+            "            return 0\n"
+            "        end_idx = None\n"
+            "        for i, t in enumerate(token_ids):\n"
+            "            if t == self._end_token_id or (\n"
+            "                self._tool_section_start_token_id is not None\n"
+            "                and t == self._tool_section_start_token_id\n"
+            "            ):\n"
+            "                end_idx = i\n"
+            "                break\n"
+            "        ids = list(token_ids)\n"
+            "        region = ids[:end_idx] if end_idx is not None else ids\n"
+            "        return sum(1 for t in region if t != self._start_token_id)\n\n"
+        )
+        marker = "    def extract_reasoning(\n"
+        if marker in src:
+            fp.write_text(src.replace(marker, method + marker, 1))
+            print("Patched: added count_reasoning_tokens override")
+        else:
+            print("extract_reasoning marker not found (OK, different vLLM)")
+PYPATCH_REASONING_COUNT
+
+# Patch: surface reasoning_tokens on /v1/chat/completions usage. vLLM 0.21 only
+# reports it on /v1/responses; chat/completions has no completion_tokens_details
+# at all. Add the type+field to UsageInfo and populate it (via the reasoning
+# parser's count_reasoning_tokens) in both the non-streaming and streaming paths.
+echo "Patching chat/completions usage for reasoning_tokens (protocol + serving)..."
+python3 << 'PYPATCH_CHAT_REASONING'
+from pathlib import Path
+proto = Path('vllm/entrypoints/openai/engine/protocol.py')
+if not proto.exists():
+    print(f"{proto} not found (OK, different vLLM layout)")
+else:
+    p = proto.read_text()
+    if 'class CompletionTokenUsageInfo' in p:
+        print("protocol already patched (OK)")
+    else:
+        old = (
+            "class UsageInfo(OpenAIBaseModel):\n"
+            "    prompt_tokens: int = 0\n"
+            "    total_tokens: int = 0\n"
+            "    completion_tokens: int | None = 0\n"
+            "    prompt_tokens_details: PromptTokenUsageInfo | None = None\n"
+        )
+        new = (
+            "class CompletionTokenUsageInfo(OpenAIBaseModel):\n"
+            "    reasoning_tokens: int | None = None\n\n\n"
+            "class UsageInfo(OpenAIBaseModel):\n"
+            "    prompt_tokens: int = 0\n"
+            "    total_tokens: int = 0\n"
+            "    completion_tokens: int | None = 0\n"
+            "    prompt_tokens_details: PromptTokenUsageInfo | None = None\n"
+            "    completion_tokens_details: CompletionTokenUsageInfo | None = None\n"
+        )
+        if old in p:
+            proto.write_text(p.replace(old, new, 1))
+            print("protocol patched")
+        else:
+            print("protocol UsageInfo block not found (OK, different vLLM)")
+
+serv = Path('vllm/entrypoints/openai/chat_completion/serving.py')
+if not serv.exists():
+    print(f"{serv} not found (OK, different vLLM layout)")
+else:
+    s = serv.read_text()
+    orig = s
+    if 'CompletionTokenUsageInfo' not in s and '    PromptTokenUsageInfo,\n' in s:
+        s = s.replace('    PromptTokenUsageInfo,\n',
+                      '    CompletionTokenUsageInfo,\n    PromptTokenUsageInfo,\n', 1)
+    ns_old = (
+        "        usage = UsageInfo(\n"
+        "            prompt_tokens=num_prompt_tokens,\n"
+        "            completion_tokens=num_generated_tokens,\n"
+        "            total_tokens=num_prompt_tokens + num_generated_tokens,\n"
+        "        )\n"
+        "        if self.enable_prompt_tokens_details and final_res.num_cached_tokens:\n"
+    )
+    ns_new = (
+        "        usage = UsageInfo(\n"
+        "            prompt_tokens=num_prompt_tokens,\n"
+        "            completion_tokens=num_generated_tokens,\n"
+        "            total_tokens=num_prompt_tokens + num_generated_tokens,\n"
+        "        )\n"
+        "        if reasoning_parser is not None:\n"
+        "            _reasoning_toks = sum(\n"
+        "                reasoning_parser.count_reasoning_tokens(output.token_ids)\n"
+        "                for output in final_res.outputs\n"
+        "            )\n"
+        "            if _reasoning_toks:\n"
+        "                usage.completion_tokens_details = CompletionTokenUsageInfo(\n"
+        "                    reasoning_tokens=_reasoning_toks\n"
+        "                )\n"
+        "        if self.enable_prompt_tokens_details and final_res.num_cached_tokens:\n"
+    )
+    if 'usage.completion_tokens_details' not in s and ns_old in s:
+        s = s.replace(ns_old, ns_new, 1)
+    st_old = (
+        "                final_usage = UsageInfo(\n"
+        "                    prompt_tokens=num_prompt_tokens,\n"
+        "                    completion_tokens=completion_tokens,\n"
+        "                    total_tokens=num_prompt_tokens + completion_tokens,\n"
+        "                )\n"
+        "                if self.enable_prompt_tokens_details and num_cached_tokens:\n"
+    )
+    st_new = (
+        "                final_usage = UsageInfo(\n"
+        "                    prompt_tokens=num_prompt_tokens,\n"
+        "                    completion_tokens=completion_tokens,\n"
+        "                    total_tokens=num_prompt_tokens + completion_tokens,\n"
+        "                )\n"
+        "                if (\n"
+        "                    reasoning_parser is not None\n"
+        "                    and all_previous_token_ids is not None\n"
+        "                ):\n"
+        "                    _reasoning_toks = sum(\n"
+        "                        reasoning_parser.count_reasoning_tokens(ids)\n"
+        "                        for ids in all_previous_token_ids\n"
+        "                    )\n"
+        "                    if _reasoning_toks:\n"
+        "                        final_usage.completion_tokens_details = (\n"
+        "                            CompletionTokenUsageInfo(\n"
+        "                                reasoning_tokens=_reasoning_toks\n"
+        "                            )\n"
+        "                        )\n"
+        "                if self.enable_prompt_tokens_details and num_cached_tokens:\n"
+    )
+    if 'final_usage.completion_tokens_details' not in s and st_old in s:
+        s = s.replace(st_old, st_new, 1)
+    if s != orig:
+        serv.write_text(s)
+        print("serving patched")
+    else:
+        print("serving already patched or markers not found (OK)")
+PYPATCH_CHAT_REASONING
+
 # Get current NGC PyTorch version for constraints
 NGC_TORCH_VERSION=$(python3 -c "import torch; print(torch.__version__)")
 echo "NGC PyTorch version: ${NGC_TORCH_VERSION}"

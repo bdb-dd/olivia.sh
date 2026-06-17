@@ -914,6 +914,11 @@ preset_field() {
             # Kimi K2.6 (1T MoE, 32B active). The base repo ships Moonshot's
             # native int4 (compressed-tensors, ~640GB) — there is no separate
             # -AWQ repo. ~640GB → 8 GPUs / 2 nodes, same TP=4 + PP=2 as glm51.
+            # index 4 = the validated eager vLLM 0.21 container
+            # (vllm-kimi-4-sandbox, shared with kimi27) — carries the
+            # reasoning_tokens patches and is what the K2.6 deployment runs on.
+            # (Was the default index 1 = legacy vLLM 0.19 vllm-kimi-1-sandbox.)
+            prefix="kimi"; index="4"
             model="moonshotai/Kimi-K2.6"
             nodes="2"; gpus="4"; pp="2"
             ;;

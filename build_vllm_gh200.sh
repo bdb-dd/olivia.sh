@@ -91,6 +91,11 @@ apply_preset() {
     # yet (applied during build — see the VLLM_PATCHES step in Phase 3).
     PRESET_VLLM_PATCHES=""
 
+    # Default: no preset-specific NGC base. A preset can pin one (e.g. glm52 on
+    # vLLM main needs a newer torch::stable ABI than 26.03 ships). Resolved into
+    # NGC_PYTORCH_TAG after this function runs.
+    PRESET_NGC_TAG=""
+
     case "${preset}" in
         glm51_v19|GLM51_V19|glm51|GLM51|glm-5.1|GLM-5.1)
             # MODEL_ID stays "glm51" so the container name is vllm-glm51-<index>-sandbox
@@ -146,6 +151,11 @@ apply_preset() {
             PRESET_VLLM_VERSION="main"
             PRESET_TRANSFORMERS=">=5.4.0"
             PRESET_VLLM_PATCHES="45895"
+            # vLLM main's csrc/libtorch_stable (cuda_view.cu) uses torch::stable
+            # APIs (Tensor::layout(), newer from_blob) absent from NGC 26.03's
+            # torch 2.11.0a0 alpha — the build fails at the CUDA compile. 26.05
+            # (newest as of 2026-06) ships a later 2.11.0 alpha with that ABI.
+            PRESET_NGC_TAG="26.05-py3"
             PRESET_NOTES="GLM-5.2 (744B MoE+DSA) FP8. Builds vLLM main + PR#45895 (skip-topk indexer, grafted via VLLM_PATCHES); not in any release. Multi-node PP wedge as glm51 — pair with proxy serialization."
             ;;
         glm47|GLM47|glm-4.7|GLM-4.7)
@@ -220,9 +230,9 @@ WORKDIR="${WORKDIR:-$PWD}"
 #
 # vLLM v0.19.0 (Apr 2026) is the pinned version per the official recipe
 # (https://github.com/vllm-project/recipes/blob/main/GLM/GLM5.md). If you pin
-# a newer vLLM, you may need NGC_PYTORCH_TAG=26.04-py3 or later.
-NGC_PYTORCH_TAG="${NGC_PYTORCH_TAG:-26.03-py3}"
-NGC_IMAGE="${NGC_IMAGE:-docker://nvcr.io/nvidia/pytorch:${NGC_PYTORCH_TAG}}"
+# a newer vLLM, you may need NGC_PYTORCH_TAG=26.04-py3 or later. The default is
+# resolved AFTER apply_preset (below), so a preset can pin its own NGC base
+# (glm52 → 26.05). Explicit env > preset pin > 26.03 default.
 
 # Container output directory (shared location on Olivia)
 CONTAINER_DIR="${CONTAINER_DIR:-}"
@@ -239,6 +249,11 @@ apply_preset "${MODEL_ID}"
 
 # Allow override of preset defaults
 VLLM_VERSION="${VLLM_VERSION:-${PRESET_VLLM_VERSION}}"
+
+# Resolve NGC base image now that the preset has run: explicit env wins, then
+# the preset's pin (PRESET_NGC_TAG), then the 26.03 default.
+NGC_PYTORCH_TAG="${NGC_PYTORCH_TAG:-${PRESET_NGC_TAG:-26.03-py3}}"
+NGC_IMAGE="${NGC_IMAGE:-docker://nvcr.io/nvidia/pytorch:${NGC_PYTORCH_TAG}}"
 
 # Upstream vLLM PRs to graft onto the cloned source during Phase 3 (space-
 # separated PR numbers). Defaults to the preset's list; override with
@@ -446,7 +461,11 @@ echo "  User: $(whoami)"
 echo "  PWD: $(pwd)"
 
 echo "Installing build dependencies..."
-pip install --no-cache-dir --root-user-action=ignore ninja cmake wheel packaging setuptools-scm
+# setuptools-rust is required to even generate metadata for vLLM main's
+# pyproject (it ships a Rust frontend). We build with --no-build-isolation, so
+# every build-system.requires entry must be present in the env up front.
+# Harmless for older pinned versions that don't use it.
+pip install --no-cache-dir --root-user-action=ignore ninja cmake wheel packaging setuptools-scm setuptools-rust
 
 echo "Cloning vLLM repository..."
 cd /opt
@@ -764,6 +783,31 @@ pip install --no-cache-dir --no-deps --root-user-action=ignore --no-build-isolat
     echo "Warning: DeepGEMM install failed. GLM-5.1 (DSA) will not be able to load;"
     echo "         other presets are unaffected. Override DEEPGEMM_REF to pin a commit."
 }
+
+# vLLM main (post-v0.20) ships a Rust frontend under vllm/vllm-rs (tokenizer,
+# tool/reasoning parsers, incl. the deepseek_v32 renderer used by DSA models).
+# Its pyproject build needs an actual Rust toolchain (cargo/rustc) in addition
+# to setuptools-rust, and NGC ships neither. Install rustup ONLY when the cloned
+# source actually has the Rust frontend, so older pinned versions (e.g. glm51's
+# v0.19.0, which predates it) build exactly as before. cwd is /opt/vllm here.
+if [[ -f rust-toolchain.toml || -d rust ]]; then
+    echo ""
+    echo "vLLM source has a Rust frontend — installing Rust toolchain (rustup)..."
+    export RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo
+    RUST_CHANNEL=$(grep -oE 'channel[[:space:]]*=[[:space:]]*"[^"]+"' rust-toolchain.toml 2>/dev/null | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+    RUST_CHANNEL="${RUST_CHANNEL:-stable}"
+    echo "  Pinned Rust channel: ${RUST_CHANNEL}"
+    if ! command -v cargo >/dev/null 2>&1; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --profile minimal --default-toolchain "${RUST_CHANNEL}"
+    fi
+    export PATH="${CARGO_HOME}/bin:${PATH}"
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "ERROR: cargo not on PATH after rustup install; cannot build vLLM Rust frontend."
+        exit 1
+    fi
+    echo "  Rust toolchain ready: $(cargo --version)"
+fi
 
 # Build and install vLLM
 echo ""

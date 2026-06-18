@@ -156,17 +156,21 @@ apply_preset() {
             # TopK share for iteration"), created 2026-06-17 and NOT yet merged —
             # so it is in NO tagged release (v0.23.0 was cut two days before it).
             #
-            # We graft PR#45895 onto vLLM main at build time via PRESET_VLLM_PATCHES
-            # below (the Phase 3 VLLM_PATCHES step git-applies it to the cloned
-            # source before compiling; it's pure Python, 9 files). The apply is
-            # idempotent — once PR#45895 merges into main, drop "45895" here (and
-            # the snapshot in patches/). A newer vLLM main may need
-            # NGC_PYTORCH_TAG=26.04-py3+.
+            # We graft PR#45895 via PRESET_VLLM_PATCHES below (the Phase 3
+            # VLLM_PATCHES step applies the committed patches/ snapshot to the
+            # cloned source before compiling; pure Python, 9 files). For
+            # reproducibility the base is PINNED to the exact main commit the
+            # deployed glm52 container built from and the snapshot was validated
+            # against (091386a, 2026-06-17), so clone(pinned) + apply(snapshot) is
+            # byte-identical every build. Override VLLM_VERSION=main to track
+            # latest (then re-pin + re-snapshot once validated). Once PR#45895
+            # merges at/under the pin, drop "45895" + the snapshot. A newer base
+            # may need NGC_PYTORCH_TAG=26.04-py3+.
             #
             # Quant is block-FP8 (zai-org / RedHatAI, [128,128], e4m3, dynamic) →
             # DeepGEMM path on Hopper. Default model = RedHatAI/GLM-5.2-FP8.
             MODEL_ID="glm52"
-            PRESET_VLLM_VERSION="main"
+            PRESET_VLLM_VERSION="091386a99b9542691bb1e935ca44d0efbba6e111"
             PRESET_TRANSFORMERS=">=5.4.0"
             PRESET_VLLM_PATCHES="45895"
             # GLM-5.2's DSA sparse-attention indexer calls fp8_fp4_mqa_logits at
@@ -579,6 +583,21 @@ fi
 VLLM_VERSION="${VLLM_VERSION:-main}"
 if [[ "$VLLM_VERSION" == "main" ]]; then
     git clone --depth 1 https://github.com/vllm-project/vllm.git
+elif [[ "$VLLM_VERSION" =~ ^[0-9a-f]{7,40}$ ]]; then
+    # Pinned commit SHA — full reproducibility for snapshot-grafted presets
+    # (glm52): clone(pinned base) + apply(committed snapshot) is byte-identical
+    # every build, unlike cloning a moving branch where the base drifts (and the
+    # snapshot can stop applying). GitHub serves arbitrary commits
+    # (allowAnySHA1InWant), so shallow-fetch the exact SHA. Like the "main" path
+    # this is a dev build (version label <next>.dev0+g<sha>), so --depth 1 is fine
+    # — the tag-history concern below only applies to tagged releases.
+    echo "Pinning vLLM to commit ${VLLM_VERSION} (reproducible build)"
+    mkdir vllm && cd vllm
+    git init -q
+    git remote add origin https://github.com/vllm-project/vllm.git
+    git fetch --depth 1 origin "${VLLM_VERSION}"
+    git checkout -q FETCH_HEAD
+    cd /opt
 else
     git clone --branch "${VLLM_VERSION}" https://github.com/vllm-project/vllm.git
 fi

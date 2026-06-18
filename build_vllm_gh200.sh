@@ -526,7 +526,18 @@ export VLLM_VERSION="${VLLM_VERSION}"
 export VLLM_PATCHES="${VLLM_PATCHES}"
 export DEEPGEMM_REF="${DEEPGEMM_REF}"
 
-singularity exec ${SING_OPTS} \
+# Reproducible PR graft (#2): if a snapshot dir was deployed alongside this script
+# (olivia.sh deploys ./patches/), bind it read-only so the VLLM_PATCHES step in
+# Phase 3 prefers the committed snapshot over a live GitHub fetch. Absent dir =
+# the build falls back to the live fetch (so this is purely additive).
+PATCHES_BIND=""
+PATCHES_DIR="${PATCHES_DIR:-${CONTAINER_DIR:-$(pwd)}/patches}"
+if [[ -d "${PATCHES_DIR}" ]]; then
+    PATCHES_BIND="--bind ${PATCHES_DIR}:/opt/olivia-patches:ro"
+    echo "PR-graft snapshots: ${PATCHES_DIR} -> /opt/olivia-patches (ro)"
+fi
+
+singularity exec ${SING_OPTS} ${PATCHES_BIND} \
     --env "VLLM_VERSION=${VLLM_VERSION}" \
     --env "VLLM_PATCHES=${VLLM_PATCHES}" \
     --env "DEEPGEMM_REF=${DEEPGEMM_REF}" \
@@ -711,10 +722,16 @@ PYPATCH_MINLATENCY
 # -----------------------------------------------------------------------------
 # VLLM_PATCHES (space-separated PR numbers, passed via --env) lists upstream vLLM
 # PRs a preset needs that aren't in a release yet. Each PR's cumulative diff is
-# fetched from GitHub and git-applied to the cloned source HERE — before the
-# `pip install .` compile below — so the fix is baked into the container.
-# The glm52 preset uses this for PR#45895 (GLM-5.2's new skip-topk DSA indexer +
-# MTP final-norm recycle; pure Python). cwd is /opt/vllm.
+# git-applied to the cloned source HERE — before the `pip install .` compile
+# below — so the fix is baked into the container. The glm52 preset uses this for
+# PR#45895 (GLM-5.2's new skip-topk DSA indexer + MTP final-norm recycle; pure
+# Python). cwd is /opt/vllm.
+#
+# Source of each diff (#2, reproducibility): a committed snapshot bound in at
+# /opt/olivia-patches (patches/vllm-pr<N>*.diff) is PREFERRED — reproducible and
+# offline. Only if no snapshot is present do we fetch the LIVE PR from GitHub
+# (which can drift if the PR is force-updated/rebased). Drop the snapshot file
+# (or the PR number) once the PR merges into the pinned ref.
 #
 # Idempotent: a reverse-apply check skips PRs already present (e.g. once the PR
 # merges into the pinned ref, or on a --force rebuild). A diff that no longer
@@ -722,16 +739,24 @@ PYPATCH_MINLATENCY
 if [[ -n "${VLLM_PATCHES:-}" ]]; then
     echo ""
     echo "Grafting upstream vLLM PR(s): ${VLLM_PATCHES}"
-    if ! command -v curl >/dev/null 2>&1; then
-        echo "ERROR: curl not found in container; cannot fetch PR diffs."
-        exit 1
-    fi
     for PR in ${VLLM_PATCHES}; do
         DIFF="/tmp/vllm-pr-${PR}.diff"
-        echo "  PR #${PR}: fetching diff from GitHub..."
-        if ! curl -fsSL "https://github.com/vllm-project/vllm/pull/${PR}.diff" -o "${DIFF}"; then
-            echo "  ERROR: failed to download PR #${PR} diff."
-            exit 1
+        # Prefer a committed local snapshot (reproducible + offline); fall back to
+        # the live GitHub PR diff only if no snapshot was bound in.
+        SNAP="$(ls /opt/olivia-patches/vllm-pr${PR}*.diff 2>/dev/null | head -1 || true)"
+        if [[ -n "${SNAP}" ]]; then
+            echo "  PR #${PR}: using committed snapshot $(basename "${SNAP}")"
+            cp "${SNAP}" "${DIFF}"
+        else
+            echo "  PR #${PR}: no local snapshot bound — fetching live from GitHub..."
+            if ! command -v curl >/dev/null 2>&1; then
+                echo "  ERROR: curl not found in container; cannot fetch PR diffs."
+                exit 1
+            fi
+            if ! curl -fsSL "https://github.com/vllm-project/vllm/pull/${PR}.diff" -o "${DIFF}"; then
+                echo "  ERROR: failed to download PR #${PR} diff."
+                exit 1
+            fi
         fi
         if ! grep -q '^diff --git ' "${DIFF}"; then
             echo "  ERROR: PR #${PR} download is not a valid diff ($(wc -c < "${DIFF}") bytes)."

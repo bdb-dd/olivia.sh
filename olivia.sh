@@ -43,6 +43,7 @@ REMOTE_CONTAINER_DIR="${REMOTE_CONTAINER_DIR:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL_SERVER_SCRIPT="${SCRIPT_DIR}/run_vllm_server.sh"
 LOCAL_BUILD_SCRIPT="${SCRIPT_DIR}/build_vllm_gh200.sh"
+LOCAL_PATCHES_DIR="${SCRIPT_DIR}/patches"
 # Chat-template override for GLM-5.1 (see run_vllm_server.sh for why).
 LOCAL_GLM51_CHAT_TEMPLATE="${SCRIPT_DIR}/templates/glm51_chat_template.jinja"
 CHAT_SCRIPT="${SCRIPT_DIR}/chat_devstral.py"
@@ -680,6 +681,18 @@ deploy_build_script() {
         "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_CONTAINER_DIR}/build_vllm_gh200.sh"; then
         error "Failed to upload build script"
         return 1
+    fi
+
+    # Deploy the PR-graft snapshots (patches/) alongside the build script so the
+    # build applies the committed diff reproducibly instead of fetching the live
+    # PR from GitHub (#2). Optional: if the dir is absent (or upload fails) the
+    # build simply falls back to the live fetch.
+    if [[ -d "${LOCAL_PATCHES_DIR}" ]]; then
+        info "Uploading patches/ (PR-graft snapshots)"
+        if ! scp_run -r "${LOCAL_PATCHES_DIR}" \
+            "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_CONTAINER_DIR}/"; then
+            warn "Failed to upload patches/ — build will fetch PR diffs live"
+        fi
     fi
 
     success "Build script deployed"

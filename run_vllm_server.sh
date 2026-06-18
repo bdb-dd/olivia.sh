@@ -453,13 +453,16 @@ fi
 # implement the SupportsPP interface. Combining --speculative-config with
 # --pipeline-parallel-size > 1 raises:
 #   NotImplementedError: Pipeline parallelism is not supported for this model.
-# When PP > 1 we MUST disable MTP. The throughput loss (~15-25%) is much
-# smaller than the alternative (TP=N across the cross-node fabric instead
-# of PP, which bottlenecks on all-reduce every layer). Revisit when the
-# upstream SupportsPP interface lands for MTP draft models.
-if [[ "${USE_SPECULATIVE}" == "1" && "${PP_SIZE}" -gt 1 ]]; then
-    echo "[WARN] Disabling MTP speculative decoding: incompatible with pipeline parallelism (PP_SIZE=${PP_SIZE}) in vLLM v0.19.x"
+# When PP > 1 we disable MTP. The throughput loss (~15-25%) is much smaller
+# than the alternative (TP=N across the cross-node fabric instead of PP, which
+# bottlenecks on all-reduce every layer). On vLLM main, MTP's SupportsPP may
+# now be implemented (PR#45895 reworked GLM-5.2 MTP) — set ALLOW_MTP_PP=1 to
+# try MTP+PP and measure (e.g. for glm52's slow single-stream decode).
+if [[ "${USE_SPECULATIVE}" == "1" && "${PP_SIZE}" -gt 1 && "${ALLOW_MTP_PP:-0}" != "1" ]]; then
+    echo "[WARN] Disabling MTP speculative decoding: incompatible with pipeline parallelism (PP_SIZE=${PP_SIZE}) on v0.19.x. Set ALLOW_MTP_PP=1 to try it on vLLM main."
     USE_SPECULATIVE=0
+elif [[ "${USE_SPECULATIVE}" == "1" && "${PP_SIZE}" -gt 1 ]]; then
+    echo "[INFO] ALLOW_MTP_PP=1: keeping MTP enabled with PP_SIZE=${PP_SIZE} (testing main's SupportsPP)"
 fi
 
 echo "Speculative Decoding:"

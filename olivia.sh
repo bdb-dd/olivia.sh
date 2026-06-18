@@ -123,7 +123,8 @@ notify() {
 
 # SSH helpers
 ssh_opts() {
-    echo -o "ControlMaster=auto" -o "ControlPath=${SSH_CONTROL_SOCKET}" -o "ControlPersist=600"
+    echo -o "ControlMaster=auto" -o "ControlPath=${SSH_CONTROL_SOCKET}" -o "ControlPersist=3600" \
+         -o "ServerAliveInterval=30" -o "ServerAliveCountMax=10"
 }
 
 ssh_run() {
@@ -157,9 +158,9 @@ ensure_master_connection() {
 
     ssh -f -N -M \
         -o "ControlPath=${SSH_CONTROL_SOCKET}" \
-        -o "ControlPersist=600" \
-        -o "ServerAliveInterval=60" \
-        -o "ServerAliveCountMax=3" \
+        -o "ControlPersist=3600" \
+        -o "ServerAliveInterval=30" \
+        -o "ServerAliveCountMax=10" \
         "${REMOTE_USER}@${REMOTE_HOST}"
 
     sleep 1
@@ -1004,7 +1005,7 @@ start_server_job() {
                        RAY_DEDUP_LOGS NCCL_DEBUG CUDAGRAPH_MODE \
                        ENABLE_AUTO_TOOL_CHOICE GLM_TOOL_PARSER \
                        GLM_REASONING_PARSER SERVED_MODEL_NAME \
-                       MTP_SPECULATIVE_TOKENS ENABLE_SPECULATIVE \
+                       MTP_SPECULATIVE_TOKENS ENABLE_SPECULATIVE ALLOW_MTP_PP \
                        MAX_MODEL_LEN GPU_MEM_UTIL RAY_CGRAPH_GET_TIMEOUT \
                        VLLM_USE_RAY_V2_EXECUTOR_BACKEND \
                        VLLM_PP_LAYER_PARTITION EXTRA_VLLM_ARGS; do

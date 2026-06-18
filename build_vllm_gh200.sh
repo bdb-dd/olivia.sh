@@ -533,6 +533,10 @@ export DEEPGEMM_REF="${DEEPGEMM_REF}"
 PATCHES_BIND=""
 PATCHES_DIR="${PATCHES_DIR:-${CONTAINER_DIR:-$(pwd)}/patches}"
 if [[ -d "${PATCHES_DIR}" ]]; then
+    # Apptainer does NOT auto-create bind destinations (unlike Docker); the bind
+    # fails at container creation if the mount point is absent. The sandbox is a
+    # writable dir tree on the host, so create the mount point in it first.
+    mkdir -p "${SANDBOX_PATH}/opt/olivia-patches"
     PATCHES_BIND="--bind ${PATCHES_DIR}:/opt/olivia-patches:ro"
     echo "PR-graft snapshots: ${PATCHES_DIR} -> /opt/olivia-patches (ro)"
 fi

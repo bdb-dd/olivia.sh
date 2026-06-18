@@ -4,8 +4,14 @@
 #SBATCH --gpus=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=0
-#SBATCH --time=08:00:00
+# Bounded memory: NOT --mem=0, which requests the whole node's RAM (~808G) and
+# blocks this 1-GPU build from backfilling into a partially-used node. 128G is
+# ample for a vLLM compile; raise it if parallel nvcc/ninja ever pressures it.
+#SBATCH --mem=128G
+# Build needs ~30-90 min; a short walltime backfills into transient GPU holes
+# far more easily than an 8h reservation (the scheduler can only place an 8h job
+# in a hole that stays free for 8h before the next higher-priority reservation).
+#SBATCH --time=02:00:00
 #SBATCH --output=build_vllm_%j.log
 
 # =============================================================================
@@ -56,9 +62,16 @@ show_presets() {
     echo "               git-applies it (VLLM_PATCHES=45895). Drop it once PR merges."
     echo "               Same multi-node PP decode wedge as glm51; use proxy serialization."
     echo ""
+    echo "  gemma4     - Gemma 4 (31B dense, multimodal text+image)"
+    echo "               vLLM: v0.19.0, transformers>=5.5.0"
+    echo "               ~20GiB @ AWQ, fits 1-2x GH200 (FP8 has known bugs)"
     echo "  glm47      - GLM-4.7 (358B) - Latest flagship model from THUDM"
     echo "               vLLM: main, transformers>=5.0.0rc0"
     echo "               Requires ~358GB VRAM (FP8) or ~716GB (BF16)"
+    echo ""
+    echo "  kimi       - Kimi K2.6 (1T MoE, 32B active) MLA + multimodal from Moonshot"
+    echo "               vLLM: v0.19.1, transformers>=4.57.1,<5.0.0"
+    echo "               native int4 ~640GB, 8 GPUs (2 nodes × 4× GH200, TP=4 + PP=2)"
     echo ""
     echo "  devstral   - Devstral/Mistral models (7B-123B)"
     echo "               vLLM: main, transformers>=4.45.0"
@@ -169,11 +182,40 @@ apply_preset() {
             PRESET_NGC_TAG="26.05-py3"
             PRESET_NOTES="GLM-5.2 (744B MoE+DSA) FP8. Builds vLLM main + PR#45895 (skip-topk indexer, grafted via VLLM_PATCHES); not in any release. Multi-node PP wedge as glm51 — pair with proxy serialization."
             ;;
+        gemma4|Gemma4|gemma-4|Gemma-4)
+            MODEL_ID="gemma4"
+            # Pinned to v0.19.0: vLLM main after 2026-03-31 (commit 7c080dd3c,
+            # PR #37503) uses torch::headeronly::CppTypeToScalarType, which
+            # isn't in NGC PyTorch 25.12. v0.19.0 predates that migration and
+            # is the version recommended by the QuantTrio gemma-4 AWQ model card.
+            PRESET_VLLM_VERSION="v0.19.0"
+            PRESET_TRANSFORMERS=">=5.5.0"
+            PRESET_NOTES="Gemma 4 31B dense, multimodal text+image, AWQ recommended (FP8 broken in vLLM)"
+            ;;
         glm47|GLM47|glm-4.7|GLM-4.7)
             MODEL_ID="glm47"
             PRESET_VLLM_VERSION="main"
             PRESET_TRANSFORMERS=">=5.0.0rc0"
             PRESET_NOTES="GLM-4.7 requires MTP speculative decoding, tool/reasoning parsers"
+            ;;
+        kimi|KIMI|kimi26|kimi-k2.6|kimi_k26|Kimi-K2.6)
+            MODEL_ID="kimi"
+            # Kimi K2.6 (Moonshot): 1T-param MoE (32B active), MLA attention,
+            # multimodal (MoonViT). The base repo moonshotai/Kimi-K2.6 ships
+            # native int4 (compressed-tensors, ~640GB) — there is no separate
+            # -AWQ repo. Targets 8 GPUs across 2 nodes on Olivia (TP=4 + PP=2),
+            # like glm51. Architecture KimiK25ForConditionalGeneration is
+            # custom_code. vLLM 0.19.1 is the manually-verified stable release
+            # per Moonshot's deploy guide; newer support is nightly-only.
+            PRESET_VLLM_VERSION="v0.19.1"
+            # Model card lists transformers >=4.57.1,<5.0.0 for STANDALONE HF use.
+            # But vLLM serves Kimi via its NATIVE kimi_k25.py (only imports
+            # BatchFeature), so transformers 5 works under vLLM — required for the
+            # vLLM 0.21+ MQ Ray executor that fixes the multi-node PP compiled-DAG
+            # wedge (ray#58426). Overridable via PRESET_TRANSFORMERS env for the
+            # 0.21 build experiment (PRESET_TRANSFORMERS='>=5').
+            PRESET_TRANSFORMERS="${PRESET_TRANSFORMERS:->=4.57.1,<5.0.0}"
+            PRESET_NOTES="Kimi K2.6 (1T MoE, MLA, multimodal): native int4, multi-node TP=4 + PP=2, kimi_k2 parser"
             ;;
         devstral|mistral|Devstral|Mistral)
             MODEL_ID="devstral"
@@ -457,14 +499,34 @@ else
     SING_OPTS="--nv --writable"
 fi
 
-# Export preset values for use inside container
+# Run the build in a PRIVATE IPC namespace (--ipc). On these GH200 nodes the
+# shared host IPC namespace has an exhausted/clobbered SysV semaphore space, so
+# parallel (MAX_JOBS>1) compiles die a few ninja steps into the vLLM kernel build
+# with `semop(1): encountered an error: Invalid argument` (NOT memory — observed
+# at ~58 GB). A private IPC namespace gives the build a fresh SysV semaphore space
+# so the default MAX_JOBS=8 builds clean (verified). Serial MAX_JOBS=1 also avoids
+# it but is far slower. Default ON; set BUILD_IPC=0 to disable (e.g. on a future
+# node/Apptainer that lacks --ipc, or once the host IPC space is fixed).
+if [[ "${BUILD_IPC:-1}" == "1" ]]; then
+    SING_OPTS="${SING_OPTS} --ipc"
+    echo "BUILD_IPC -> using a private IPC namespace (--ipc) for the build"
+fi
+
+# Export preset values for use inside the container.
+# PRESET_TRANSFORMERS is forwarded via the SINGULARITYENV_/APPTAINERENV_ prefix
+# rather than `singularity exec --env`: that flag splits a value on commas (and
+# this Apptainer build does NOT honor backslash-escaping them), which mangles a
+# pip range like ">=4.57.1,<5.0.0" (Kimi needs transformers <5.0.0) into a
+# malformed second entry and aborts Phase 3. The prefix mechanism passes the
+# value into the container env verbatim, with no comma parsing.
+export SINGULARITYENV_PRESET_TRANSFORMERS="${PRESET_TRANSFORMERS}"
+export APPTAINERENV_PRESET_TRANSFORMERS="${PRESET_TRANSFORMERS}"
 export PRESET_TRANSFORMERS="${PRESET_TRANSFORMERS}"
 export VLLM_VERSION="${VLLM_VERSION}"
 export VLLM_PATCHES="${VLLM_PATCHES}"
 export DEEPGEMM_REF="${DEEPGEMM_REF}"
 
 singularity exec ${SING_OPTS} \
-    --env "PRESET_TRANSFORMERS=${PRESET_TRANSFORMERS}" \
     --env "VLLM_VERSION=${VLLM_VERSION}" \
     --env "VLLM_PATCHES=${VLLM_PATCHES}" \
     --env "DEEPGEMM_REF=${DEEPGEMM_REF}" \
@@ -509,30 +571,12 @@ fi
 cd vllm
 echo "vLLM source cloned: $(git describe --tags --always 2>/dev/null || echo 'unknown')"
 
-# Safety check: if we're pinning a version older than the libtorch-stable
-# migration, the csrc/libtorch_stable directory won't exist and the disable
-# patch below is a no-op (which is what we want). If the directory DOES exist
-# on a pinned tag, our patch will silently drop ops like
-# `per_token_group_fp8_quant` that runtime code (deepseek_v2.py,
-# fp8_utils.py) unconditionally calls — producing a forward-pass AttributeError
-# later. Warn loudly so the operator can decide whether to proceed.
-if [[ -d "csrc/libtorch_stable" && "$VLLM_VERSION" != "main" ]]; then
-    echo ""
-    echo "================================================================"
-    echo "WARNING: vLLM ${VLLM_VERSION} ships csrc/libtorch_stable/."
-    echo "         Our NGC 25.12 patch disables that extension, which drops"
-    echo "         ops like per_token_group_fp8_quant (used by DeepSeek/GLM-"
-    echo "         family models at forward-pass time). The build will"
-    echo "         succeed but the resulting container will fail to load"
-    echo "         models that depend on those ops."
-    echo ""
-    echo "         Pin an older VLLM_VERSION that predates the stable-ABI"
-    echo "         migration, or switch to a build strategy that compiles"
-    echo "         _C_stable_libtorch (requires a newer NGC PyTorch with"
-    echo "         TORCH_BOX)."
-    echo "================================================================"
-    echo ""
-fi
+# vLLM's csrc/libtorch_stable holds the stable-ABI ops — including
+# per_token_group_fp8_quant, which DeepSeek/GLM/Kimi-family models call at
+# forward time. On NGC 26.01+ (we pin 26.03) this target compiles cleanly, so we
+# no longer disable it (see the NOTE below for the history). If you override
+# NGC_PYTORCH_TAG to an older tag lacking TORCH_BOX, _C_stable_libtorch fails to
+# COMPILE — a loud build error, not a silent op drop — so bump to NGC 26.03+.
 
 # NOTE: we previously patched out `_C_stable_libtorch` here because NGC 25.12's
 # PyTorch alpha (2025-11-04) predated the upstream TORCH_BOX macro (2025-11-11,
@@ -611,6 +655,214 @@ else:
     print(f"{fp} not found (OK, may be a newer vLLM layout)")
 PYPATCH_FXREPR
 
+# Patch: disable the DeepSeek-V3 "min-latency" fused QKV-A GEMM so its custom op
+# is never emitted into the graph.
+# vllm/model_executor/models/deepseek_v2.py wraps the low-batch dsv3_fused_a_gemm
+# kernel in a custom op `torch.ops.vllm.min_latency_fused_qkv_a_proj` (used by
+# DeepSeek/Kimi-family MLA models, incl. Kimi K2.6, at batch <= 16, i.e. decode).
+# It registers a fake/meta via direct_register_custom_op(..., fake_impl=...), but
+# under NGC's torch alpha that fake never lands in the FakeTensor dispatch table,
+# so torch.compile's profile_run dies with:
+#   TypeError: Multiple dispatch failed for
+#     'torch._ops.vllm.min_latency_fused_qkv_a_proj.default';
+#     all __torch_dispatch__ handlers returned NotImplemented
+# That crash is independent of cudagraph_mode (it happens before capture), so it
+# blocks CUDAGraph entirely and forces eager (~5x slower decode). Forcing
+# `_use_min_latency_gemm = False` makes the layer fall back to its parent
+# MergedColumnParallelLinear.forward — the SAME merged matmul, identical output,
+# only without the low-batch kernel micro-opt — which torch.compile traces fine.
+# This is the fix that unblocks CUDAGraph for Kimi K2.6 on GH200. Revisit when
+# NGC ships a torch where the custom-op fake registration works (then this whole
+# block can go and the kernel micro-opt comes back). See the proposed plan
+# plans/proposed/kimi_serving_perf.md for the full investigation.
+echo "Patching vllm/model_executor/models/deepseek_v2.py: disable dsv3 min-latency gemm..."
+python3 << 'PYPATCH_MINLATENCY'
+import re
+from pathlib import Path
+fp = Path('vllm/model_executor/models/deepseek_v2.py')
+if not fp.exists():
+    print(f"{fp} not found (OK, may be a newer vLLM layout)")
+else:
+    src = fp.read_text()
+    if 'NGC-torch patch' in src and '_use_min_latency_gemm = (False and' in src:
+        print("Already patched (OK)")
+    else:
+        # Match only the original assignment: `(` immediately followed by newline.
+        # The patched form is `(False and  # ...`, so re-runs find 0 matches.
+        new_src, n = re.subn(
+            r'self\._use_min_latency_gemm = \(\n',
+            'self._use_min_latency_gemm = (False and  # NGC-torch patch: '
+            'no working fake for the dsv3 min-latency custom op under NGC torch '
+            'alpha; force off so torch.compile/CUDAGraph can trace MLA decode.\n',
+            src,
+        )
+        if n == 1:
+            fp.write_text(new_src)
+            print("Patched _use_min_latency_gemm -> forced False (min-latency gemm disabled)")
+        elif n == 0:
+            print("No `_use_min_latency_gemm = (` assignment found "
+                  "(OK, may be a newer vLLM that fixed this)")
+        else:
+            print(f"WARNING: expected 1 match, found {n} — patch skipped, inspect manually")
+PYPATCH_MINLATENCY
+
+# Patch: make the Kimi K2 reasoning parser actually count reasoning tokens.
+# vLLM's base ReasoningParser.count_reasoning_tokens() returns 0 unless a parser
+# opts in, and kimi_k2 never overrides it -> usage reasoning_tokens is always 0.
+# Kimi K2/K2.7 also typically omit the <think> start token (reasoning begins at
+# the start, ended by </think> or a tool-call section), so a naive start/end
+# depth counter would also be 0. Mirror the parser's own extract_reasoning().
+echo "Patching vllm/reasoning/kimi_k2_reasoning_parser.py: count reasoning tokens..."
+python3 << 'PYPATCH_REASONING_COUNT'
+from pathlib import Path
+fp = Path('vllm/reasoning/kimi_k2_reasoning_parser.py')
+if not fp.exists():
+    print(f"{fp} not found (OK, may be a different vLLM layout)")
+else:
+    src = fp.read_text()
+    if 'def count_reasoning_tokens' in src:
+        print("Already patched (OK)")
+    else:
+        method = (
+            "    def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:\n"
+            "        # Olivia patch: base default returns 0; Kimi K2 omits the\n"
+            "        # <think> start token, so count tokens before the first\n"
+            "        # </think>/tool-call-section marker, dropping a leading\n"
+            "        # <think>. Mirrors extract_reasoning.\n"
+            "        if self._identity_parser is not None:\n"
+            "            return 0\n"
+            "        end_idx = None\n"
+            "        for i, t in enumerate(token_ids):\n"
+            "            if t == self._end_token_id or (\n"
+            "                self._tool_section_start_token_id is not None\n"
+            "                and t == self._tool_section_start_token_id\n"
+            "            ):\n"
+            "                end_idx = i\n"
+            "                break\n"
+            "        ids = list(token_ids)\n"
+            "        region = ids[:end_idx] if end_idx is not None else ids\n"
+            "        return sum(1 for t in region if t != self._start_token_id)\n\n"
+        )
+        marker = "    def extract_reasoning(\n"
+        if marker in src:
+            fp.write_text(src.replace(marker, method + marker, 1))
+            print("Patched: added count_reasoning_tokens override")
+        else:
+            print("extract_reasoning marker not found (OK, different vLLM)")
+PYPATCH_REASONING_COUNT
+
+# Patch: surface reasoning_tokens on /v1/chat/completions usage. vLLM 0.21 only
+# reports it on /v1/responses; chat/completions has no completion_tokens_details
+# at all. Add the type+field to UsageInfo and populate it (via the reasoning
+# parser's count_reasoning_tokens) in both the non-streaming and streaming paths.
+echo "Patching chat/completions usage for reasoning_tokens (protocol + serving)..."
+python3 << 'PYPATCH_CHAT_REASONING'
+from pathlib import Path
+proto = Path('vllm/entrypoints/openai/engine/protocol.py')
+if not proto.exists():
+    print(f"{proto} not found (OK, different vLLM layout)")
+else:
+    p = proto.read_text()
+    if 'class CompletionTokenUsageInfo' in p:
+        print("protocol already patched (OK)")
+    else:
+        old = (
+            "class UsageInfo(OpenAIBaseModel):\n"
+            "    prompt_tokens: int = 0\n"
+            "    total_tokens: int = 0\n"
+            "    completion_tokens: int | None = 0\n"
+            "    prompt_tokens_details: PromptTokenUsageInfo | None = None\n"
+        )
+        new = (
+            "class CompletionTokenUsageInfo(OpenAIBaseModel):\n"
+            "    reasoning_tokens: int | None = None\n\n\n"
+            "class UsageInfo(OpenAIBaseModel):\n"
+            "    prompt_tokens: int = 0\n"
+            "    total_tokens: int = 0\n"
+            "    completion_tokens: int | None = 0\n"
+            "    prompt_tokens_details: PromptTokenUsageInfo | None = None\n"
+            "    completion_tokens_details: CompletionTokenUsageInfo | None = None\n"
+        )
+        if old in p:
+            proto.write_text(p.replace(old, new, 1))
+            print("protocol patched")
+        else:
+            print("protocol UsageInfo block not found (OK, different vLLM)")
+
+serv = Path('vllm/entrypoints/openai/chat_completion/serving.py')
+if not serv.exists():
+    print(f"{serv} not found (OK, different vLLM layout)")
+else:
+    s = serv.read_text()
+    orig = s
+    if 'CompletionTokenUsageInfo' not in s and '    PromptTokenUsageInfo,\n' in s:
+        s = s.replace('    PromptTokenUsageInfo,\n',
+                      '    CompletionTokenUsageInfo,\n    PromptTokenUsageInfo,\n', 1)
+    ns_old = (
+        "        usage = UsageInfo(\n"
+        "            prompt_tokens=num_prompt_tokens,\n"
+        "            completion_tokens=num_generated_tokens,\n"
+        "            total_tokens=num_prompt_tokens + num_generated_tokens,\n"
+        "        )\n"
+        "        if self.enable_prompt_tokens_details and final_res.num_cached_tokens:\n"
+    )
+    ns_new = (
+        "        usage = UsageInfo(\n"
+        "            prompt_tokens=num_prompt_tokens,\n"
+        "            completion_tokens=num_generated_tokens,\n"
+        "            total_tokens=num_prompt_tokens + num_generated_tokens,\n"
+        "        )\n"
+        "        if reasoning_parser is not None:\n"
+        "            _reasoning_toks = sum(\n"
+        "                reasoning_parser.count_reasoning_tokens(output.token_ids)\n"
+        "                for output in final_res.outputs\n"
+        "            )\n"
+        "            if _reasoning_toks:\n"
+        "                usage.completion_tokens_details = CompletionTokenUsageInfo(\n"
+        "                    reasoning_tokens=_reasoning_toks\n"
+        "                )\n"
+        "        if self.enable_prompt_tokens_details and final_res.num_cached_tokens:\n"
+    )
+    if 'usage.completion_tokens_details' not in s and ns_old in s:
+        s = s.replace(ns_old, ns_new, 1)
+    st_old = (
+        "                final_usage = UsageInfo(\n"
+        "                    prompt_tokens=num_prompt_tokens,\n"
+        "                    completion_tokens=completion_tokens,\n"
+        "                    total_tokens=num_prompt_tokens + completion_tokens,\n"
+        "                )\n"
+        "                if self.enable_prompt_tokens_details and num_cached_tokens:\n"
+    )
+    st_new = (
+        "                final_usage = UsageInfo(\n"
+        "                    prompt_tokens=num_prompt_tokens,\n"
+        "                    completion_tokens=completion_tokens,\n"
+        "                    total_tokens=num_prompt_tokens + completion_tokens,\n"
+        "                )\n"
+        "                if (\n"
+        "                    reasoning_parser is not None\n"
+        "                    and all_previous_token_ids is not None\n"
+        "                ):\n"
+        "                    _reasoning_toks = sum(\n"
+        "                        reasoning_parser.count_reasoning_tokens(ids)\n"
+        "                        for ids in all_previous_token_ids\n"
+        "                    )\n"
+        "                    if _reasoning_toks:\n"
+        "                        final_usage.completion_tokens_details = (\n"
+        "                            CompletionTokenUsageInfo(\n"
+        "                                reasoning_tokens=_reasoning_toks\n"
+        "                            )\n"
+        "                        )\n"
+        "                if self.enable_prompt_tokens_details and num_cached_tokens:\n"
+    )
+    if 'final_usage.completion_tokens_details' not in s and st_old in s:
+        s = s.replace(st_old, st_new, 1)
+    if s != orig:
+        serv.write_text(s)
+        print("serving patched")
+    else:
+        print("serving already patched or markers not found (OK)")
+PYPATCH_CHAT_REASONING
 # -----------------------------------------------------------------------------
 # Graft requested upstream vLLM PRs (patch-during-build)
 # -----------------------------------------------------------------------------
@@ -953,8 +1205,12 @@ pip install --no-cache-dir \
     opencv-python-headless>=4.11.0 \
     pybase64 \
     setproctitle \
-    lark==1.2.2 \
-    2>&1 | tail -30 || true
+    lark==1.2.2
+# Do NOT mask failures here (previously this ended with '2>&1 | tail -30 || true',
+# which swallowed a fatal ResolutionImpossible and shipped a container missing
+# ray/transformers/compressed-tensors — it still passed 'import vllm' but could
+# not serve). set -euo pipefail is active, so a resolver failure now aborts the
+# build loudly. See the NGC-26.05 incident (2026-06-14).
 
 # compressed-tensors and xgrammar are torch-dependent, so they live OUTSIDE the
 # bulk install above. On newer NGC bases (e.g. 26.05's torch 2.12.0a0 pre-

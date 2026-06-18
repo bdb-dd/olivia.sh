@@ -62,6 +62,7 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 ./olivia.sh build glm51_v19    # Build GLM-5.1 container on vLLM v0.19.0 (alias: glm51)
 ./olivia.sh build glm51_v20    # Build GLM-5.1 container on vLLM v0.20.0 (quarantined — same wedge)
 ./olivia.sh build glm47        # Build GLM-4.7 container
+./olivia.sh build kimi         # Build Kimi K2.6 container on vLLM v0.19.1
 ./olivia.sh build devstral     # Build Devstral container
 ./olivia.sh build llama        # Build Llama container
 
@@ -85,6 +86,7 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 ./olivia.sh server start glm51_v19   # Start GLM-5.1 server on vLLM v0.19.0 (alias: glm51; 8 GPUs across 2 nodes, TP=4 + PP=2)
 ./olivia.sh server start glm51_v20   # Start GLM-5.1 server on vLLM v0.20.0 (quarantined — same wedge)
 ./olivia.sh server start glm47       # Start GLM-4.7 server
+./olivia.sh server start kimi        # Start Kimi K2.6 server (8 GPUs across 2 nodes, TP=4 + PP=2)
 ./olivia.sh server start devstral    # Start Devstral server
 ./olivia.sh server start llama       # Start Llama server
 ./olivia.sh server start qwen        # Start Qwen server
@@ -128,6 +130,7 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 | `glm51_v20` | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | Same as glm51_v19 but on vLLM v0.20.0 + RayExecutorV2, container index 2. **Quarantined** — same wedge as v0.19.0; kept for diagnostic work only. |
 | `glm52` | `RedHatAI/GLM-5.2-FP8` | 12 (3 nodes × 4) | TP=4 + PP=3. Block-FP8 (~755 GB) — does **not** fit 8 GPUs, hence 3 nodes. **Needs vLLM main + PR#45895** (new skip-topk DSA indexer); not in any release. Same multi-node PP wedge as glm51 → proxy serialization. fp8 KV cache + DeepGEMM (`VLLM_DEEP_GEMM_WARMUP=skip`). |
 | `glm47` | `QuantTrio/GLM-4.7-AWQ` | 4 | TP=4, MTP speculative |
+| `kimi` | `moonshotai/Kimi-K2.6` | 8 (2 nodes × 4) | TP=4 + PP=2, native int4, MLA, multimodal, vLLM v0.19.1 |
 | `devstral` | `mistralai/Devstral-2-123B-Instruct-2512` | 4 | TP=4 |
 | `llama` | `meta-llama/Llama-3.3-70B-Instruct` | 4 | TP=4 |
 | `qwen` | `Qwen/Qwen2.5-72B-Instruct` | 4 | TP=4 |
@@ -159,8 +162,36 @@ Mechanism notes:
 ```bash
 ./olivia.sh tunnel             # Show tunnel status
 ./olivia.sh tunnel up          # Open tunnel to vLLM server
-./olivia.sh tunnel down        # Close tunnel
+./olivia.sh tunnel refresh     # Re-point tunnel after the job moved nodes
+./olivia.sh tunnel down        # Close tunnel (also stops the login-node relay)
+./olivia.sh reconnect          # Re-auth after a drop and restore the tunnel
 ```
+
+**Connection durability (mitigating 2FA fragility):**
+Olivia requires password + OTP on every *new* interactive SSH connection (SSH
+keys do not bypass 2FA). ControlMaster pays that 2FA once and multiplexes; the
+key to avoiding re-auth is keeping the master alive. The master is opened
+detached (`ssh -f -N -M`) with a long `ControlPersist` and keepalives, so a
+single 2FA covers a long idle window and survives the terminal closing.
+
+- `SSH_CONTROL_PERSIST` (default `12h`) — how long the master persists when idle
+- `SSH_ALIVE_INTERVAL` / `SSH_ALIVE_COUNT` — keepalive to prevent NAT/idle drops
+- After a genuine drop, `./olivia.sh reconnect` re-auths (one OTP) and restores
+  any recorded tunnel. Unattended auto-reconnect (autossh) is intentionally not
+  used because a fresh connection needs an interactive OTP.
+
+**Login-node follow-the-node relay (opt-in: `--login-proxy` / `LOGIN_PROXY=1`):**
+Normally the local forward targets the GPU node directly, so a job moving to a
+new node requires re-pointing the forward. With `--login-proxy`, the laptop
+forwards to a *fixed* login-node port and a small user-space Python relay on the
+login node (`~/.olivia/relay.py`, managed by olivia.sh) forwards to the current
+GPU node. Node moves then only re-point the relay; the local forward is never
+disturbed. `LOGIN_PROXY_PORT` defaults to `18000`.
+
+> ⚠️ This runs a long-lived process on the *shared* login node — check the NRIS
+> acceptable-use policy before relying on it. Validate on the cluster: it
+> assumes the login node can reach `<gpu-node>:8000` directly (the same path the
+> direct forward already uses) and that `python3` is on the login node.
 
 #### Global Options
 ```bash
@@ -242,6 +273,7 @@ The build script includes predefined configurations for common models. Run witho
 | `glm51_v20` | GLM-5.1 on RayExecutorV2 — **quarantined**, same multi-node PP wedge as v0.19.0 | v0.20.0 | >=5.4.0 |
 | `glm52` | GLM-5.2 (744B / 40B active) MoE+DSA, successor to 5.1 — FP8. Builds vLLM main + auto-grafts PR#45895 (`VLLM_PATCHES`); not in any release | main + PR#45895 | >=5.4.0 |
 | `glm47` | GLM-4.7 (358B) flagship model | main | >=5.0.0rc0 |
+| `kimi` | Kimi K2.6 (1T / 32B active) MoE + MLA, multimodal | v0.19.1 | >=4.57.1,<5.0.0 |
 | `devstral` | Devstral/Mistral models | main | >=4.45.0 |
 | `llama` | Llama 3.x models | main | >=4.45.0 |
 | `qwen` | Qwen 2.5 models | main | >=4.45.0 |
@@ -295,6 +327,16 @@ Runs vLLM server with GH200-optimized settings:
 - `SERVED_MODEL_NAME`: Custom model name for API (default: empty, uses model ID)
 - `MTP_SPECULATIVE_TOKENS`: MTP speculative tokens (default: `3`)
 - GLM-5.1 additionally passes `--trust-remote-code` and flips the MoE flashinfer kernel from `VLLM_USE_FLASHINFER_MOE_FP8=1` to `VLLM_USE_FLASHINFER_MOE_FP16=1` (matches the QuantTrio GLM-5-AWQ recipe)
+
+**Kimi K2.6 Specific (auto-detected when MODEL contains "Kimi-K2"):**
+- `KIMI_TOOL_PARSER`: Tool call parser (default: `kimi_k2`)
+- `KIMI_REASONING_PARSER`: Reasoning parser (default: `kimi_k2`; set to empty to omit, e.g. instant mode). Thinking mode is on by default, so this is normally required.
+- Kimi K2.6 also passes `--trust-remote-code` (custom `KimiK25ForConditionalGeneration`) and `--mm-encoder-tp-mode data` (MoonViT vision encoder replicated across the TP group), auto-selects an MLA attention backend, and enables expert parallel. No `--quantization` flag — the native int4 is `compressed-tensors`, which vLLM auto-detects.
+- **CUDAGraph (decode speedup) — not available; Kimi runs eager (`CUDAGRAPH_MODE=NONE`, the default).** CUDAGraph *capture* is unrecoverable on the deployed vLLM 0.21 + NGC-torch GH200 stack and the recovery campaign is **exhausted** (2026-06-15); both K2.6 (`:8010`) and K2.7 (`:8020`) on `vllm-kimi-4-sandbox` run eager and stable. Eager single-stream decode is ~17 tok/s (overhead-bound), but per-stream stays flat under load and aggregate scales near-linearly (~267 tok/s at 16-way, ~600 at 32-way, ~830 at 48-way in production), so batched/multi-user throughput is good. **Two distinct failures — do not conflate them:**
+    - *profile_run dispatch crash — FIXED (still required).* `torch.compile` profile_run aborts *before* capture with `Multiple dispatch failed for 'torch._ops.vllm.min_latency_fused_qkv_a_proj' … NotImplemented`: that MLA op has a registered fake, but under NGC's torch alpha it never lands in the FakeTensor dispatch table. `build_vllm_gh200.sh` (`PYPATCH_MINLATENCY`) forces `_use_min_latency_gemm=False` in `deepseek_v2.py`, so the op is never emitted and the layer falls back to `MergedColumnParallelLinear` (identical math). Baked into the build; it only lets compile *reach* capture — it is **not** the capture bug.
+    - *CUDAGraph capture IMA — UNFIXED (the blocker).* With profile_run fixed, capture itself dies with `CUDA error: an illegal memory access` (`cudaErrorIllegalAddress`) inside a **miscompiled inductor kernel** (`_capture_cudagraphs` → `torch/_inductor/runtime/triton_heuristics.py:autotune_to_one_config`). It is **mode-independent** (`PIECEWISE` and `FULL_AND_PIECEWISE` both IMA) and both escape axes are exhausted: config (`combo_kernels=false`, `use_inductor_graph_partition`, `max_cudagraph_capture_size`) and torch (rebuilt on NGC 26.05 with a newer inductor — capture reached 30/51 graphs then the identical IMA; 26.05 separately breaks the FastAPI server). Remaining low-priority options: an upstream bug report, or a non-NGC stable torch (forfeits NGC's tuned GH200 kernels).
+
+  Do **not** set `CUDAGRAPH_MODE=PIECEWISE`/`FULL_AND_PIECEWISE` on the current containers — capture will crash. (Historical note: PIECEWISE *did* capture and run ~34 tok/s on the earlier vLLM **0.19.1** container; moving to 0.21 for reasoning_tokens + K2.7 lost it to the capture IMA above.) Separately, idle multi-node servers can die on an idle→active NCCL abort regardless of mode — keep a keepalive pinging during idle windows (`anthropic_proxy.py --keepalive-interval`). Full account: `plans/proposed/kimi_k27_results.md`; superseded history: `plans/proposed/kimi_serving_perf.md`.
 
 **Multi-node Distributed Inference (GLM-5.1):**
 - `NUM_NODES`: Number of nodes to use (default: `1`). When `>1`, `run_vllm_server.sh` bootstraps a Ray cluster via `srun`, starts head on node 0, workers on remaining nodes, waits for the cluster to register the expected GPU count, then launches vLLM with `--distributed-executor-backend ray`
@@ -481,6 +523,49 @@ HF_HOME=/cluster/work/projects/nn10104k/huggingface ./olivia.sh server start glm
 ./olivia.sh cluster
 ```
 
+### Kimi K2.6 Quantization Options
+
+Kimi K2.6 (Moonshot) is a 1T-parameter MoE (~32B active) with 384 experts, MLA attention, a 262K context window, and a native MoonViT vision encoder (multimodal). It uses the same 2-node shape as glm51 on Olivia: it does **not** fit on a single 4-GPU node.
+
+| Model | Size | Olivia Compatible | Notes |
+|-------|------|-------------------|-------|
+| `moonshotai/Kimi-K2.6` | ~640 GB | **Yes (Recommended)** | Moonshot's **native int4** (compressed-tensors); fits on 8×GH200. This base repo *is* the int4 checkpoint. |
+| `nvidia/Kimi-K2.6-NVFP4` | ~smaller | **No** | Requires Blackwell FP4 tensor cores |
+| `amd/Kimi-K2.6-MXFP4` | ~smaller | **No** | AMD MXFP4 (ROCm) |
+| `unsloth/Kimi-K2.6-GGUF` | varies | **No** | GGUF is for llama.cpp, not vLLM |
+| `moonshotai/Kimi-K2.6-AWQ` | — | **Does not exist** | There is no AWQ repo — use the native-int4 base repo above. |
+
+**Important:**
+- The model is the base repo `moonshotai/Kimi-K2.6` — its native int4 is `quant_method: compressed-tensors`, which vLLM auto-detects, so **no `--quantization` flag** is passed.
+- **transformers must be `>=4.57.1,<5.0.0`** (a hard requirement from the model card, and incompatible with glm51's `>=5.4.0` — which is why Kimi gets its own container). vLLM **v0.19.1** is the manually-verified stable release; newer K2.6 support is nightly-only.
+- Architecture `KimiK25ForConditionalGeneration` ships as `custom_code`, so `--trust-remote-code` is required.
+- Per Moonshot's deploy guide the server auto-passes `--tool-call-parser kimi_k2 --reasoning-parser kimi_k2 --mm-encoder-tp-mode data --trust-remote-code`. **Thinking mode is on by default**, so the reasoning parser is required; for instant mode pass `chat_template_kwargs={"thinking": false}` (recommended `temperature` 1.0 thinking / 0.6 instant, `top_p` 0.95).
+- The ~640 GB weights download from HF at **serve** time, so the cluster needs `HF_TOKEN` set then (not for the build).
+
+### Kimi K2.6 Usage
+
+```bash
+# Build Kimi K2.6 container (vLLM v0.19.1, transformers >=4.57.1,<5.0.0)
+./olivia.sh build kimi
+
+# Start Kimi K2.6 server (preset auto-allocates 2 nodes × 4 GPUs, TP=4 + PP=2)
+./olivia.sh server start kimi
+./olivia.sh server watch
+
+# Override context length (native 262K; default is 131072)
+# or direct: MAX_MODEL_LEN=262144 ... run_vllm_server.sh
+
+# Force instant mode (no reasoning extraction) by dropping the reasoning parser
+KIMI_REASONING_PARSER="" CONTAINER=vllm-kimi-4-sandbox MODEL=moonshotai/Kimi-K2.6 \
+    NUM_NODES=2 TP_SIZE=4 PP_SIZE=2 ./run_vllm_server.sh
+```
+
+**Memory requirements for Kimi K2.6 (1T params, ~32B active):**
+| Quantization | Model Size | 8×GH200 (768 GB HBM) | Notes |
+|--------------|------------|----------------------|-------|
+| Native int4 | ~640 GB | ~50–120 GB free (@0.90 util) | Recommended; MLA keeps KV cache compact |
+| BF16 | ~2 TB | Won't fit | — |
+
 ### Batching Proxy for SSH Tunnels
 
 When accessing vLLM over SSH tunnels, streaming responses can be slow due to per-token network overhead. The batching proxy aggregates multiple tokens into single SSE events, reducing network round-trips by ~70%.
@@ -572,6 +657,7 @@ Optionally chain through the batching proxy for SSE compaction over the tunnel: 
 Naming examples:
 - `vllm-glm51-1-sandbox` - GLM-5.1 build #1
 - `vllm-glm47-1-sandbox` - GLM-4.7 build #1
+- `vllm-kimi-1-sandbox` - Kimi K2.6 build #1
 - `vllm-devstral-1-sandbox` - Devstral build #1
 - `vllm-generic-1-sandbox` - Generic build #1
 

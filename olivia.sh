@@ -51,8 +51,29 @@ CHAT_SCRIPT="${SCRIPT_DIR}/chat_devstral.py"
 SSH_CONTROL_DIR="${HOME}/.ssh/controls"
 SSH_CONTROL_SOCKET="${SSH_CONTROL_DIR}/olivia-${REMOTE_USER}@${REMOTE_HOST}"
 
+# SSH connection durability
+# Olivia requires password + OTP on every *new* interactive SSH connection
+# (keys do not bypass 2FA). ControlMaster lets us pay that 2FA once and then
+# multiplex; keeping the master alive as long as possible is what avoids
+# re-authenticating. A long ControlPersist + keepalives prevents idle/NAT drops.
+# Unattended auto-reconnect (autossh) is intentionally NOT used: a fresh
+# connection needs an interactive OTP, which cannot be supplied in the
+# background. Use `./olivia.sh reconnect` to re-establish after a real drop.
+SSH_CONTROL_PERSIST="${SSH_CONTROL_PERSIST:-12h}"
+SSH_ALIVE_INTERVAL="${SSH_ALIVE_INTERVAL:-30}"
+SSH_ALIVE_COUNT="${SSH_ALIVE_COUNT:-3}"
+
+# Optional login-node relay (opt-in via LOGIN_PROXY=1 or `--login-proxy`).
+# The laptop forwards to a FIXED login-node port and a lightweight user-space
+# relay on the login node follows the GPU node across job restarts, so node
+# churn never tears down the local forward. NOTE: this runs a long-lived
+# process on the shared login node - check the NRIS acceptable-use policy.
+LOGIN_PROXY="${LOGIN_PROXY:-0}"
+LOGIN_PROXY_PORT="${LOGIN_PROXY_PORT:-18000}"
+
 # State files
 TUNNEL_NODE_FILE="/tmp/olivia-tunnel-${LOCAL_PORT}.node"
+TUNNEL_TARGET_FILE="/tmp/olivia-tunnel-${LOCAL_PORT}.target"
 
 # =============================================================================
 # Helper functions
@@ -121,10 +142,21 @@ notify() {
     fi
 }
 
+# Re-point LOCAL_PORT and the per-port state files together (keep them in sync).
+set_local_port() {
+    LOCAL_PORT="$1"
+    TUNNEL_NODE_FILE="/tmp/olivia-tunnel-${LOCAL_PORT}.node"
+    TUNNEL_TARGET_FILE="/tmp/olivia-tunnel-${LOCAL_PORT}.target"
+}
+
 # SSH helpers
 ssh_opts() {
-    echo -o "ControlMaster=auto" -o "ControlPath=${SSH_CONTROL_SOCKET}" -o "ControlPersist=3600" \
-         -o "ServerAliveInterval=30" -o "ServerAliveCountMax=10"
+    echo -o "ControlMaster=auto" \
+         -o "ControlPath=${SSH_CONTROL_SOCKET}" \
+         -o "ControlPersist=${SSH_CONTROL_PERSIST}" \
+         -o "ServerAliveInterval=${SSH_ALIVE_INTERVAL}" \
+         -o "ServerAliveCountMax=${SSH_ALIVE_COUNT}" \
+         -o "TCPKeepAlive=yes"
 }
 
 ssh_run() {
@@ -154,13 +186,18 @@ ensure_master_connection() {
 
     info "Establishing SSH connection to ${REMOTE_HOST}..."
     echo "    (You may be prompted for 2FA)" >&2
+    echo "    Connection will persist for ${SSH_CONTROL_PERSIST} of idle time" >&2
     echo "" >&2
 
+    # -f -N -M with ControlPersist leaves a detached master that survives this
+    # terminal closing, so a single 2FA covers the whole persist window.
     ssh -f -N -M \
         -o "ControlPath=${SSH_CONTROL_SOCKET}" \
-        -o "ControlPersist=3600" \
-        -o "ServerAliveInterval=30" \
-        -o "ServerAliveCountMax=10" \
+        -o "ControlPersist=${SSH_CONTROL_PERSIST}" \
+        -o "ServerAliveInterval=${SSH_ALIVE_INTERVAL}" \
+        -o "ServerAliveCountMax=${SSH_ALIVE_COUNT}" \
+        -o "TCPKeepAlive=yes" \
+        -o "ExitOnForwardFailure=yes" \
         "${REMOTE_USER}@${REMOTE_HOST}"
 
     sleep 1
@@ -177,6 +214,137 @@ close_master_connection() {
     if is_master_alive; then
         ssh -o "ControlPath=${SSH_CONTROL_SOCKET}" -O exit "${REMOTE_USER}@${REMOTE_HOST}" 2>/dev/null || true
     fi
+}
+
+# =============================================================================
+# Login-node relay (opt-in: LOGIN_PROXY=1)
+# =============================================================================
+# A tiny user-space TCP relay on the login node that listens on a fixed port
+# and forwards to the CURRENT GPU node:REMOTE_PORT. The laptop forward then
+# targets the stable login-node port, so when the SLURM job moves to a new node
+# we only re-point the relay (cheap, over the existing master) instead of
+# tearing down the local forward. The login node can already reach the compute
+# node's port directly over the internal network (same path the direct forward
+# uses), so no inner SSH hop is needed.
+
+# Deploy the relay script to the login node (idempotent, tiny).
+login_proxy_deploy() {
+    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+        'mkdir -p "$HOME/.olivia" && cat > "$HOME/.olivia/relay.py"' <<'PYEOF'
+import asyncio
+import sys
+
+
+async def _pipe(reader, writer):
+    try:
+        while True:
+            data = await reader.read(65536)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+async def _handle(local_reader, local_writer, host, port):
+    try:
+        remote_reader, remote_writer = await asyncio.open_connection(host, port)
+    except Exception:
+        local_writer.close()
+        return
+    await asyncio.gather(
+        _pipe(local_reader, remote_writer),
+        _pipe(remote_reader, local_writer),
+    )
+
+
+async def _main():
+    listen_port = int(sys.argv[1])
+    upstream_host = sys.argv[2]
+    upstream_port = int(sys.argv[3])
+    server = await asyncio.start_server(
+        lambda r, w: _handle(r, w, upstream_host, upstream_port),
+        "127.0.0.1",
+        listen_port,
+    )
+    async with server:
+        await server.serve_forever()
+
+
+if __name__ == "__main__":
+    asyncio.run(_main())
+PYEOF
+}
+
+# Start or re-point the relay at the given GPU node.
+login_proxy_ensure() {
+    local gpu_node="$1"
+
+    if ! login_proxy_deploy; then
+        error "Failed to deploy login-node relay script"
+        return 1
+    fi
+
+    info "Pointing login-node relay (:${LOGIN_PROXY_PORT}) at ${gpu_node}:${REMOTE_PORT}..."
+
+    local out
+    if ! out=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" bash -s -- \
+        "${LOGIN_PROXY_PORT}" "${gpu_node}" "${REMOTE_PORT}" <<'REMOTE_EOF'
+set -u
+PORT="$1"; NODE="$2"; UPSTREAM="$3"
+DIR="$HOME/.olivia"
+PIDFILE="$DIR/relay-$PORT.pid"
+LOGFILE="$DIR/relay-$PORT.log"
+
+# Stop any existing relay on this port.
+if [ -f "$PIDFILE" ]; then
+    OLDPID=$(cat "$PIDFILE" 2>/dev/null || true)
+    if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
+        kill "$OLDPID" 2>/dev/null || true
+        sleep 1
+    fi
+fi
+
+nohup python3 "$DIR/relay.py" "$PORT" "$NODE" "$UPSTREAM" >"$LOGFILE" 2>&1 &
+echo $! > "$PIDFILE"
+sleep 1
+NEWPID=$(cat "$PIDFILE" 2>/dev/null || true)
+if [ -n "$NEWPID" ] && kill -0 "$NEWPID" 2>/dev/null; then
+    echo "relay-up pid=$NEWPID"
+else
+    echo "relay-failed"
+    tail -n 20 "$LOGFILE" 2>/dev/null || true
+    exit 1
+fi
+REMOTE_EOF
+    ); then
+        error "Login-node relay failed to start"
+        [[ -n "$out" ]] && echo "$out" >&2
+        return 1
+    fi
+
+    success "Login-node relay running (${out#relay-up })"
+    return 0
+}
+
+# Stop the relay on LOGIN_PROXY_PORT.
+login_proxy_stop() {
+    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" bash -s -- "${LOGIN_PROXY_PORT}" <<'REMOTE_EOF' 2>/dev/null || true
+PORT="$1"
+DIR="$HOME/.olivia"
+PIDFILE="$DIR/relay-$PORT.pid"
+if [ -f "$PIDFILE" ]; then
+    PID=$(cat "$PIDFILE" 2>/dev/null || true)
+    [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
+    rm -f "$PIDFILE"
+fi
+REMOTE_EOF
 }
 
 # =============================================================================
@@ -199,23 +367,40 @@ is_tunnel_alive() {
 }
 
 kill_tunnel() {
-    if [[ -f "${TUNNEL_NODE_FILE}" ]]; then
-        local node
-        node=$(cat "${TUNNEL_NODE_FILE}")
-        info "Canceling port forward to ${node}..."
-
-        ssh -O cancel \
-            -L "${LOCAL_PORT}:${node}:${REMOTE_PORT}" \
-            -o "ControlPath=${SSH_CONTROL_SOCKET}" \
-            "${REMOTE_USER}@${REMOTE_HOST}" 2>/dev/null || true
-
-        rm -f "${TUNNEL_NODE_FILE}"
-        success "Tunnel closed"
-        return 0
-    else
+    if [[ ! -f "${TUNNEL_NODE_FILE}" && ! -f "${TUNNEL_TARGET_FILE}" ]]; then
         warn "No active tunnel found"
         return 1
     fi
+
+    local node target
+    node=$(cat "${TUNNEL_NODE_FILE}" 2>/dev/null || echo "")
+    # The cancel spec must match the forward spec exactly; prefer the stored
+    # target (handles login-proxy mode), fall back to the direct node target.
+    target=$(cat "${TUNNEL_TARGET_FILE}" 2>/dev/null || echo "${node}:${REMOTE_PORT}")
+
+    info "Canceling port forward (localhost:${LOCAL_PORT} -> ${target})..."
+    ssh -O cancel \
+        -L "${LOCAL_PORT}:${target}" \
+        -o "ControlPath=${SSH_CONTROL_SOCKET}" \
+        "${REMOTE_USER}@${REMOTE_HOST}" 2>/dev/null || true
+
+    # A localhost:<port> target means we went via the login-node relay; stop it.
+    # Only reach out if the master is alive - otherwise ssh_run would open a
+    # fresh (2FA-prompting) connection just to tear down.
+    if [[ "$target" == localhost:* ]]; then
+        LOGIN_PROXY_PORT="${target#localhost:}"
+        if is_master_alive; then
+            login_proxy_stop
+        else
+            warn "Master connection down; login-node relay (:${LOGIN_PROXY_PORT}) may still be running"
+            echo "    It will be reaped on the next --login-proxy use, or stop it manually:" >&2
+            echo "    ssh ${REMOTE_HOST} 'kill \$(cat ~/.olivia/relay-${LOGIN_PROXY_PORT}.pid)'" >&2
+        fi
+    fi
+
+    rm -f "${TUNNEL_NODE_FILE}" "${TUNNEL_TARGET_FILE}"
+    success "Tunnel closed"
+    return 0
 }
 
 find_vllm_node() {
@@ -255,22 +440,54 @@ find_vllm_node() {
 setup_tunnel() {
     local gpu_node="$1"
 
-    if is_tunnel_alive; then
+    # The remote end of the local -L forward. In login-proxy mode this is a
+    # FIXED login-node port (so node moves don't disturb the local forward); in
+    # direct mode it is the GPU node itself.
+    local target
+    if [[ "${LOGIN_PROXY}" == "1" ]]; then
+        target="localhost:${LOGIN_PROXY_PORT}"
+    else
+        target="${gpu_node}:${REMOTE_PORT}"
+    fi
+
+    local stored_target=""
+    [[ -f "${TUNNEL_TARGET_FILE}" ]] && stored_target=$(cat "${TUNNEL_TARGET_FILE}")
+
+    if is_tunnel_alive && [[ "$stored_target" == "$target" ]]; then
         local existing_node
         existing_node=$(get_tunnel_node)
-        if [[ "$existing_node" == "$gpu_node" ]]; then
+        if [[ "${LOGIN_PROXY}" == "1" ]]; then
+            # Local forward already up to the fixed login port; just (re)point
+            # the relay at the current node - no local teardown needed.
+            login_proxy_ensure "$gpu_node" || return 1
+            echo "$gpu_node" > "${TUNNEL_NODE_FILE}"
+            if [[ "$existing_node" == "$gpu_node" ]]; then
+                success "Tunnel active; relay already on ${gpu_node}"
+            else
+                success "Tunnel active; relay repointed ${existing_node} -> ${gpu_node}"
+            fi
+            return 0
+        elif [[ "$existing_node" == "$gpu_node" ]]; then
             success "Tunnel already active to ${gpu_node} on port ${LOCAL_PORT}"
             return 0
         else
             warn "Tunnel to ${existing_node}, but job is now on ${gpu_node}"
             kill_tunnel
         fi
+    elif is_tunnel_alive; then
+        # Mode or target changed (e.g. switching to/from login-proxy); rebuild.
+        warn "Tunnel target changed; rebuilding"
+        kill_tunnel
     fi
 
-    info "Setting up tunnel: localhost:${LOCAL_PORT} -> ${gpu_node}:${REMOTE_PORT}"
+    if [[ "${LOGIN_PROXY}" == "1" ]]; then
+        login_proxy_ensure "$gpu_node" || return 1
+    fi
+
+    info "Setting up tunnel: localhost:${LOCAL_PORT} -> ${target}"
 
     if ! ssh -O forward \
-        -L "${LOCAL_PORT}:${gpu_node}:${REMOTE_PORT}" \
+        -L "${LOCAL_PORT}:${target}" \
         -o "ControlPath=${SSH_CONTROL_SOCKET}" \
         "${REMOTE_USER}@${REMOTE_HOST}" 2>&1; then
         error "Failed to set up tunnel"
@@ -284,9 +501,14 @@ setup_tunnel() {
     fi
 
     echo "$gpu_node" > "${TUNNEL_NODE_FILE}"
+    echo "$target" > "${TUNNEL_TARGET_FILE}"
     success "Tunnel established"
     echo "    Local:  localhost:${LOCAL_PORT}" >&2
-    echo "    Remote: ${gpu_node}:${REMOTE_PORT}" >&2
+    if [[ "${LOGIN_PROXY}" == "1" ]]; then
+        echo "    Path:   localhost:${LOCAL_PORT} -> ${REMOTE_HOST}:${LOGIN_PROXY_PORT} -> ${gpu_node}:${REMOTE_PORT}" >&2
+    else
+        echo "    Remote: ${gpu_node}:${REMOTE_PORT}" >&2
+    fi
 }
 
 # =============================================================================
@@ -475,15 +697,16 @@ list_containers() {
 cmd_build_logs() {
     ensure_master_connection || exit 1
 
-    local job_id
-    if job_id=$(find_job_id "build-vllm-gh200"); then
-        local log_file="${REMOTE_CONTAINER_DIR}/build_vllm_${job_id}.log"
-        info "Tailing logs for build job ${job_id}..."
-        echo "    (Press Ctrl+C to stop watching - build will continue running)" >&2
-        echo "" >&2
-        ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "tail -F '${log_file}' 2>/dev/null" || true
-    else
-        error "No running build job found"
+    # Find the build job in ANY state (PENDING/CONFIGURING/RUNNING), not just
+    # RUNNING. A queued build has no log file yet but is still the job the user
+    # means — find_job_id is RUNNING-only by design (the server commands rely on
+    # that), so build logs queries by name directly instead.
+    local job_info
+    job_info=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+        "squeue -u \$USER -h -o '%i %T %R' --name=build-vllm-gh200 2>/dev/null | head -n1") || true
+
+    if [[ -z "$job_info" ]]; then
+        error "No build job in the queue"
         local latest_log
         latest_log=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
             "ls -t ${REMOTE_CONTAINER_DIR}/build_vllm_*.log 2>/dev/null | head -n1") || true
@@ -493,6 +716,45 @@ cmd_build_logs() {
         fi
         exit 1
     fi
+
+    local job_id job_state job_reason
+    job_id=$(echo "$job_info" | awk '{print $1}')
+    job_state=$(echo "$job_info" | awk '{print $2}')
+    # Reason is the remaining field(s), e.g. "(Resources)" / "(Priority)".
+    job_reason=$(echo "$job_info" | awk '{$1=""; $2=""; sub(/^ +/, ""); print}')
+    local log_file="${REMOTE_CONTAINER_DIR}/build_vllm_${job_id}.log"
+
+    # If the job hasn't started, say so and wait for it to start (like the
+    # server-watch PENDING phase). Ctrl+C stops watching; the build stays queued.
+    if [[ "$job_state" != "RUNNING" ]]; then
+        warn "Build job ${job_id} is ${job_state}${job_reason:+ ${job_reason}} — not started yet"
+        info "Waiting for it to start (Ctrl+C to stop; the build stays queued)..."
+        echo "" >&2
+        while ! ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "test -f '${log_file}'" 2>/dev/null; do
+            local st
+            st=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+                "squeue -j ${job_id} -h -o '%T %R'" 2>/dev/null) || true
+            if [[ -z "$st" ]]; then
+                # Left the queue. Either it started and finished fast (log now
+                # exists → tail it) or it was cancelled/failed before logging.
+                if ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "test -f '${log_file}'" 2>/dev/null; then
+                    break
+                fi
+                echo "" >&2
+                error "Build job ${job_id} left the queue before producing a log (cancelled or failed early)"
+                exit 1
+            fi
+            printf "\r    %-50s" "${st} (waiting for start...)" >&2
+            sleep 10
+        done
+        echo "" >&2
+        success "Build job ${job_id} started"
+    fi
+
+    info "Tailing logs for build job ${job_id}..."
+    echo "    (Press Ctrl+C to stop watching - build will continue running)" >&2
+    echo "" >&2
+    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "tail -F '${log_file}' 2>/dev/null" || true
 }
 
 cmd_build_cancel() {
@@ -578,7 +840,7 @@ cmd_build() {
                 info "To build a new container:"
                 echo "    ./olivia.sh build <preset>" >&2
                 echo "" >&2
-                echo "Available presets: glm51_v19 (alias: glm51), glm51_v20, glm52, glm47, devstral, llama, qwen, generic" >&2
+                echo "Available presets: glm51_v19 (alias: glm51), glm51_v20, glm52, glm47, kimi, kimi27, devstral, llama, qwen, generic" >&2
                 exit 0
                 ;;
             --presets|-p)
@@ -601,6 +863,17 @@ cmd_build() {
                 echo ""
                 echo "  glm47      GLM-4.7 (358B) flagship model"
                 echo "             vLLM: main, transformers>=5.0.0rc0"
+                echo ""
+                echo "  kimi       Kimi K2.6 (1T MoE, 32B active) MLA + multimodal"
+                echo "             vLLM: v0.19.1, transformers>=4.57.1,<5.0.0"
+                echo "             native int4 ~640GB, 8 GPUs (2×4-GPU nodes, TP=4 + PP=2)"
+                echo ""
+                echo "  kimi27     Kimi K2.7-Code (1T MoE, 32B active) coding-focused"
+                echo "             Same arch as K2.6 — reuses kimi container (index 4,"
+                echo "             eager vLLM 0.21), no rebuild. native int4 ~560GB,"
+                echo "             8 GPUs (2×4-GPU nodes, TP=4 + PP=2). Thinking-mode only."
+                echo "             Weights on /cluster/work scratch — serve with"
+                echo "             HF_HOME=/cluster/work/projects/nn10104k/huggingface"
                 echo ""
                 echo "  devstral   Devstral/Mistral models"
                 echo "             vLLM: main, transformers>=4.45.0"
@@ -823,6 +1096,8 @@ normalize_preset() {
         glm51_v20)                      echo "glm51_v20" ;;
         glm52|glm-5.2|glm5.2)           echo "glm52" ;;
         glm47|glm-4.7)                  echo "glm47" ;;
+        kimi|kimi26|kimi-k2.6|kimi_k26) echo "kimi" ;;
+        kimi27|kimi-k2.7|kimi_k27|kimi-k2.7-code|kimi27code) echo "kimi27" ;;
         devstral|mistral)               echo "devstral" ;;
         llama|llama3)                   echo "llama" ;;
         qwen|qwen2)                     echo "qwen" ;;
@@ -874,6 +1149,31 @@ preset_field() {
             ;;
         glm47)
             model="QuantTrio/GLM-4.7-AWQ"
+            ;;
+        kimi)
+            # Kimi K2.6 (1T MoE, 32B active). The base repo ships Moonshot's
+            # native int4 (compressed-tensors, ~640GB) — there is no separate
+            # -AWQ repo. ~640GB → 8 GPUs / 2 nodes, same TP=4 + PP=2 as glm51.
+            # index 4 = the validated eager vLLM 0.21 container
+            # (vllm-kimi-4-sandbox, shared with kimi27) — carries the
+            # reasoning_tokens patches and is what the K2.6 deployment runs on.
+            # (Was the default index 1 = legacy vLLM 0.19 vllm-kimi-1-sandbox.)
+            prefix="kimi"; index="4"
+            model="moonshotai/Kimi-K2.6"
+            nodes="2"; gpus="4"; pp="2"
+            ;;
+        kimi27)
+            # Kimi K2.7-Code (1T MoE, 32B active): coding-focused successor to
+            # K2.6. SAME KimiK25ForConditionalGeneration arch + native int4
+            # (compressed-tensors ~560GB), so it reuses the "kimi" container
+            # (index 4 = the validated eager vLLM 0.21 build) with no rebuild.
+            # 8 GPUs / 2 nodes, TP=4 + PP=2. Thinking-mode only (temp 1.0,
+            # top_p 0.95). Weights live on /cluster/work scratch (the project
+            # quota is full with K2.6) -> serve with HF_HOME pointed at the
+            # scratch cache: HF_HOME=/cluster/work/projects/nn10104k/huggingface
+            prefix="kimi"; index="4"
+            model="moonshotai/Kimi-K2.7-Code"
+            nodes="2"; gpus="4"; pp="2"
             ;;
         devstral)
             model="mistralai/Devstral-2-123B-Instruct-2512"
@@ -1001,13 +1301,20 @@ start_server_job() {
     # Tool/reasoning knobs are forwarded so Claude Code and other OpenAI
     # tool-using clients can enable the GLM tool-call parser per-session
     # without editing run_vllm_server.sh.
+    # Cache-dir overrides (VLLM_CACHE*, *_CACHE_DIR) let several servers run
+    # concurrently from the same workdir without racing on the shared
+    # $PWD/cache/* compile/JIT caches — give each parallel experiment its own
+    # cache root. DISABLE_CUSTOM_ALL_REDUCE is forwarded so CUDAGraph capture
+    # experiments can pin the NCCL all-reduce fallback explicitly.
     for forward_var in VERBOSE VLLM_LOGGING_LEVEL RAY_BACKEND_LOG_LEVEL \
                        RAY_DEDUP_LOGS NCCL_DEBUG CUDAGRAPH_MODE \
                        ENABLE_AUTO_TOOL_CHOICE GLM_TOOL_PARSER \
                        GLM_REASONING_PARSER SERVED_MODEL_NAME \
                        MTP_SPECULATIVE_TOKENS ENABLE_SPECULATIVE ALLOW_MTP_PP \
                        MAX_MODEL_LEN GPU_MEM_UTIL RAY_CGRAPH_GET_TIMEOUT \
-                       VLLM_USE_RAY_V2_EXECUTOR_BACKEND \
+                       VLLM_USE_RAY_V2_EXECUTOR_BACKEND DISABLE_CUSTOM_ALL_REDUCE \
+                       VLLM_CACHE VLLM_CACHE_ROOT TRITON_CACHE_DIR \
+                       DG_JIT_CACHE_DIR TORCHINDUCTOR_CACHE_DIR \
                        VLLM_PP_LAYER_PARTITION EXTRA_VLLM_ARGS; do
         if [[ -n "${!forward_var:-}" ]]; then
             env_vars+=" ${forward_var}=${!forward_var}"
@@ -1771,11 +2078,42 @@ EOF
 # MODULE: Tunnel
 # =============================================================================
 
+tunnel_status() {
+    if is_tunnel_alive; then
+        local node target
+        node=$(get_tunnel_node)
+        target=$(cat "${TUNNEL_TARGET_FILE}" 2>/dev/null || echo "")
+        success "Tunnel ACTIVE"
+        echo "    Node:   $node"
+        echo "    Local:  localhost:${LOCAL_PORT}"
+        if [[ "$target" == localhost:* ]]; then
+            echo "    Mode:   login-proxy (relay on ${REMOTE_HOST}:${target#localhost:})"
+            echo "    Path:   localhost:${LOCAL_PORT} -> ${REMOTE_HOST}:${target#localhost:} -> ${node}:${REMOTE_PORT}"
+        else
+            echo "    Remote: ${node}:${REMOTE_PORT}"
+        fi
+    else
+        warn "Tunnel NOT ACTIVE"
+    fi
+}
+
 cmd_tunnel() {
     local action="${1:-status}"
+    shift || true
+
+    # Flags apply to up/refresh.
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --login-proxy)      LOGIN_PROXY=1; shift ;;
+            --login-proxy-port) LOGIN_PROXY_PORT="$2"; shift 2 ;;
+            --port)             set_local_port "$2"; shift 2 ;;
+            -h|--help)          cmd_tunnel_help; exit 0 ;;
+            *) error "Unknown tunnel option: $1"; cmd_tunnel_help; exit 1 ;;
+        esac
+    done
 
     case "$action" in
-        up|open|start)
+        up|open|start|refresh)
             ensure_master_connection || exit 1
             local gpu_node
             if ! gpu_node=$(find_vllm_node); then
@@ -1790,16 +2128,7 @@ cmd_tunnel() {
             kill_tunnel
             ;;
         status)
-            if is_tunnel_alive; then
-                local node
-                node=$(get_tunnel_node)
-                success "Tunnel ACTIVE"
-                echo "    Node:   $node"
-                echo "    Local:  localhost:${LOCAL_PORT}"
-                echo "    Remote: ${node}:${REMOTE_PORT}"
-            else
-                warn "Tunnel NOT ACTIVE"
-            fi
+            tunnel_status
             ;;
         -h|--help)
             cmd_tunnel_help
@@ -1815,19 +2144,29 @@ cmd_tunnel() {
 
 cmd_tunnel_help() {
     cat <<EOF
-Usage: ./olivia.sh tunnel <action>
+Usage: ./olivia.sh tunnel <action> [options]
 
 Manage SSH tunnel to vLLM server.
 
 Actions:
     up, open, start     Open tunnel to running vLLM server
-    down, close, kill   Close tunnel
+    refresh             Re-point tunnel at the current node (after a job move)
+    down, close, kill   Close tunnel (and stop the login-node relay if used)
     status              Show tunnel status (default)
 
+Options:
+    --port PORT             Local port (default: ${LOCAL_PORT})
+    --login-proxy           Route via a fixed login-node relay that follows the
+                            GPU node across job restarts (opt-in; runs a small
+                            long-lived process on the shared login node)
+    --login-proxy-port PORT Login-node relay port (default: ${LOGIN_PROXY_PORT})
+
 Examples:
-    ./olivia.sh tunnel up       Open tunnel
-    ./olivia.sh tunnel down     Close tunnel
-    ./olivia.sh tunnel status   Check tunnel status
+    ./olivia.sh tunnel up                  Open a direct tunnel
+    ./olivia.sh tunnel up --login-proxy    Open via the follow-the-node relay
+    ./olivia.sh tunnel refresh             Re-point after the job moved nodes
+    ./olivia.sh tunnel down                Close tunnel
+    ./olivia.sh tunnel status              Check tunnel status
 EOF
 }
 
@@ -1875,8 +2214,15 @@ cmd_chat() {
                 shift
                 ;;
             --port)
-                LOCAL_PORT="$2"
-                TUNNEL_NODE_FILE="/tmp/olivia-tunnel-${LOCAL_PORT}.node"
+                set_local_port "$2"
+                shift 2
+                ;;
+            --login-proxy)
+                LOGIN_PROXY=1
+                shift
+                ;;
+            --login-proxy-port)
+                LOGIN_PROXY_PORT="$2"
                 shift 2
                 ;;
             --no-store)
@@ -2012,19 +2358,22 @@ Usage: ./olivia.sh chat [options]
 Connect to vLLM server and start interactive chat.
 
 Options:
-    --port PORT         Local port (default: 8000)
-    --tunnel-only       Only set up tunnel, don't start chat
-    --no-stream         Disable streaming in chat
-    --resume [ID]       Resume most recent stored conversation, or specific ID
-    --no-store          Disable conversation persistence for this session
-    -h, --help          Show this help
+    --port PORT             Local port (default: 8000)
+    --tunnel-only           Only set up tunnel, don't start chat
+    --no-stream             Disable streaming in chat
+    --resume [ID]           Resume most recent stored conversation, or specific ID
+    --no-store              Disable conversation persistence for this session
+    --login-proxy           Route via the follow-the-node login-node relay
+    --login-proxy-port PORT Login-node relay port (default: ${LOGIN_PROXY_PORT})
+    -h, --help              Show this help
 
 Examples:
-    ./olivia.sh chat                Connect and start chat
-    ./olivia.sh chat --port 9000    Use different port
-    ./olivia.sh chat --tunnel-only  Just set up tunnel
-    ./olivia.sh chat --resume       Resume most recent conversation
-    ./olivia.sh chat --resume 12    Resume conversation #12
+    ./olivia.sh chat                   Connect and start chat
+    ./olivia.sh chat --port 9000       Use different port
+    ./olivia.sh chat --tunnel-only     Just set up tunnel
+    ./olivia.sh chat --resume          Resume most recent conversation
+    ./olivia.sh chat --resume 12       Resume conversation #12
+    ./olivia.sh chat --login-proxy     Connect via the follow-the-node relay
 EOF
 }
 
@@ -2032,26 +2381,81 @@ EOF
 # MODULE: Status
 # =============================================================================
 
+# Enriched job listing for `status`. Prints the base squeue line per job, then
+# for each RUNNING vLLM-server job a derived phase line — LOADING <shards>,
+# CAPTURING cudagraphs, SERVING (+ live throughput / KV usage / health), or
+# ERROR — plus build-job progress. All derived in a single remote pass over the
+# job logs so `status` stays one round trip.
+print_jobs_enriched() {
+    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+        "CDIR='${REMOTE_CONTAINER_DIR}' VPORT='${REMOTE_PORT}' bash -s" <<'REMOTE_JOBS' 2>/dev/null || true
+jobs=$(squeue -u "$USER" -h -o '%i|%j|%T|%M|%l|%R' 2>/dev/null)
+if [ -z "$jobs" ]; then echo "  (no jobs in queue)"; exit 0; fi
+printf '  %-9s %-18s %-10s %-13s %s\n' JOBID NAME STATE TIME/LIMIT NODES
+echo "$jobs" | while IFS='|' read -r jid name state etime tlimit nodes; do
+  printf '  %-9s %-18s %-10s %-13s %s\n' "$jid" "$name" "$state" "$etime/$tlimit" "$nodes"
+  [ "$state" = RUNNING ] || continue
+  case "$name" in
+    *vllm-server*)
+      head=$(scontrol show hostnames "$nodes" 2>/dev/null | head -1)
+      hl="$CDIR/logs/vllm_server_${jid}_head.log"; wl="$CDIR/logs/vllm_server_${jid}.log"
+      model=$(grep -oE 'Model: +[^[:space:]]+' "$wl" 2>/dev/null | head -1 | awk '{print $NF}')
+      mode=$(grep -oE 'CUDAGraph Mode: +[^[:space:]]+' "$wl" 2>/dev/null | head -1 | awk '{print $NF}')
+      tag="${model:-?} [cg=${mode:-?}]"
+      if [ -f "$hl" ] && grep -qE 'Application startup complete|Uvicorn running on' "$hl" 2>/dev/null; then
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://$head:${VPORT}/health" 2>/dev/null)
+        tp=$(grep -oE 'Avg generation throughput: [0-9.]+ tokens/s, Running: [0-9]+ reqs, Waiting: [0-9]+ reqs, GPU KV cache usage: [0-9.]+%' "$hl" 2>/dev/null | tail -1)
+        echo "             -> SERVING  $tag  http://$head:${VPORT} (health $code)"
+        [ -n "$tp" ] && echo "                ${tp#Avg }"
+      elif [ -f "$hl" ] && grep -qE 'illegal memory access|Traceback \(most recent call last\)|EngineDeadError|Engine core initialization failed|Fatal Python error' "$hl" 2>/dev/null; then
+        echo "             -> ERROR  $tag  (engine failed; tail logs/vllm_server_${jid}_head.log)"
+      elif [ -f "$hl" ] && grep -qE 'Capturing cudagraph|Capturing CUDA graph' "$hl" 2>/dev/null; then
+        echo "             -> CAPTURING cudagraphs  $tag  (weights loaded)"
+      elif [ -f "$hl" ]; then
+        sh=$(grep -oE 'Loading safetensors checkpoint shards: +[0-9]+% Completed \| [0-9]+/[0-9]+' "$hl" 2>/dev/null | tail -1)
+        if [ -n "$sh" ]; then
+          nn=$(echo "$sh" | grep -oE '[0-9]+/[0-9]+' | head -1); pct=$(echo "$sh" | grep -oE '[0-9]+%' | head -1)
+          echo "             -> LOADING weights ${nn} (${pct})  $tag"
+        else echo "             -> INIT / Ray bootstrap  $tag"; fi
+      else echo "             -> starting (no head log yet)  $tag"; fi
+      ;;
+    *build-vllm*)
+      bl="$CDIR/build_vllm_${jid}.log"
+      if [ -f "$bl" ]; then
+        if grep -qE 'Build Complete!' "$bl" 2>/dev/null; then echo "             -> build COMPLETE"
+        else stp=$(grep -oE '\[[0-9]+/[0-9]+\]' "$bl" 2>/dev/null | tail -1); echo "             -> building ${stp:-(deps/clone phase)}"; fi
+      fi
+      ;;
+  esac
+done
+REMOTE_JOBS
+}
+
 cmd_status() {
     header "Olivia Status"
 
     # SSH connection
     if is_master_alive; then
         success "SSH Connection: ACTIVE"
+        echo "    Persist: ${SSH_CONTROL_PERSIST} idle (single 2FA covers this window)"
     else
         warn "SSH Connection: NOT ACTIVE"
-        echo "    Run any command to establish connection"
+        echo "    Run any command to establish connection (or: ./olivia.sh reconnect)"
     fi
 
     echo ""
 
     # Tunnel
     if is_tunnel_alive; then
-        local node
+        local node target
         node=$(get_tunnel_node)
+        target=$(cat "${TUNNEL_TARGET_FILE}" 2>/dev/null || echo "")
         success "SSH Tunnel: ACTIVE"
         echo "    Node:   $node"
         echo "    Local:  localhost:${LOCAL_PORT}"
+        if [[ "$target" == localhost:* ]]; then
+            echo "    Mode:   login-proxy (relay on ${REMOTE_HOST}:${target#localhost:})"
+        fi
     else
         warn "SSH Tunnel: NOT ACTIVE"
     fi
@@ -2061,7 +2465,7 @@ cmd_status() {
     # Remote jobs (if connected)
     if is_master_alive || ensure_master_connection 2>/dev/null; then
         info "Jobs on Olivia:"
-        ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "squeue -u \$USER" 2>/dev/null || true
+        print_jobs_enriched
     fi
 }
 
@@ -2140,7 +2544,42 @@ pending_count=$(squeue -h -u "$USER" -t PENDING -o "%i" | wc -l)
 if [ "$running_count" -eq 0 ] && [ "$pending_count" -eq 0 ]; then
     printf "    (none)\n"
 else
-    squeue -u "$USER" -o "  %.8i  %.14j  %.8T  %.5D  %.10M  %.10l  %R" | tail -n +1
+    squeue -u "$USER" -h -o '%i|%j|%T|%M|%l|%R' | while IFS='|' read -r jid name state etime tlimit nodes; do
+        printf "  ${BLD}%-8s${RST} %-16s %-9s %-13s %s\n" "$jid" "$name" "$state" "$etime/$tlimit" "$nodes"
+        [ "$state" = RUNNING ] || continue
+        case "$name" in
+          (*vllm-server*)
+            head=$(scontrol show hostnames "$nodes" 2>/dev/null | head -1)
+            hl="$CDIR/logs/vllm_server_${jid}_head.log"; wl="$CDIR/logs/vllm_server_${jid}.log"
+            model=$(grep -oE 'Model: +[^[:space:]]+' "$wl" 2>/dev/null | head -1 | awk '{print $NF}')
+            mode=$(grep -oE 'CUDAGraph Mode: +[^[:space:]]+' "$wl" 2>/dev/null | head -1 | awk '{print $NF}')
+            tag="${model:-?} [cg=${mode:-?}]"
+            if [ -f "$hl" ] && grep -qE 'Application startup complete|Uvicorn running on' "$hl" 2>/dev/null; then
+                code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://$head:${VPORT}/health" 2>/dev/null)
+                tp=$(grep -oE 'Avg generation throughput: [0-9.]+ tokens/s, Running: [0-9]+ reqs, Waiting: [0-9]+ reqs, GPU KV cache usage: [0-9.]+%' "$hl" 2>/dev/null | tail -1)
+                printf "           ${GRN}SERVING${RST}  %s  http://%s:%s (health %s)\n" "$tag" "$head" "$VPORT" "$code"
+                [ -n "$tp" ] && printf "             %s\n" "${tp#Avg }"
+            elif [ -f "$hl" ] && grep -qE 'illegal memory access|Traceback \(most recent call last\)|EngineDeadError|Engine core initialization failed|Fatal Python error' "$hl" 2>/dev/null; then
+                printf "           ${RED}ERROR${RST}  %s  (engine failed; tail logs/vllm_server_%s_head.log)\n" "$tag" "$jid"
+            elif [ -f "$hl" ] && grep -qE 'Capturing cudagraph|Capturing CUDA graph' "$hl" 2>/dev/null; then
+                printf "           ${YEL}CAPTURING${RST} cudagraphs  %s  (weights loaded)\n" "$tag"
+            elif [ -f "$hl" ]; then
+                shd=$(grep -oE 'Loading safetensors checkpoint shards: +[0-9]+% Completed \| [0-9]+/[0-9]+' "$hl" 2>/dev/null | tail -1)
+                if [ -n "$shd" ]; then
+                    nn=$(echo "$shd" | grep -oE '[0-9]+/[0-9]+' | head -1); pct=$(echo "$shd" | grep -oE '[0-9]+%' | head -1)
+                    printf "           ${YEL}LOADING${RST} weights %s (%s)  %s\n" "$nn" "$pct" "$tag"
+                else printf "           ${YEL}INIT${RST} / Ray bootstrap  %s\n" "$tag"; fi
+            else printf "           starting (no head log yet)  %s\n" "$tag"; fi
+            ;;
+          (*build-vllm*)
+            bl="$CDIR/build_vllm_${jid}.log"
+            if [ -f "$bl" ]; then
+                if grep -qE 'Build Complete!' "$bl" 2>/dev/null; then printf "           ${GRN}build COMPLETE${RST}\n"
+                else stp=$(grep -oE '\[[0-9]+/[0-9]+\]' "$bl" 2>/dev/null | tail -1); printf "           ${YEL}building${RST} %s\n" "${stp:-(deps/clone phase)}"; fi
+            fi
+            ;;
+        esac
+    done
     if [ "$pending_count" -gt 0 ]; then
         printf "\n  ${BLD}Estimated start (PENDING):${RST}\n"
         squeue --start -h -u "$USER" -o "  %.8i  %.20S  %R" 2>/dev/null || true
@@ -2417,7 +2856,7 @@ REMOTE_SCRIPT
     # (with line-buffered flushes so --watch feels instant); the __METRICS__
     # sentinel line is diverted into the sample file, prefixed with the local
     # timestamp. Single SSH round-trip, no stderr juggling.
-    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "$remote_script" \
+    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "CDIR='${REMOTE_CONTAINER_DIR}' VPORT='${REMOTE_PORT}'; $remote_script" \
         | awk -v f="$sample_file" -v ts="$local_ts" '
             /^__METRICS__\t/ {
                 sub(/^__METRICS__\t/, "")
@@ -2727,6 +3166,50 @@ cmd_prefetch() {
 }
 
 # =============================================================================
+# MODULE: Reconnect
+# =============================================================================
+
+# Re-establish the 2FA'd master after a real drop (laptop sleep, network change,
+# persist window expiry). Costs one OTP, then restores any recorded tunnel.
+cmd_reconnect() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --port)             set_local_port "$2"; shift 2 ;;
+            --login-proxy-port) LOGIN_PROXY_PORT="$2"; shift 2 ;;
+            -h|--help)
+                echo "Usage: ./olivia.sh reconnect [--port PORT]"
+                echo "Re-establish the SSH master connection and restore the recorded tunnel."
+                exit 0
+                ;;
+            *) error "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    require_remote_config || exit 1
+
+    info "Re-establishing SSH master connection..."
+    close_master_connection
+    ensure_master_connection || exit 1
+
+    # Restore a previously-recorded tunnel, inferring the mode from its target.
+    if [[ -f "${TUNNEL_TARGET_FILE}" || -f "${TUNNEL_NODE_FILE}" ]]; then
+        local target
+        target=$(cat "${TUNNEL_TARGET_FILE}" 2>/dev/null || echo "")
+        if [[ "$target" == localhost:* ]]; then
+            LOGIN_PROXY=1
+            LOGIN_PROXY_PORT="${target#localhost:}"
+        fi
+        local gpu_node
+        if gpu_node=$(find_vllm_node); then
+            info "Restoring tunnel..."
+            setup_tunnel "$gpu_node"
+        else
+            warn "No running vLLM job found; tunnel not restored"
+        fi
+    fi
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -2742,6 +3225,7 @@ Commands:
     server      Manage vLLM server (deploy, restart, logs)
     prefetch    Download model weights into persistent HF_HOME (login node)
     tunnel      Manage SSH tunnel
+    reconnect   Re-establish the SSH master after a drop and restore the tunnel
     status      Show cluster and connection status
     cluster     Show Olivia partition utilization (queue, GPUs, reservations)
 
@@ -2750,10 +3234,16 @@ Global Options:
     -h, --help          Show this help
     -v, --version       Show version
 
+Connection durability (env overrides):
+    SSH_CONTROL_PERSIST  How long the 2FA'd master persists when idle (default: ${SSH_CONTROL_PERSIST})
+    LOGIN_PROXY=1        Route the tunnel via a fixed login-node relay that
+                         follows the GPU node across job restarts (opt-in)
+
 Examples:
     $(basename "$0") chat               Connect to vLLM and chat
     $(basename "$0") build glm47        Build GLM-4.7 container
     $(basename "$0") server restart     Restart vLLM server
+    $(basename "$0") reconnect          Re-auth after a drop, restore tunnel
     $(basename "$0") status             Check status
 
 Run '$(basename "$0") <command> --help' for command-specific help.
@@ -2798,6 +3288,9 @@ main() {
             ;;
         tunnel)
             cmd_tunnel "$@"
+            ;;
+        reconnect)
+            cmd_reconnect "$@"
             ;;
         status)
             cmd_status "$@"

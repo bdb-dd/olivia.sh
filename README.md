@@ -1,14 +1,18 @@
 # vLLM for NVIDIA GH200 (GraceHopper) on HPC Clusters
 
-Build and run [vLLM](https://github.com/vllm-project/vllm) on NVIDIA GH200 ARM64 GPUs, specifically optimized for the NRIS Olivia HPC cluster. Includes full-featured CLI tooling, streaming chat client, and performance optimizations for high-latency SSH tunnel connections.
+Build and run [vLLM](https://github.com/vllm-project/vllm) on NVIDIA GH200 ARM64 GPUs, specifically optimized for the NRIS Olivia HPC cluster — from single-node 4-GPU models up to 1T-parameter MoE models sharded across 3 nodes / 12 GPUs. Includes full-featured CLI tooling, a streaming chat client, an Anthropic/Claude-Code bridge, and performance optimizations for high-latency SSH tunnel connections.
 
 ## Features
 
 - **Preserves NGC PyTorch** - Builds vLLM without overwriting NVIDIA's custom PyTorch
-- **Model Presets** - Pre-configured builds for GLM-4.7, Devstral, Llama, and Qwen
-- **GH200 Optimizations** - NCCL/NVLink tuning, optimal GPU ordering, Flash Attention
-- **Unified CLI** - Single command interface with SSH ControlMaster (one 2FA per session)
-- **Streaming Proxy** - Batches SSE tokens for 3x faster streaming over SSH tunnels
+- **Model Presets** - Build + serve recipes for GLM-4.7, GLM-5.1, GLM-5.2, Kimi K2.6/K2.7, Gemma-4, Devstral, Llama, and Qwen
+- **Multi-node serving** - TP=4 intra-node + pipeline parallel across nodes over Slingshot, with an auto-bootstrapped Ray cluster (GLM-5.1/5.2 and Kimi span 2–3 nodes)
+- **Reproducible builds** - Pin a vLLM commit and graft not-yet-released upstream PRs from committed snapshots (`VLLM_PATCHES`), so a container rebuilds byte-identically
+- **GH200 Optimizations** - NCCL/NVLink tuning, optimal GPU ordering, Flash Attention, DeepGEMM/FP8 paths
+- **Unified CLI** - Single command interface with SSH ControlMaster (one 2FA per session) + durable reconnect
+- **Claude Code bridge** - `anthropic_proxy.py` serves the Anthropic Messages API (thinking/reasoning + tool calls) on top of the OpenAI endpoint
+- **reasoning_tokens** - Reported on `/v1/chat/completions` usage for the reasoning models (Kimi, GLM-5.x)
+- **Streaming Proxy** - Batches SSE tokens for ~3x faster streaming over SSH tunnels
 - **Smart Monitoring** - Multi-phase server watch with GPU loading progress and live throughput
 
 ## Quick Start
@@ -96,16 +100,18 @@ Unified CLI for all operations. Uses SSH ControlMaster for single 2FA authentica
 ./olivia.sh build --presets    # List available model presets
 ./olivia.sh build --list       # List existing containers on cluster
 
-# Build containers
-./olivia.sh build glm47        # Build GLM-4.7 container
-./olivia.sh build devstral     # Build Devstral container
-./olivia.sh build llama        # Build Llama container
+# Build containers (build + serve presets share the same name)
+./olivia.sh build glm52        # GLM-5.2 (FP8, pinned vLLM commit + PR#45895 snapshot)
+./olivia.sh build kimi         # Kimi K2.6/K2.7 (shared container)
+./olivia.sh build glm51        # GLM-5.1
+./olivia.sh build glm47        # GLM-4.7 (single node)
+./olivia.sh build devstral     # Devstral
 
 # Build options
 ./olivia.sh build glm47 --index 2    # Build second container (safe, won't touch existing)
 ./olivia.sh build glm47 --force      # Rebuild existing container
 ./olivia.sh build glm47 --sif        # Create SIF image after build
-./olivia.sh build glm47 --vllm v0.6.6  # Override vLLM version
+./olivia.sh build glm47 --vllm v0.6.6  # Override vLLM version (branch, tag, or commit SHA)
 ```
 
 **Safety:** Builds fail by default if a container already exists. Use `--index N` to create a new container or `--force` to explicitly overwrite.
@@ -117,10 +123,11 @@ Unified CLI for all operations. Uses SSH ControlMaster for single 2FA authentica
 ./olivia.sh server list              # List available containers
 ./olivia.sh server status            # Show running server status
 
-# Start servers (preset with default model)
-./olivia.sh server start glm47       # Start GLM-4.7 server
-./olivia.sh server start devstral    # Start Devstral server
-./olivia.sh server start llama       # Start Llama server
+# Start servers (preset with default model; multi-node presets auto-allocate nodes)
+./olivia.sh server start glm52       # GLM-5.2 (3 nodes × 4, eager) — see HF_HOME note below
+./olivia.sh server start kimi        # Kimi K2.6 (2 nodes × 4, eager)
+./olivia.sh server start glm51       # GLM-5.1 (2 nodes × 4)
+./olivia.sh server start glm47       # GLM-4.7 (single node, 4 GPUs)
 
 # Start with options
 ./olivia.sh server start glm47 --index 2              # Use vllm-glm47-2-sandbox
@@ -153,13 +160,51 @@ Unified CLI for all operations. Uses SSH ControlMaster for single 2FA authentica
 
 ## Model Presets
 
-| Preset | Default Model | vLLM | Transformers |
-|--------|---------------|------|--------------|
-| `glm47` | `QuantTrio/GLM-4.7-AWQ` | main | >=5.0.0rc0 |
-| `devstral` | `mistralai/Devstral-2-123B-Instruct-2512` | main | >=4.45.0 |
-| `llama` | `meta-llama/Llama-3.3-70B-Instruct` | main | >=4.45.0 |
-| `qwen` | `Qwen/Qwen2.5-72B-Instruct` | main | >=4.45.0 |
-| `generic` | *(user specified)* | main | >=4.45.0 |
+| Preset | Default Model | GPUs | Container | Notes |
+|--------|---------------|------|-----------|-------|
+| `glm51_v19` (alias `glm51`) | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | `vllm-glm51-1` | TP=4 + PP=2, vLLM v0.19.0. Multi-node PP decode wedge → serve behind `anthropic_proxy.py` serialization |
+| `glm51_v20` | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | `vllm-glm51-2` | vLLM v0.20.0 + RayExecutorV2. **Quarantined** (same wedge) |
+| `glm52` | `RedHatAI/GLM-5.2-FP8` | 12 (3 nodes × 4) | `vllm-glm52-1` | TP=4 + PP=3, block-FP8 (~755 GB). vLLM main pinned `091386a` + PR#45895 snapshot. Eager; fp8 KV + DeepGEMM |
+| `glm47` | `QuantTrio/GLM-4.7-AWQ` | 4 | `vllm-glm47-1` | TP=4, MTP speculative |
+| `kimi` | `moonshotai/Kimi-K2.6` | 8 (2 nodes × 4) | `vllm-kimi-4` | TP=4 + PP=2, native int4, MLA, multimodal, vLLM 0.21. Eager. reasoning_tokens on chat/completions |
+| `kimi27` | `moonshotai/Kimi-K2.7-Code` | 8 (2 nodes × 4) | `vllm-kimi-4` (shared) | Same arch + container as K2.6 (no rebuild); thinking-only |
+| `gemma4` | Gemma 4 (31B, multimodal) | 1–2 | `vllm-gemma4-1` | vLLM v0.19.0, AWQ |
+| `devstral` | `mistralai/Devstral-2-123B-Instruct-2512` | 4 | `vllm-devstral-1` | TP=4 |
+| `llama` | `meta-llama/Llama-3.3-70B-Instruct` | 4 | — | TP=4 |
+| `qwen` | `Qwen/Qwen2.5-72B-Instruct` | 4 | — | TP=4 |
+| `generic` | *(user specified)* | 4 | — | generic defaults |
+
+> Build and serve presets are aligned by name (e.g. `./olivia.sh build glm52` then `./olivia.sh server start glm52`). The **Container** column is where each preset's server looks (`vllm-<name>-<index>-sandbox`); `kimi`/`kimi27` share index 4. See **[CLAUDE.md](CLAUDE.md)** for full per-model guides — memory layout, quant options, known issues, and multi-node architecture.
+
+## Performance
+
+Latest measured throughput / latency. **Update this section after every sweep** (with the date + config).
+
+### GLM-5.2 (`glm52`) — 3 nodes × 4 GH200, eager, FP8 · 2026-06-18
+Concurrency sweep (`bench_sweep.py`, `max_tokens=256`, thinking on):
+
+| Concurrency | 1 | 2 | 4 | 8 | 16 | 32 | 48 | 64 |
+|---|---|---|---|---|---|---|---|---|
+| Aggregate tok/s | 5.6 | 11.1 | 22.5 | 43.1 | 81.1 | 130.7 | 224.5 | 419.0 |
+| Per-stream tok/s | 5.6 | 5.6 | 5.6 | 5.4 | 5.1 | 4.1 | 4.7 | 6.6 |
+
+Stable 1→64 (0 failures, no decode wedge — RayExecutorV2). Single-stream is slow (~5.6 tok/s, eager) with high TTFT (~14 s, PP=3 prefill); strong batched throughput (~75× from 1→64). CUDAGraph capture IMAs on this NGC stack, so eager only.
+
+### Kimi K2.7 / K2.6 — 2 nodes × 4 GH200, eager, native int4 · 2026-06-15
+Concurrency sweep (256 output tokens, distinct prompts):
+
+| Concurrency | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|---|
+| Aggregate tok/s | 16.9 | 37.0 | 78.0 | 134.6 | 267.3 | 602.6 |
+| Per-stream tok/s | 16.9 | 18.6 | 19.5 | 16.8 | 16.7 | 18.8 |
+
+Per-stream flat ~17–19 tok/s; TTFT ~1.8 s single-stream; 0 failures. Production K2.6 sustains ~830 tok/s at 48 concurrent. Eager (CUDAGraph capture unrecoverable on this stack).
+
+### GLM-5.1 / GLM-4.7
+- **GLM-5.1** (2 nodes, AWQ): wedges under concurrent decode (`Running ≥ 2`) — serve behind `anthropic_proxy.py` request serialization; effectively single-stream for CLI use.
+- **GLM-4.7** (single node, 4 GPUs, AWQ): fast single-node, no multi-node wedge.
+
+> Sweep tools: `bench_sweep.py` (concurrency, streaming SSE) and `bench_serving.py` (TTFT + decode). Re-run after any serving-config change and refresh the tables above.
 
 ## Direct Script Usage
 
@@ -282,7 +327,10 @@ python vllm_proxy.py --vllm-port 8000 --proxy-port 8001 --batch-tokens 15 --batc
 |----------|---------|-------------|
 | `MODEL_ID` | *(required)* | Model preset or custom identifier |
 | `BUILD_INDEX` | `1` | Build index for multiple containers |
-| `VLLM_VERSION` | `main` | vLLM version to build |
+| `VLLM_VERSION` | `main` | vLLM ref to build — branch, tag, **or commit SHA** (presets may pin a SHA for reproducible builds) |
+| `VLLM_PATCHES` | *(preset)* | Space-separated vLLM PR numbers to graft at build time (committed `patches/` snapshot preferred, else live GitHub fetch) |
+| `NGC_PYTORCH_TAG` | `26.03-py3` | NGC PyTorch base-image tag (a preset may pin, e.g. glm52 → `26.05-py3`) |
+| `DEEPGEMM_REF` | `59f2c07` | DeepGEMM commit (a preset may pin, e.g. glm52) |
 | `CREATE_SIF` | `0` | Create SIF image after build |
 | `OVERWRITE` | `0` | Allow overwriting existing containers |
 | `MAX_JOBS` | `8` | Parallel compilation jobs |
@@ -294,10 +342,14 @@ python vllm_proxy.py --vllm-port 8000 --proxy-port 8001 --batch-tokens 15 --batc
 |----------|---------|-------------|
 | `CONTAINER` | *(required)* | Container name or path |
 | `MODEL` | `mistralai/Devstral-2-123B-Instruct-2512` | HuggingFace model ID |
-| `TP_SIZE` | `4` | Tensor parallel size |
+| `HF_HOME` | *(required)* | Persistent HF weights cache. Must be on project storage (auto-purge-safe), **not** `/cluster/work` — except glm52, whose ~700 GB FP8 exceeds the project quota, so override to the work cache. Normally forwarded from `mise.local.toml` |
+| `HF_TOKEN` | *(none)* | HuggingFace token for gated models (forwarded over stdin) |
+| `TP_SIZE` | `4` | Tensor parallel size (intra-node) |
+| `NUM_NODES` | `1` | Nodes for multi-node serving (glm51/kimi = 2, glm52 = 3); auto-bootstraps Ray |
+| `PP_SIZE` | `1` | Pipeline-parallel size across nodes (2 for glm51/kimi, 3 for glm52) |
+| `CUDAGRAPH_MODE` | *(auto)* | `NONE` = eager. Kimi and glm52 default to eager (CUDAGraph capture IMAs on this NGC stack) |
 | `GPU_MEM_UTIL` | `0.90` | GPU memory utilization |
-| `MAX_MODEL_LEN` | `32768` | Maximum context length |
-| `HF_TOKEN` | *(none)* | HuggingFace token for gated models |
+| `MAX_MODEL_LEN` | `32768` | Max context length (131072 for GLM-5.x / Kimi) |
 | `VERBOSE` | `0` | Enable detailed logging |
 
 ### Speculative Decoding

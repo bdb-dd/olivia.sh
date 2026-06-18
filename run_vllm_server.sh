@@ -305,6 +305,16 @@ if [[ "${IS_KIMI}" == "1" && -z "${CUDAGRAPH_MODE}" ]]; then
     CUDAGRAPH_MODE="NONE"
 fi
 
+# GLM-5.2: CUDAGraph capture hits an illegal-memory-access during capture_model
+# (the same eager-only story as Kimi — verified 2026-06-18, job 1308936 died with
+# "CUDA error: an illegal memory access" under <auto-select>). Default to eager
+# (mode=NONE) when unset so `./olivia.sh server start glm52` works out of the box;
+# override CUDAGRAPH_MODE=PIECEWISE etc. to retry capture. Scoped to 5.2 only —
+# glm51 keeps its own capture experiment (see its CUDAGraph TODO).
+if [[ "${IS_GLM52}" == "1" && -z "${CUDAGRAPH_MODE}" ]]; then
+    CUDAGRAPH_MODE="NONE"
+fi
+
 # Any GLM MoE model that uses the glm47/glm45 parser family
 IS_GLM_MOE=0
 if [[ "${IS_GLM47}" == "1" || "${IS_GLM5}" == "1" ]]; then

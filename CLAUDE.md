@@ -161,8 +161,36 @@ Mechanism notes:
 ```bash
 ./olivia.sh tunnel             # Show tunnel status
 ./olivia.sh tunnel up          # Open tunnel to vLLM server
-./olivia.sh tunnel down        # Close tunnel
+./olivia.sh tunnel refresh     # Re-point tunnel after the job moved nodes
+./olivia.sh tunnel down        # Close tunnel (also stops the login-node relay)
+./olivia.sh reconnect          # Re-auth after a drop and restore the tunnel
 ```
+
+**Connection durability (mitigating 2FA fragility):**
+Olivia requires password + OTP on every *new* interactive SSH connection (SSH
+keys do not bypass 2FA). ControlMaster pays that 2FA once and multiplexes; the
+key to avoiding re-auth is keeping the master alive. The master is opened
+detached (`ssh -f -N -M`) with a long `ControlPersist` and keepalives, so a
+single 2FA covers a long idle window and survives the terminal closing.
+
+- `SSH_CONTROL_PERSIST` (default `12h`) — how long the master persists when idle
+- `SSH_ALIVE_INTERVAL` / `SSH_ALIVE_COUNT` — keepalive to prevent NAT/idle drops
+- After a genuine drop, `./olivia.sh reconnect` re-auths (one OTP) and restores
+  any recorded tunnel. Unattended auto-reconnect (autossh) is intentionally not
+  used because a fresh connection needs an interactive OTP.
+
+**Login-node follow-the-node relay (opt-in: `--login-proxy` / `LOGIN_PROXY=1`):**
+Normally the local forward targets the GPU node directly, so a job moving to a
+new node requires re-pointing the forward. With `--login-proxy`, the laptop
+forwards to a *fixed* login-node port and a small user-space Python relay on the
+login node (`~/.olivia/relay.py`, managed by olivia.sh) forwards to the current
+GPU node. Node moves then only re-point the relay; the local forward is never
+disturbed. `LOGIN_PROXY_PORT` defaults to `18000`.
+
+> ⚠️ This runs a long-lived process on the *shared* login node — check the NRIS
+> acceptable-use policy before relying on it. Validate on the cluster: it
+> assumes the login node can reach `<gpu-node>:8000` directly (the same path the
+> direct forward already uses) and that `python3` is on the login node.
 
 #### Global Options
 ```bash

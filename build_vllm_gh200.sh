@@ -54,6 +54,17 @@ show_presets() {
     echo "               Same multi-node PP wedge as glm51_v19 reproduced — kept for"
     echo "               diagnostic work only, not for routine use. Builds to index 2."
     echo ""
+    echo "  glm52      - GLM-5.2 (744B, 40B active) MoE+DSA, successor to GLM-5.1"
+    echo "               vLLM: main + PR#45895 (auto-grafted), transformers>=5.4.0"
+    echo "               FP8 ~755GB, 12 GPUs (3 nodes × 4× GH200, TP=4 + PP=3)"
+    echo "               NEW skip-topk DSA indexer (index_topk_freq/skip_topk_offset)"
+    echo "               needs PR#45895 — NOT in any release (incl. v0.23.0); the build"
+    echo "               git-applies it (VLLM_PATCHES=45895). Drop it once PR merges."
+    echo "               Same multi-node PP decode wedge as glm51; use proxy serialization."
+    echo ""
+    echo "  gemma4     - Gemma 4 (31B dense, multimodal text+image)"
+    echo "               vLLM: v0.19.0, transformers>=5.5.0"
+    echo "               ~20GiB @ AWQ, fits 1-2x GH200 (FP8 has known bugs)"
     echo "  glm47      - GLM-4.7 (358B) - Latest flagship model from THUDM"
     echo "               vLLM: main, transformers>=5.0.0rc0"
     echo "               Requires ~358GB VRAM (FP8) or ~716GB (BF16)"
@@ -88,6 +99,21 @@ show_presets() {
 apply_preset() {
     local preset="$1"
 
+    # Default: no upstream PRs to graft. A preset sets PRESET_VLLM_PATCHES to a
+    # space-separated list of vLLM PR numbers it needs that aren't in a release
+    # yet (applied during build — see the VLLM_PATCHES step in Phase 3).
+    PRESET_VLLM_PATCHES=""
+
+    # Default: no preset-specific NGC base. A preset can pin one (e.g. glm52 on
+    # vLLM main needs a newer torch::stable ABI than 26.03 ships). Resolved into
+    # NGC_PYTORCH_TAG after this function runs.
+    PRESET_NGC_TAG=""
+
+    # Default: no preset-specific DeepGEMM ref (build falls back to 59f2c07). A
+    # preset can pin a newer commit (e.g. glm52 needs fp8_fp4_mqa_logits for
+    # GLM-5.2's DSA sparse-attention indexer). Resolved into DEEPGEMM_REF below.
+    PRESET_DEEPGEMM_REF=""
+
     case "${preset}" in
         glm51_v19|GLM51_V19|glm51|GLM51|glm-5.1|GLM-5.1)
             # MODEL_ID stays "glm51" so the container name is vllm-glm51-<index>-sandbox
@@ -121,6 +147,50 @@ apply_preset() {
             PRESET_VLLM_VERSION="v0.20.0"
             PRESET_TRANSFORMERS=">=5.4.0"
             PRESET_NOTES="GLM-5.1 on vLLM v0.20.0 + RayExecutorV2 — quarantined, same multi-node PP wedge as v0.19.0"
+            ;;
+        glm52|GLM52|glm-5.2|GLM-5.2)
+            # GLM-5.2 reuses GLM-5.1's GlmMoeDsaForCausalLM arch (shipped since
+            # ~v0.19.0), BUT adds a new periodic/skip-topk DSA indexer
+            # (index_topk_freq=4, index_skip_topk_offset=3) that GLM-5.1 lacks.
+            # That path is fixed by upstream PR#45895 ("Indexer init skip and MTP
+            # TopK share for iteration"), created 2026-06-17 and NOT yet merged —
+            # so it is in NO tagged release (v0.23.0 was cut two days before it).
+            #
+            # We graft PR#45895 onto vLLM main at build time via PRESET_VLLM_PATCHES
+            # below (the Phase 3 VLLM_PATCHES step git-applies it to the cloned
+            # source before compiling; it's pure Python, 9 files). The apply is
+            # idempotent — once PR#45895 merges into main, drop "45895" here (and
+            # the snapshot in patches/). A newer vLLM main may need
+            # NGC_PYTORCH_TAG=26.04-py3+.
+            #
+            # Quant is block-FP8 (zai-org / RedHatAI, [128,128], e4m3, dynamic) →
+            # DeepGEMM path on Hopper. Default model = RedHatAI/GLM-5.2-FP8.
+            MODEL_ID="glm52"
+            PRESET_VLLM_VERSION="main"
+            PRESET_TRANSFORMERS=">=5.4.0"
+            PRESET_VLLM_PATCHES="45895"
+            # GLM-5.2's DSA sparse-attention indexer calls fp8_fp4_mqa_logits at
+            # decode (sparse_attn_indexer.py); the default pin 59f2c07 (Sep 2025)
+            # predates it → "DeepGEMM backend not available or outdated" RuntimeError
+            # that kills the engine on the first request. 88965b0781 (2026-06-01)
+            # has it (FP4 Indexer landed 7f2a703e, 2026-04-17) and matches vLLM main.
+            PRESET_DEEPGEMM_REF="88965b0781"
+            # vLLM main's csrc/libtorch_stable (cuda_view.cu) uses torch::stable
+            # APIs (Tensor::layout(), newer from_blob) absent from NGC 26.03's
+            # torch 2.11.0a0 alpha — the build fails at the CUDA compile. 26.05
+            # (newest as of 2026-06) ships a later 2.11.0 alpha with that ABI.
+            PRESET_NGC_TAG="26.05-py3"
+            PRESET_NOTES="GLM-5.2 (744B MoE+DSA) FP8. Builds vLLM main + PR#45895 (skip-topk indexer, grafted via VLLM_PATCHES); not in any release. Multi-node PP wedge as glm51 — pair with proxy serialization."
+            ;;
+        gemma4|Gemma4|gemma-4|Gemma-4)
+            MODEL_ID="gemma4"
+            # Pinned to v0.19.0: vLLM main after 2026-03-31 (commit 7c080dd3c,
+            # PR #37503) uses torch::headeronly::CppTypeToScalarType, which
+            # isn't in NGC PyTorch 25.12. v0.19.0 predates that migration and
+            # is the version recommended by the QuantTrio gemma-4 AWQ model card.
+            PRESET_VLLM_VERSION="v0.19.0"
+            PRESET_TRANSFORMERS=">=5.5.0"
+            PRESET_NOTES="Gemma 4 31B dense, multimodal text+image, AWQ recommended (FP8 broken in vLLM)"
             ;;
         glm47|GLM47|glm-4.7|GLM-4.7)
             MODEL_ID="glm47"
@@ -213,9 +283,9 @@ WORKDIR="${WORKDIR:-$PWD}"
 #
 # vLLM v0.19.0 (Apr 2026) is the pinned version per the official recipe
 # (https://github.com/vllm-project/recipes/blob/main/GLM/GLM5.md). If you pin
-# a newer vLLM, you may need NGC_PYTORCH_TAG=26.04-py3 or later.
-NGC_PYTORCH_TAG="${NGC_PYTORCH_TAG:-26.03-py3}"
-NGC_IMAGE="${NGC_IMAGE:-docker://nvcr.io/nvidia/pytorch:${NGC_PYTORCH_TAG}}"
+# a newer vLLM, you may need NGC_PYTORCH_TAG=26.04-py3 or later. The default is
+# resolved AFTER apply_preset (below), so a preset can pin its own NGC base
+# (glm52 → 26.05). Explicit env > preset pin > 26.03 default.
 
 # Container output directory (shared location on Olivia)
 CONTAINER_DIR="${CONTAINER_DIR:-}"
@@ -232,6 +302,20 @@ apply_preset "${MODEL_ID}"
 
 # Allow override of preset defaults
 VLLM_VERSION="${VLLM_VERSION:-${PRESET_VLLM_VERSION}}"
+
+# Resolve NGC base image now that the preset has run: explicit env wins, then
+# the preset's pin (PRESET_NGC_TAG), then the 26.03 default.
+NGC_PYTORCH_TAG="${NGC_PYTORCH_TAG:-${PRESET_NGC_TAG:-26.03-py3}}"
+NGC_IMAGE="${NGC_IMAGE:-docker://nvcr.io/nvidia/pytorch:${NGC_PYTORCH_TAG}}"
+
+# Resolve DeepGEMM ref: explicit env > preset pin > 59f2c07 default. Forwarded
+# into the Phase 3 build container below.
+DEEPGEMM_REF="${DEEPGEMM_REF:-${PRESET_DEEPGEMM_REF:-59f2c07}}"
+
+# Upstream vLLM PRs to graft onto the cloned source during Phase 3 (space-
+# separated PR numbers). Defaults to the preset's list; override with
+# VLLM_PATCHES="..." or disable with VLLM_PATCHES="".
+VLLM_PATCHES="${VLLM_PATCHES-${PRESET_VLLM_PATCHES}}"
 
 # Build index (for multiple builds of same model type)
 BUILD_INDEX="${BUILD_INDEX:-1}"
@@ -267,6 +351,8 @@ echo "  Build index:    ${BUILD_INDEX}"
 echo "  Sandbox:        ${SANDBOX_NAME}"
 echo "  Sandbox path:   ${SANDBOX_PATH}"
 echo "  vLLM version:   ${VLLM_VERSION}"
+echo "  vLLM patches:   ${VLLM_PATCHES:-<none>}"
+echo "  DeepGEMM ref:   ${DEEPGEMM_REF}"
 echo "  NGC base:       ${NGC_IMAGE}"
 echo ""
 
@@ -437,9 +523,13 @@ export SINGULARITYENV_PRESET_TRANSFORMERS="${PRESET_TRANSFORMERS}"
 export APPTAINERENV_PRESET_TRANSFORMERS="${PRESET_TRANSFORMERS}"
 export PRESET_TRANSFORMERS="${PRESET_TRANSFORMERS}"
 export VLLM_VERSION="${VLLM_VERSION}"
+export VLLM_PATCHES="${VLLM_PATCHES}"
+export DEEPGEMM_REF="${DEEPGEMM_REF}"
 
 singularity exec ${SING_OPTS} \
     --env "VLLM_VERSION=${VLLM_VERSION}" \
+    --env "VLLM_PATCHES=${VLLM_PATCHES}" \
+    --env "DEEPGEMM_REF=${DEEPGEMM_REF}" \
     --bind "${PIP_CACHE}:/root/.cache/pip" \
     "${SANDBOX_PATH}" /bin/bash << 'BUILDSCRIPT'
 
@@ -451,7 +541,11 @@ echo "  User: $(whoami)"
 echo "  PWD: $(pwd)"
 
 echo "Installing build dependencies..."
-pip install --no-cache-dir --root-user-action=ignore ninja cmake wheel packaging setuptools-scm
+# setuptools-rust is required to even generate metadata for vLLM main's
+# pyproject (it ships a Rust frontend). We build with --no-build-isolation, so
+# every build-system.requires entry must be present in the env up front.
+# Harmless for older pinned versions that don't use it.
+pip install --no-cache-dir --root-user-action=ignore ninja cmake wheel packaging setuptools-scm setuptools-rust
 
 echo "Cloning vLLM repository..."
 cd /opt
@@ -769,6 +863,56 @@ else:
     else:
         print("serving already patched or markers not found (OK)")
 PYPATCH_CHAT_REASONING
+# -----------------------------------------------------------------------------
+# Graft requested upstream vLLM PRs (patch-during-build)
+# -----------------------------------------------------------------------------
+# VLLM_PATCHES (space-separated PR numbers, passed via --env) lists upstream vLLM
+# PRs a preset needs that aren't in a release yet. Each PR's cumulative diff is
+# fetched from GitHub and git-applied to the cloned source HERE — before the
+# `pip install .` compile below — so the fix is baked into the container.
+# The glm52 preset uses this for PR#45895 (GLM-5.2's new skip-topk DSA indexer +
+# MTP final-norm recycle; pure Python). cwd is /opt/vllm.
+#
+# Idempotent: a reverse-apply check skips PRs already present (e.g. once the PR
+# merges into the pinned ref, or on a --force rebuild). A diff that no longer
+# applies fails the build loudly rather than compiling a half-patched tree.
+if [[ -n "${VLLM_PATCHES:-}" ]]; then
+    echo ""
+    echo "Grafting upstream vLLM PR(s): ${VLLM_PATCHES}"
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "ERROR: curl not found in container; cannot fetch PR diffs."
+        exit 1
+    fi
+    for PR in ${VLLM_PATCHES}; do
+        DIFF="/tmp/vllm-pr-${PR}.diff"
+        echo "  PR #${PR}: fetching diff from GitHub..."
+        if ! curl -fsSL "https://github.com/vllm-project/vllm/pull/${PR}.diff" -o "${DIFF}"; then
+            echo "  ERROR: failed to download PR #${PR} diff."
+            exit 1
+        fi
+        if ! grep -q '^diff --git ' "${DIFF}"; then
+            echo "  ERROR: PR #${PR} download is not a valid diff ($(wc -c < "${DIFF}") bytes)."
+            exit 1
+        fi
+        N_FILES=$(grep -c '^diff --git ' "${DIFF}")
+        if git apply --reverse --check "${DIFF}" 2>/dev/null; then
+            echo "  PR #${PR}: already present (merged or re-run) — skipping (${N_FILES} files)"
+        elif git apply --check "${DIFF}" 2>/dev/null; then
+            git apply "${DIFF}"
+            echo "  PR #${PR}: applied cleanly (${N_FILES} files)"
+        else
+            echo ""
+            echo "  ERROR: PR #${PR} does not apply cleanly to vLLM ${VLLM_VERSION}."
+            echo "         Upstream main likely drifted, or the PR was updated/merged"
+            echo "         with changes. Writing .rej files under /opt/vllm for inspection..."
+            git apply --reject "${DIFF}" || true
+            echo "         Inspect: https://github.com/vllm-project/vllm/pull/${PR}"
+            echo "         If the PR has merged into main, rebuild with VLLM_PATCHES=\"\"."
+            exit 1
+        fi
+    done
+    echo ""
+fi
 
 # Get current NGC PyTorch version for constraints
 NGC_TORCH_VERSION=$(python3 -c "import torch; print(torch.__version__)")
@@ -816,6 +960,8 @@ pip install --no-cache-dir \
     sentencepiece \
     fastapi \
     uvicorn[standard] \
+    uvloop \
+    loguru \
     pydantic>=2.0 \
     prometheus-client \
     prometheus-fastapi-instrumentator>=7.0.0 \
@@ -876,8 +1022,29 @@ echo ""
 echo "Installing compressed-tensors (--no-deps to preserve NGC PyTorch)..."
 pip install --no-cache-dir --root-user-action=ignore --no-deps "compressed-tensors>=0.8.0"
 
-# Try to install xgrammar (vLLM constraint grammar feature)
-pip install --no-cache-dir --root-user-action=ignore xgrammar 2>&1 | tail -5 || echo "xgrammar not available, continuing..."
+# compressed-tensors and xgrammar are torch-dependent, so they live OUTSIDE the
+# bulk install above. On newer NGC bases (e.g. 26.05's torch 2.12.0a0 pre-
+# release) pip's resolver can't match their torch>=2.10 / torch<2.11 metadata
+# against the pinned pre-release version, which fails the ENTIRE resolve — if
+# they were in the bulk list that would silently take fastapi/uvloop/etc. down
+# with them (exactly the glm52-on-26.05 failure). Install with deps first (works
+# on 26.03, preserving glm51/kimi), then fall back to --no-deps. Their non-torch
+# deps are supplied explicitly: loguru (compressed-tensors) is in the bulk list;
+# apache-tvm-ffi (xgrammar's tvm_ffi backend) is installed just below.
+echo ""
+echo "Installing compressed-tensors..."
+pip install --no-cache-dir --root-user-action=ignore --constraint /tmp/constraints.txt "compressed-tensors>=0.8.0" 2>&1 | tail -5 \
+    || pip install --no-cache-dir --root-user-action=ignore --no-deps "compressed-tensors>=0.8.0" 2>&1 | tail -5 \
+    || echo "compressed-tensors not available, continuing..."
+
+echo ""
+echo "Installing xgrammar (+ apache-tvm-ffi backend)..."
+pip install --no-cache-dir --root-user-action=ignore --constraint /tmp/constraints.txt xgrammar 2>&1 | tail -5 \
+    || pip install --no-cache-dir --root-user-action=ignore --no-deps xgrammar 2>&1 | tail -5 \
+    || echo "xgrammar not available, continuing..."
+# tvm_ffi backend for xgrammar (no torch dep → installs cleanly with deps).
+# Needed when xgrammar went in via --no-deps; a harmless no-op otherwise.
+pip install --no-cache-dir --root-user-action=ignore apache-tvm-ffi 2>&1 | tail -3 || echo "apache-tvm-ffi not available, continuing..."
 
 # Install flashinfer (use --no-deps to avoid pulling torch)
 echo ""
@@ -922,6 +1089,31 @@ pip install --no-cache-dir --no-deps --root-user-action=ignore --no-build-isolat
     echo "Warning: DeepGEMM install failed. GLM-5.1 (DSA) will not be able to load;"
     echo "         other presets are unaffected. Override DEEPGEMM_REF to pin a commit."
 }
+
+# vLLM main (post-v0.20) ships a Rust frontend under vllm/vllm-rs (tokenizer,
+# tool/reasoning parsers, incl. the deepseek_v32 renderer used by DSA models).
+# Its pyproject build needs an actual Rust toolchain (cargo/rustc) in addition
+# to setuptools-rust, and NGC ships neither. Install rustup ONLY when the cloned
+# source actually has the Rust frontend, so older pinned versions (e.g. glm51's
+# v0.19.0, which predates it) build exactly as before. cwd is /opt/vllm here.
+if [[ -f rust-toolchain.toml || -d rust ]]; then
+    echo ""
+    echo "vLLM source has a Rust frontend — installing Rust toolchain (rustup)..."
+    export RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo
+    RUST_CHANNEL=$(grep -oE 'channel[[:space:]]*=[[:space:]]*"[^"]+"' rust-toolchain.toml 2>/dev/null | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+    RUST_CHANNEL="${RUST_CHANNEL:-stable}"
+    echo "  Pinned Rust channel: ${RUST_CHANNEL}"
+    if ! command -v cargo >/dev/null 2>&1; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --profile minimal --default-toolchain "${RUST_CHANNEL}"
+    fi
+    export PATH="${CARGO_HOME}/bin:${PATH}"
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "ERROR: cargo not on PATH after rustup install; cannot build vLLM Rust frontend."
+        exit 1
+    fi
+    echo "  Rust toolchain ready: $(cargo --version)"
+fi
 
 # Build and install vLLM
 echo ""
@@ -1051,6 +1243,21 @@ else:
 # Check vLLM
 import vllm
 print(f"\nvLLM: {vllm.__version__}")
+
+# Check the OpenAI serving stack. `import vllm` succeeding is NOT enough — the
+# api_server pulls runtime deps (uvloop, fastapi, compressed_tensors, xgrammar)
+# that --no-deps / a poisoned resolver can silently drop, yielding a container
+# that builds but can't `vllm serve`. Fail the build loudly instead of shipping
+# that (this is exactly how the glm52-on-26.05 dep break slipped through once).
+try:
+    import vllm.entrypoints.openai.api_server  # noqa: F401  (pulls uvloop+fastapi)
+    import compressed_tensors  # noqa: F401
+    import xgrammar  # noqa: F401
+    print("Serving stack (api_server + compressed_tensors + xgrammar): ✓")
+except Exception as e:
+    print(f"\n✗ FATAL: serving-stack import failed: {e!r}")
+    print("  Container builds but cannot serve — check the dependency-install phase.")
+    sys.exit(1)
 
 # Check if CUDA graphs work (this is the key test)
 try:

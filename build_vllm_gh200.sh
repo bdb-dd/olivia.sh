@@ -706,163 +706,6 @@ else:
             print(f"WARNING: expected 1 match, found {n} — patch skipped, inspect manually")
 PYPATCH_MINLATENCY
 
-# Patch: make the Kimi K2 reasoning parser actually count reasoning tokens.
-# vLLM's base ReasoningParser.count_reasoning_tokens() returns 0 unless a parser
-# opts in, and kimi_k2 never overrides it -> usage reasoning_tokens is always 0.
-# Kimi K2/K2.7 also typically omit the <think> start token (reasoning begins at
-# the start, ended by </think> or a tool-call section), so a naive start/end
-# depth counter would also be 0. Mirror the parser's own extract_reasoning().
-echo "Patching vllm/reasoning/kimi_k2_reasoning_parser.py: count reasoning tokens..."
-python3 << 'PYPATCH_REASONING_COUNT'
-from pathlib import Path
-fp = Path('vllm/reasoning/kimi_k2_reasoning_parser.py')
-if not fp.exists():
-    print(f"{fp} not found (OK, may be a different vLLM layout)")
-else:
-    src = fp.read_text()
-    if 'def count_reasoning_tokens' in src:
-        print("Already patched (OK)")
-    else:
-        method = (
-            "    def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:\n"
-            "        # Olivia patch: base default returns 0; Kimi K2 omits the\n"
-            "        # <think> start token, so count tokens before the first\n"
-            "        # </think>/tool-call-section marker, dropping a leading\n"
-            "        # <think>. Mirrors extract_reasoning.\n"
-            "        if self._identity_parser is not None:\n"
-            "            return 0\n"
-            "        end_idx = None\n"
-            "        for i, t in enumerate(token_ids):\n"
-            "            if t == self._end_token_id or (\n"
-            "                self._tool_section_start_token_id is not None\n"
-            "                and t == self._tool_section_start_token_id\n"
-            "            ):\n"
-            "                end_idx = i\n"
-            "                break\n"
-            "        ids = list(token_ids)\n"
-            "        region = ids[:end_idx] if end_idx is not None else ids\n"
-            "        return sum(1 for t in region if t != self._start_token_id)\n\n"
-        )
-        marker = "    def extract_reasoning(\n"
-        if marker in src:
-            fp.write_text(src.replace(marker, method + marker, 1))
-            print("Patched: added count_reasoning_tokens override")
-        else:
-            print("extract_reasoning marker not found (OK, different vLLM)")
-PYPATCH_REASONING_COUNT
-
-# Patch: surface reasoning_tokens on /v1/chat/completions usage. vLLM 0.21 only
-# reports it on /v1/responses; chat/completions has no completion_tokens_details
-# at all. Add the type+field to UsageInfo and populate it (via the reasoning
-# parser's count_reasoning_tokens) in both the non-streaming and streaming paths.
-echo "Patching chat/completions usage for reasoning_tokens (protocol + serving)..."
-python3 << 'PYPATCH_CHAT_REASONING'
-from pathlib import Path
-proto = Path('vllm/entrypoints/openai/engine/protocol.py')
-if not proto.exists():
-    print(f"{proto} not found (OK, different vLLM layout)")
-else:
-    p = proto.read_text()
-    if 'class CompletionTokenUsageInfo' in p:
-        print("protocol already patched (OK)")
-    else:
-        old = (
-            "class UsageInfo(OpenAIBaseModel):\n"
-            "    prompt_tokens: int = 0\n"
-            "    total_tokens: int = 0\n"
-            "    completion_tokens: int | None = 0\n"
-            "    prompt_tokens_details: PromptTokenUsageInfo | None = None\n"
-        )
-        new = (
-            "class CompletionTokenUsageInfo(OpenAIBaseModel):\n"
-            "    reasoning_tokens: int | None = None\n\n\n"
-            "class UsageInfo(OpenAIBaseModel):\n"
-            "    prompt_tokens: int = 0\n"
-            "    total_tokens: int = 0\n"
-            "    completion_tokens: int | None = 0\n"
-            "    prompt_tokens_details: PromptTokenUsageInfo | None = None\n"
-            "    completion_tokens_details: CompletionTokenUsageInfo | None = None\n"
-        )
-        if old in p:
-            proto.write_text(p.replace(old, new, 1))
-            print("protocol patched")
-        else:
-            print("protocol UsageInfo block not found (OK, different vLLM)")
-
-serv = Path('vllm/entrypoints/openai/chat_completion/serving.py')
-if not serv.exists():
-    print(f"{serv} not found (OK, different vLLM layout)")
-else:
-    s = serv.read_text()
-    orig = s
-    if 'CompletionTokenUsageInfo' not in s and '    PromptTokenUsageInfo,\n' in s:
-        s = s.replace('    PromptTokenUsageInfo,\n',
-                      '    CompletionTokenUsageInfo,\n    PromptTokenUsageInfo,\n', 1)
-    ns_old = (
-        "        usage = UsageInfo(\n"
-        "            prompt_tokens=num_prompt_tokens,\n"
-        "            completion_tokens=num_generated_tokens,\n"
-        "            total_tokens=num_prompt_tokens + num_generated_tokens,\n"
-        "        )\n"
-        "        if self.enable_prompt_tokens_details and final_res.num_cached_tokens:\n"
-    )
-    ns_new = (
-        "        usage = UsageInfo(\n"
-        "            prompt_tokens=num_prompt_tokens,\n"
-        "            completion_tokens=num_generated_tokens,\n"
-        "            total_tokens=num_prompt_tokens + num_generated_tokens,\n"
-        "        )\n"
-        "        if reasoning_parser is not None:\n"
-        "            _reasoning_toks = sum(\n"
-        "                reasoning_parser.count_reasoning_tokens(output.token_ids)\n"
-        "                for output in final_res.outputs\n"
-        "            )\n"
-        "            if _reasoning_toks:\n"
-        "                usage.completion_tokens_details = CompletionTokenUsageInfo(\n"
-        "                    reasoning_tokens=_reasoning_toks\n"
-        "                )\n"
-        "        if self.enable_prompt_tokens_details and final_res.num_cached_tokens:\n"
-    )
-    if 'usage.completion_tokens_details' not in s and ns_old in s:
-        s = s.replace(ns_old, ns_new, 1)
-    st_old = (
-        "                final_usage = UsageInfo(\n"
-        "                    prompt_tokens=num_prompt_tokens,\n"
-        "                    completion_tokens=completion_tokens,\n"
-        "                    total_tokens=num_prompt_tokens + completion_tokens,\n"
-        "                )\n"
-        "                if self.enable_prompt_tokens_details and num_cached_tokens:\n"
-    )
-    st_new = (
-        "                final_usage = UsageInfo(\n"
-        "                    prompt_tokens=num_prompt_tokens,\n"
-        "                    completion_tokens=completion_tokens,\n"
-        "                    total_tokens=num_prompt_tokens + completion_tokens,\n"
-        "                )\n"
-        "                if (\n"
-        "                    reasoning_parser is not None\n"
-        "                    and all_previous_token_ids is not None\n"
-        "                ):\n"
-        "                    _reasoning_toks = sum(\n"
-        "                        reasoning_parser.count_reasoning_tokens(ids)\n"
-        "                        for ids in all_previous_token_ids\n"
-        "                    )\n"
-        "                    if _reasoning_toks:\n"
-        "                        final_usage.completion_tokens_details = (\n"
-        "                            CompletionTokenUsageInfo(\n"
-        "                                reasoning_tokens=_reasoning_toks\n"
-        "                            )\n"
-        "                        )\n"
-        "                if self.enable_prompt_tokens_details and num_cached_tokens:\n"
-    )
-    if 'final_usage.completion_tokens_details' not in s and st_old in s:
-        s = s.replace(st_old, st_new, 1)
-    if s != orig:
-        serv.write_text(s)
-        print("serving patched")
-    else:
-        print("serving already patched or markers not found (OK)")
-PYPATCH_CHAT_REASONING
 # -----------------------------------------------------------------------------
 # Graft requested upstream vLLM PRs (patch-during-build)
 # -----------------------------------------------------------------------------
@@ -915,22 +758,30 @@ if [[ -n "${VLLM_PATCHES:-}" ]]; then
 fi
 
 # -----------------------------------------------------------------------------
-# Local patch: surface reasoning_tokens on /v1/chat/completions usage (GLM-5.x)
+# Local patch: surface reasoning_tokens on /v1/chat/completions usage
 # -----------------------------------------------------------------------------
 # vLLM reports reasoning_tokens only on /v1/responses; chat/completions has no
-# completion_tokens_details at all. GLM-5.x (the glm45 reasoning parser =
-# DeepSeekV3ReasoningWithThinkingParser) also never counts reasoning tokens: the
-# base ReasoningParser.count_reasoning_tokens() returns 0, the V3 wrapper does
-# not forward it, and GLM emits </think> but omits the <think> START token (it
-# lives in the prompt) so the inner R1 parser's start/end depth counter is 0 too.
-# This patch (a) adds a correct count_reasoning_tokens to DeepSeekV3ReasoningParser,
-# (b) adds CompletionTokenUsageInfo + UsageInfo.completion_tokens_details to the
-# protocol, and (c) populates it in both the non-streaming and streaming chat
-# usage paths. All edits are idempotent and defensive: a missing anchor logs and
-# no-ops (a future vLLM refactor never fails the build or half-patches the tree),
-# and the runtime guards mean non-reasoning models are unaffected. cwd /opt/vllm.
+# completion_tokens_details at all, and neither the kimi_k2 parser nor the glm45
+# parser (DeepSeekV3ReasoningWithThinkingParser) counts reasoning tokens — the
+# base ReasoningParser.count_reasoning_tokens() returns 0, and both families emit
+# the reasoning-end token but omit the <think> START token (it lives in the
+# prompt), so an inherited start/end depth counter is 0 too. This one block:
+#   (1) adds count_reasoning_tokens to BOTH parsers (kimi_k2 + DeepSeekV3),
+#   (2) adds CompletionTokenUsageInfo + UsageInfo.completion_tokens_details to the
+#       protocol (once), and
+#   (3) populates it in the non-streaming + streaming chat usage paths, tolerant
+#       of BOTH vLLM 0.21 (var `reasoning_parser`, `all_previous_token_ids`) and
+#       vLLM main (var `parser`/`parsers`, own `previous_token_ids` accumulator).
+# Every edit is idempotent + defensive (a missing anchor logs and no-ops, so a
+# future vLLM refactor never fails the build or half-patches the tree). For the
+# serving paths the 0.21-specific anchors (which carry the trailing
+# enable_prompt_tokens_details line) are tried FIRST and the bare main anchors
+# SECOND under a `*.completion_tokens_details not in s` guard, so the main-only
+# `parser` variable is never injected into 0.21's serving; the main streaming
+# path is additionally gated on the 0.21 path not having applied so a 0.21 build
+# gets no dead accumulator. cwd /opt/vllm.
 echo ""
-echo "Patching vLLM for GLM reasoning_tokens on chat/completions usage..."
+echo "Patching vLLM for reasoning_tokens on chat/completions usage (kimi + GLM)..."
 python3 << 'PYPATCH_REASONING_TOKENS'
 from pathlib import Path
 
@@ -949,17 +800,49 @@ def patch(rel, fn):
     fp.write_text(out)
 
 
-# ---- 1. parser: count_reasoning_tokens override on DeepSeekV3ReasoningParser ----
-def patch_parser(s):
+# ---- parser A: kimi_k2 (Kimi K2.x) count_reasoning_tokens ----
+def patch_kimi_parser(s):
     if "def count_reasoning_tokens" in s:
-        print("  parser: already patched (OK)")
+        print("  kimi parser: already patched (OK)")
+        return s
+    marker = "    def extract_reasoning(\n"
+    if marker not in s:
+        print("  kimi parser: anchor not found (OK, different vLLM) -- skipping")
+        return s
+    method = (
+        "    def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:\n"
+        "        # Olivia patch: base default returns 0; Kimi K2 omits the <think>\n"
+        "        # start token, so count tokens before the first </think>/tool-call\n"
+        "        # marker, dropping a leading <think>. Mirrors extract_reasoning.\n"
+        "        if self._identity_parser is not None:\n"
+        "            return 0\n"
+        "        end_idx = None\n"
+        "        for i, t in enumerate(token_ids):\n"
+        "            if t == self._end_token_id or (\n"
+        "                self._tool_section_start_token_id is not None\n"
+        "                and t == self._tool_section_start_token_id\n"
+        "            ):\n"
+        "                end_idx = i\n"
+        "                break\n"
+        "        ids = list(token_ids)\n"
+        "        region = ids[:end_idx] if end_idx is not None else ids\n"
+        "        return sum(1 for t in region if t != self._start_token_id)\n\n"
+    )
+    print("  kimi parser: patched (count_reasoning_tokens added)")
+    return s.replace(marker, method + marker, 1)
+
+
+# ---- parser B: GLM DeepSeekV3 count_reasoning_tokens ----
+def patch_glm_parser(s):
+    if "def count_reasoning_tokens" in s:
+        print("  glm parser: already patched (OK)")
         return s
     anchor = (
         "    def extract_content_ids(self, input_ids: list[int]) -> list[int]:\n"
         "        return self._parser.extract_content_ids(input_ids)\n"
     )
     if anchor not in s:
-        print("  parser: anchor not found (OK, different vLLM) -- skipping")
+        print("  glm parser: anchor not found (OK, different vLLM) -- skipping")
         return s
     method = (
         "\n"
@@ -983,11 +866,11 @@ def patch_parser(s):
         "        region = ids[:end_idx] if end_idx is not None else ids\n"
         "        return sum(1 for t in region if t != start_id)\n"
     )
-    print("  parser: patched (count_reasoning_tokens added)")
+    print("  glm parser: patched (count_reasoning_tokens added)")
     return s.replace(anchor, anchor + method, 1)
 
 
-# ---- 2. protocol: CompletionTokenUsageInfo + UsageInfo field ----
+# ---- protocol: CompletionTokenUsageInfo + UsageInfo field (shared) ----
 def patch_protocol(s):
     if "class CompletionTokenUsageInfo" in s:
         print("  protocol: already patched (OK)")
@@ -1016,28 +899,54 @@ def patch_protocol(s):
     return s.replace(old, new, 1)
 
 
-# ---- 3. serving: import + non-streaming + streaming usage ----
+# ---- serving: import + non-streaming + streaming, tolerant of 0.21 AND main ----
 def patch_serving(s):
-    # 3a. import CompletionTokenUsageInfo alongside PromptTokenUsageInfo
-    if "CompletionTokenUsageInfo" not in s:
-        imp = "    PromptTokenUsageInfo,\n"
-        if imp in s:
-            s = s.replace(
-                imp, "    CompletionTokenUsageInfo,\n    PromptTokenUsageInfo,\n", 1
-            )
-            print("  serving: import added")
-        else:
-            print("  serving: import marker not found (OK, different vLLM)")
+    # import CompletionTokenUsageInfo (shared by both eras)
+    if "CompletionTokenUsageInfo" not in s and "    PromptTokenUsageInfo,\n" in s:
+        s = s.replace(
+            "    PromptTokenUsageInfo,\n",
+            "    CompletionTokenUsageInfo,\n    PromptTokenUsageInfo,\n", 1,
+        )
+        print("  serving: import added")
 
-    # 3b. non-streaming usage (chat_completion_full_generator; `parser` in scope)
-    ns_old = (
+    # non-streaming: vLLM 0.21 (specific anchor + `reasoning_parser`) first ...
+    ns021_old = (
+        "        usage = UsageInfo(\n"
+        "            prompt_tokens=num_prompt_tokens,\n"
+        "            completion_tokens=num_generated_tokens,\n"
+        "            total_tokens=num_prompt_tokens + num_generated_tokens,\n"
+        "        )\n"
+        "        if self.enable_prompt_tokens_details and final_res.num_cached_tokens:\n"
+    )
+    ns021_new = (
+        "        usage = UsageInfo(\n"
+        "            prompt_tokens=num_prompt_tokens,\n"
+        "            completion_tokens=num_generated_tokens,\n"
+        "            total_tokens=num_prompt_tokens + num_generated_tokens,\n"
+        "        )\n"
+        "        if reasoning_parser is not None:\n"
+        "            _reasoning_toks = sum(\n"
+        "                reasoning_parser.count_reasoning_tokens(output.token_ids)\n"
+        "                for output in final_res.outputs\n"
+        "            )\n"
+        "            if _reasoning_toks:\n"
+        "                usage.completion_tokens_details = CompletionTokenUsageInfo(\n"
+        "                    reasoning_tokens=_reasoning_toks\n"
+        "                )\n"
+        "        if self.enable_prompt_tokens_details and final_res.num_cached_tokens:\n"
+    )
+    if "usage.completion_tokens_details" not in s and ns021_old in s:
+        s = s.replace(ns021_old, ns021_new, 1)
+        print("  serving: non-streaming (vLLM 0.21) populated")
+    # ... then vLLM main (bare anchor + `parser.reasoning_parser`), guarded.
+    nsmain_old = (
         "        usage = UsageInfo(\n"
         "            prompt_tokens=num_prompt_tokens,\n"
         "            completion_tokens=num_generated_tokens,\n"
         "            total_tokens=num_prompt_tokens + num_generated_tokens,\n"
         "        )\n"
     )
-    ns_new = ns_old + (
+    nsmain_new = nsmain_old + (
         "        if parser is not None and parser.reasoning_parser is not None:\n"
         "            _reasoning_toks = sum(\n"
         "                parser.reasoning_parser.count_reasoning_tokens(output.token_ids)\n"
@@ -1048,67 +957,97 @@ def patch_serving(s):
         "                    reasoning_tokens=_reasoning_toks\n"
         "                )\n"
     )
-    if "usage.completion_tokens_details" not in s and ns_old in s:
-        s = s.replace(ns_old, ns_new, 1)
-        print("  serving: non-streaming usage populated")
-    elif "usage.completion_tokens_details" not in s:
+    if "usage.completion_tokens_details" not in s and nsmain_old in s:
+        s = s.replace(nsmain_old, nsmain_new, 1)
+        print("  serving: non-streaming (vLLM main) populated")
+    if "usage.completion_tokens_details" not in s:
         print("  serving: non-streaming anchor not found (OK, different vLLM)")
 
-    # 3c. streaming per-choice token-id accumulator (declaration)
-    acc_old = '        previous_texts = [""] * num_choices\n'
-    acc_new = acc_old + (
-        "        previous_token_ids: list[list[int]] = [[] for _ in range(num_choices)]\n"
-    )
-    if "previous_token_ids" not in s and acc_old in s:
-        s = s.replace(acc_old, acc_new, 1)
-        print("  serving: streaming accumulator declared")
-    elif "previous_token_ids" not in s:
-        print("  serving: streaming accumulator anchor not found (OK, different vLLM)")
-
-    # 3d. streaming accumulator append (inside the per-output loop)
-    app_old = "                    previous_num_tokens[i] += len(output.token_ids)\n"
-    app_new = app_old + (
-        "                    previous_token_ids[i].extend(as_list(output.token_ids))\n"
-    )
-    if "previous_token_ids[i].extend" not in s and app_old in s:
-        s = s.replace(app_old, app_new, 1)
-        print("  serving: streaming accumulator append wired")
-    elif "previous_token_ids[i].extend" not in s:
-        print("  serving: streaming append anchor not found (OK, different vLLM)")
-
-    # 3e. streaming final_usage population
-    st_old = (
+    # streaming: vLLM 0.21 first (uses pre-existing all_previous_token_ids) ...
+    st021_old = (
         "                final_usage = UsageInfo(\n"
         "                    prompt_tokens=num_prompt_tokens,\n"
         "                    completion_tokens=completion_tokens,\n"
         "                    total_tokens=num_prompt_tokens + completion_tokens,\n"
         "                )\n"
+        "                if self.enable_prompt_tokens_details and num_cached_tokens:\n"
     )
-    st_new = st_old + (
-        "                _reasoning_toks = 0\n"
-        "                for _i in range(num_choices):\n"
-        "                    _p = parsers[_i] if _i < len(parsers) else None\n"
-        "                    if _p is not None and _p.reasoning_parser is not None:\n"
-        "                        _reasoning_toks += (\n"
-        "                            _p.reasoning_parser.count_reasoning_tokens(\n"
-        "                                previous_token_ids[_i]\n"
+    st021_new = (
+        "                final_usage = UsageInfo(\n"
+        "                    prompt_tokens=num_prompt_tokens,\n"
+        "                    completion_tokens=completion_tokens,\n"
+        "                    total_tokens=num_prompt_tokens + completion_tokens,\n"
+        "                )\n"
+        "                if (\n"
+        "                    reasoning_parser is not None\n"
+        "                    and all_previous_token_ids is not None\n"
+        "                ):\n"
+        "                    _reasoning_toks = sum(\n"
+        "                        reasoning_parser.count_reasoning_tokens(ids)\n"
+        "                        for ids in all_previous_token_ids\n"
+        "                    )\n"
+        "                    if _reasoning_toks:\n"
+        "                        final_usage.completion_tokens_details = (\n"
+        "                            CompletionTokenUsageInfo(\n"
+        "                                reasoning_tokens=_reasoning_toks\n"
         "                            )\n"
         "                        )\n"
-        "                if _reasoning_toks:\n"
-        "                    final_usage.completion_tokens_details = (\n"
-        "                        CompletionTokenUsageInfo(reasoning_tokens=_reasoning_toks)\n"
-        "                    )\n"
+        "                if self.enable_prompt_tokens_details and num_cached_tokens:\n"
     )
-    if "final_usage.completion_tokens_details" not in s and st_old in s:
-        s = s.replace(st_old, st_new, 1)
-        print("  serving: streaming final_usage populated")
-    elif "final_usage.completion_tokens_details" not in s:
-        print("  serving: streaming final_usage anchor not found (OK, different vLLM)")
+    if "final_usage.completion_tokens_details" not in s and st021_old in s:
+        s = s.replace(st021_old, st021_new, 1)
+        print("  serving: streaming (vLLM 0.21) populated")
+    # ... then vLLM main, ONLY if 0.21 didn't apply (no dead accumulator on 0.21).
+    if "final_usage.completion_tokens_details" not in s:
+        acc_old = '        previous_texts = [""] * num_choices\n'
+        if "previous_token_ids" not in s and acc_old in s:
+            s = s.replace(
+                acc_old,
+                acc_old
+                + "        previous_token_ids: list[list[int]] = [[] for _ in range(num_choices)]\n",
+                1,
+            )
+        app_old = "                    previous_num_tokens[i] += len(output.token_ids)\n"
+        if "previous_token_ids[i].extend" not in s and app_old in s:
+            s = s.replace(
+                app_old,
+                app_old
+                + "                    previous_token_ids[i].extend(as_list(output.token_ids))\n",
+                1,
+            )
+        stmain_old = (
+            "                final_usage = UsageInfo(\n"
+            "                    prompt_tokens=num_prompt_tokens,\n"
+            "                    completion_tokens=completion_tokens,\n"
+            "                    total_tokens=num_prompt_tokens + completion_tokens,\n"
+            "                )\n"
+        )
+        stmain_new = stmain_old + (
+            "                _reasoning_toks = 0\n"
+            "                for _i in range(num_choices):\n"
+            "                    _p = parsers[_i] if _i < len(parsers) else None\n"
+            "                    if _p is not None and _p.reasoning_parser is not None:\n"
+            "                        _reasoning_toks += (\n"
+            "                            _p.reasoning_parser.count_reasoning_tokens(\n"
+            "                                previous_token_ids[_i]\n"
+            "                            )\n"
+            "                        )\n"
+            "                if _reasoning_toks:\n"
+            "                    final_usage.completion_tokens_details = (\n"
+            "                        CompletionTokenUsageInfo(reasoning_tokens=_reasoning_toks)\n"
+            "                    )\n"
+        )
+        if stmain_old in s:
+            s = s.replace(stmain_old, stmain_new, 1)
+            print("  serving: streaming (vLLM main) populated")
+    if "final_usage.completion_tokens_details" not in s:
+        print("  serving: streaming anchor not found (OK, different vLLM)")
 
     return s
 
 
-patch("vllm/reasoning/deepseek_v3_reasoning_parser.py", patch_parser)
+patch("vllm/reasoning/kimi_k2_reasoning_parser.py", patch_kimi_parser)
+patch("vllm/reasoning/deepseek_v3_reasoning_parser.py", patch_glm_parser)
 patch("vllm/entrypoints/openai/engine/protocol.py", patch_protocol)
 patch("vllm/entrypoints/openai/chat_completion/serving.py", patch_serving)
 print("reasoning_tokens patch done.")

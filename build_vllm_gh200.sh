@@ -1160,6 +1160,15 @@ echo "  Transformers package: ${TRANSFORMERS_PKG}"
 # Parse requirements but skip torch-related packages
 # This is the key step - we install everything EXCEPT torch
 # Then vLLM will be installed with --no-deps so it can't overwrite torch
+#
+# fastapi is capped <0.137: fastapi 0.137 introduced an `_IncludedRouter` route
+# type that prometheus-fastapi-instrumentator 8.0.0 (pulled below) doesn't handle
+# — its routing._get_route_name does `route.path`, which `_IncludedRouter` lacks,
+# so EVERY request (incl. /health) 500s with "AttributeError: '_IncludedRouter'
+# object has no attribute 'path'" and the server never goes ready. Builds before
+# ~2026-06-15 got fastapi 0.136.x and worked (e.g. the kimi 0.21 container); the
+# laguna build on 2026-06-19 pulled 0.137.2 and broke. Cap until the instrumentator
+# ships a fix. Affects every preset's HTTP layer, so the pin lives here, not per-preset.
 pip install --no-cache-dir \
     --root-user-action=ignore \
     --constraint /tmp/constraints.txt \
@@ -1167,7 +1176,7 @@ pip install --no-cache-dir \
     "${TRANSFORMERS_PKG}" \
     tokenizers>=0.19.0 \
     sentencepiece \
-    fastapi \
+    "fastapi<0.137" \
     uvicorn[standard] \
     uvloop \
     loguru \

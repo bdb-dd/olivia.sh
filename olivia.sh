@@ -1140,6 +1140,7 @@ normalize_preset() {
         glm47|glm-4.7)                  echo "glm47" ;;
         kimi|kimi26|kimi-k2.6|kimi_k26) echo "kimi" ;;
         kimi27|kimi-k2.7|kimi_k27|kimi-k2.7-code|kimi27code) echo "kimi27" ;;
+        laguna|laguna-m1|laguna_m1|lagunam1|laguna-m.1|laguna_m.1) echo "laguna" ;;
         devstral|mistral)               echo "devstral" ;;
         llama|llama3)                   echo "llama" ;;
         qwen|qwen2)                     echo "qwen" ;;
@@ -1216,6 +1217,16 @@ preset_field() {
             prefix="kimi"; index="4"
             model="moonshotai/Kimi-K2.7-Code"
             nodes="2"; gpus="4"; pp="2"
+            ;;
+        laguna)
+            # Laguna M.1 (Poolside): 225B total / 23B active MoE coding model
+            # (LagunaForCausalLM, 256 experts top-k=16, dense GQA full attention,
+            # 256K context). Default quant is block-FP8 (poolside/Laguna-M.1-FP8,
+            # ~225 GB) which fits a SINGLE GH200 node at TP=4 — no cross-node PP,
+            # unlike glm52's 3-node FP8. Single-node defaults (nodes=1/gpus=4/pp=1)
+            # apply. Native vLLM support (>=0.21.0); ordinary attention so it keeps
+            # FLASH_ATTN and lets CUDAGraph capture run (no eager override).
+            model="poolside/Laguna-M.1-FP8"
             ;;
         devstral)
             model="mistralai/Devstral-2-123B-Instruct-2512"

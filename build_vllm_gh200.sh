@@ -73,6 +73,10 @@ show_presets() {
     echo "               vLLM: v0.19.1, transformers>=4.57.1,<5.0.0"
     echo "               native int4 ~640GB, 8 GPUs (2 nodes × 4× GH200, TP=4 + PP=2)"
     echo ""
+    echo "  laguna     - Laguna M.1 (Poolside, 225B / 23B active) MoE coding model"
+    echo "               vLLM: v0.21.0 (native Laguna), transformers>=5.7.0"
+    echo "               FP8 ~225GB, single node (4× GH200, TP=4); poolside_v1 parsers"
+    echo ""
     echo "  devstral   - Devstral/Mistral models (7B-123B)"
     echo "               vLLM: main, transformers>=4.45.0"
     echo "               Standard Mistral architecture"
@@ -220,6 +224,24 @@ apply_preset() {
             # 0.21 build experiment (PRESET_TRANSFORMERS='>=5').
             PRESET_TRANSFORMERS="${PRESET_TRANSFORMERS:->=4.57.1,<5.0.0}"
             PRESET_NOTES="Kimi K2.6 (1T MoE, MLA, multimodal): native int4, multi-node TP=4 + PP=2, kimi_k2 parser"
+            ;;
+        laguna|Laguna|laguna-m1|laguna-m.1|Laguna-M.1)
+            MODEL_ID="laguna"
+            # Laguna M.1 (Poolside): 225B / 23B-active MoE coding model,
+            # LagunaForCausalLM, natively supported in vLLM since v0.21.0
+            # (PR#41129 added the Laguna arch + the poolside_v1 tool/reasoning
+            # parsers). transformers >=5.7.0 is the first release to ship the
+            # "laguna" model_type. Default quant is block-FP8
+            # (poolside/Laguna-M.1-FP8) — auto-detected from quantization_config,
+            # so no --quantization flag and no special DeepGEMM pin needed
+            # (ordinary block-FP8, unlike glm52's DSA-indexer fp8_fp4_mqa_logits).
+            PRESET_VLLM_VERSION="v0.21.0"
+            PRESET_TRANSFORMERS=">=5.7.0"
+            # NGC base: inherit the 26.03 default. The validated vLLM-0.21 Kimi
+            # container builds AND serves on 26.03, so 0.21-era vLLM compiles
+            # there. If v0.21.0's csrc/libtorch_stable hits the torch::stable ABI
+            # wall (the glm52-on-main failure), bump NGC_PYTORCH_TAG=26.05-py3.
+            PRESET_NOTES="Laguna M.1 (Poolside, 225B/23B MoE) FP8, single-node TP=4. vLLM v0.21.0 (native Laguna), transformers>=5.7.0, poolside_v1 parsers."
             ;;
         devstral|mistral|Devstral|Mistral)
             MODEL_ID="devstral"

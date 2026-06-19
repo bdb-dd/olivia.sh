@@ -107,6 +107,15 @@ GLM_REASONING_PARSER="${GLM_REASONING_PARSER:-glm45}"
 # output without reasoning extraction.)
 KIMI_TOOL_PARSER="${KIMI_TOOL_PARSER:-kimi_k2}"
 KIMI_REASONING_PARSER="${KIMI_REASONING_PARSER:-kimi_k2}"
+# Laguna (Poolside) parsers — used when MODEL contains "Laguna". vLLM's PR#41129
+# registers "poolside_v1" as both the tool-call and reasoning parser. Laguna has
+# native reasoning; the reasoning parser extracts it into reasoning_content.
+# Set either to "" to omit it. Thinking mode: the model card's recommended serve
+# command passes enable_thinking via the default chat-template kwargs — keep it
+# behind LAGUNA_ENABLE_THINKING (set to 0 to serve instant, no reasoning).
+LAGUNA_TOOL_PARSER="${LAGUNA_TOOL_PARSER:-poolside_v1}"
+LAGUNA_REASONING_PARSER="${LAGUNA_REASONING_PARSER:-poolside_v1}"
+LAGUNA_ENABLE_THINKING="${LAGUNA_ENABLE_THINKING:-1}"
 # ENABLE_AUTO_TOOL_CHOICE default is model-dependent and gets resolved after
 # GLM detection below: 1 for GLM MoE models (tool parser is always set),
 # 0 elsewhere. Users can still override explicitly.
@@ -295,6 +304,16 @@ if [[ "${MODEL}" == *"Kimi-K2"* ]] || [[ "${MODEL}" == *"kimi-k2"* ]]; then
     IS_KIMI=1
 fi
 
+# Detect Laguna (Poolside). 225B / 23B-active MoE coding model
+# (LagunaForCausalLM), natively supported in vLLM >=0.21.0. Ordinary dense full
+# attention + GQA (NOT MLA), so it keeps the FLASH_ATTN default and lets
+# CUDAGraph capture run — no eager override like Kimi/glm52. Uses the poolside_v1
+# tool + reasoning parser family.
+IS_LAGUNA=0
+if [[ "${MODEL}" == *"Laguna"* ]] || [[ "${MODEL}" == *"laguna"* ]]; then
+    IS_LAGUNA=1
+fi
+
 # Kimi K2.6's fused MLA op (vllm.min_latency_fused_qkv_a_proj) has no fake/meta
 # dispatch, so vLLM's torch.compile/CUDAGraph path fails during profile_run on
 # this multi-node PP setup ("Multiple dispatch failed ... NotImplemented", from
@@ -326,7 +345,7 @@ fi
 # any OpenAI tool-using client (Claude Code via anthropic_proxy.py, etc.).
 # ``${VAR+x}`` distinguishes "user explicitly set (even to 0)" from "unset".
 if [[ -z "${ENABLE_AUTO_TOOL_CHOICE+x}" ]]; then
-    if [[ "${IS_GLM_MOE}" == "1" || "${IS_KIMI}" == "1" ]]; then
+    if [[ "${IS_GLM_MOE}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" ]]; then
         ENABLE_AUTO_TOOL_CHOICE=1
     else
         ENABLE_AUTO_TOOL_CHOICE=0
@@ -338,9 +357,9 @@ fi
 # matches typical Claude Code usage (which requests max_tokens=32000).
 # Other models keep the conservative 32K default.
 if [[ -z "${MAX_MODEL_LEN+x}" ]]; then
-    if [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" ]]; then
-        # GLM-5.1 ~205K, GLM-5.2 ~1M, Kimi K2.6 ~256K native — all ship far
-        # larger windows, but 128K is the safe default within our KV budget.
+    if [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" ]]; then
+        # GLM-5.1 ~205K, GLM-5.2 ~1M, Kimi K2.6 ~256K, Laguna M.1 ~256K native —
+        # all ship far larger windows, but 128K is the safe default within budget.
         # On glm52's 3-node FP8 (~18 GB/GPU KV), 128K holds a few concurrent
         # sequences; raise with --kv-cache-dtype fp8 (see KV_CACHE_DTYPE) or
         # fewer seqs.
@@ -550,6 +569,15 @@ if [[ "${IS_KIMI}" == "1" ]]; then
     echo "  Auto Tool Choice: ${ENABLE_AUTO_TOOL_CHOICE}"
     echo "  Multimodal:       MoonViT (mm-encoder-tp-mode=data)"
     echo "  Expert Parallel:  ${USE_EXPERT_PARALLEL}"
+fi
+
+if [[ "${IS_LAGUNA}" == "1" ]]; then
+    echo ""
+    echo "Laguna M.1 Settings:"
+    echo "  Tool Parser:      ${LAGUNA_TOOL_PARSER:-<none>}"
+    echo "  Reasoning Parser: ${LAGUNA_REASONING_PARSER:-<none>}"
+    echo "  Auto Tool Choice: ${ENABLE_AUTO_TOOL_CHOICE}"
+    echo "  Thinking Mode:    ${LAGUNA_ENABLE_THINKING}"
 fi
 
 if [[ "${NUM_NODES}" -gt 1 ]]; then
@@ -880,6 +908,31 @@ if [[ "${IS_KIMI}" == "1" ]]; then
     # Multimodal (MoonViT vision encoder): replicate the encoder across the TP
     # group instead of sharding it (vLLM K2.6 recipe recommendation).
     VLLM_ARGS+=("--mm-encoder-tp-mode" "data")
+fi
+
+# Laguna (Poolside) arguments
+if [[ "${IS_LAGUNA}" == "1" ]]; then
+    if [[ -n "${LAGUNA_TOOL_PARSER}" ]]; then
+        VLLM_ARGS+=("--tool-call-parser" "${LAGUNA_TOOL_PARSER}")
+    fi
+    if [[ -n "${LAGUNA_REASONING_PARSER}" ]]; then
+        VLLM_ARGS+=("--reasoning-parser" "${LAGUNA_REASONING_PARSER}")
+    fi
+    if [[ "${ENABLE_AUTO_TOOL_CHOICE}" == "1" ]]; then
+        VLLM_ARGS+=("--enable-auto-tool-choice")
+    fi
+    if [[ -n "${SERVED_MODEL_NAME}" ]]; then
+        VLLM_ARGS+=("--served-model-name" "${SERVED_MODEL_NAME}")
+    fi
+    # LagunaForCausalLM is natively integrated in transformers/vLLM, but the repo
+    # still ships custom pieces (tokenizer / chat template), so the model card
+    # calls for --trust-remote-code.
+    VLLM_ARGS+=("--trust-remote-code")
+    # Thinking mode: the model card's recommended serve command enables it via
+    # the default chat-template kwargs. LAGUNA_ENABLE_THINKING=0 serves instant.
+    if [[ "${LAGUNA_ENABLE_THINKING}" == "1" ]]; then
+        VLLM_ARGS+=("--default-chat-template-kwargs" '{"enable_thinking": true}')
+    fi
 fi
 
 # Expert parallel for MoE models (required for AWQ-quantized MoE like GLM-4.7-AWQ)

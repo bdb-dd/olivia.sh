@@ -131,6 +131,7 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 | `glm52` | `RedHatAI/GLM-5.2-FP8` | 12 (3 nodes × 4) | TP=4 + PP=3. Block-FP8 (~755 GB) — does **not** fit 8 GPUs, hence 3 nodes. **Needs vLLM main `091386a` (pinned) + PR#45895** (new skip-topk DSA indexer); not in any release. Same multi-node PP wedge as glm51 → proxy serialization. fp8 KV cache + DeepGEMM (`VLLM_DEEP_GEMM_WARMUP=skip`). |
 | `glm47` | `QuantTrio/GLM-4.7-AWQ` | 4 | TP=4, MTP speculative |
 | `kimi` | `moonshotai/Kimi-K2.6` | 8 (2 nodes × 4) | TP=4 + PP=2, native int4, MLA, multimodal, vLLM v0.19.1 |
+| `laguna` | `poolside/Laguna-M.1-FP8` | 4 | TP=4, single node. FP8 (~225 GB), dense full attention (FLASH_ATTN), CUDAGraph capture on. vLLM v0.21.0, `poolside_v1` parsers. |
 | `devstral` | `mistralai/Devstral-2-123B-Instruct-2512` | 4 | TP=4 |
 | `llama` | `meta-llama/Llama-3.3-70B-Instruct` | 4 | TP=4 |
 | `qwen` | `Qwen/Qwen2.5-72B-Instruct` | 4 | TP=4 |
@@ -274,6 +275,7 @@ The build script includes predefined configurations for common models. Run witho
 | `glm52` | GLM-5.2 (744B / 40B active) MoE+DSA, successor to 5.1 — FP8. Builds vLLM main pinned to `091386a` + auto-grafts PR#45895 snapshot (`VLLM_PATCHES`); not in any release | main `091386a` + PR#45895 | >=5.4.0 |
 | `glm47` | GLM-4.7 (358B) flagship model | main | >=5.0.0rc0 |
 | `kimi` | Kimi K2.6 (1T / 32B active) MoE + MLA, multimodal | v0.19.1 | >=4.57.1,<5.0.0 |
+| `laguna` | Laguna M.1 (Poolside, 225B / 23B active) MoE coding model — FP8, single-node TP=4, native vLLM Laguna support | v0.21.0 | >=5.7.0 |
 | `devstral` | Devstral/Mistral models | main | >=4.45.0 |
 | `llama` | Llama 3.x models | main | >=4.45.0 |
 | `qwen` | Qwen 2.5 models | main | >=4.45.0 |
@@ -565,6 +567,66 @@ KIMI_REASONING_PARSER="" CONTAINER=vllm-kimi-4-sandbox MODEL=moonshotai/Kimi-K2.
 |--------------|------------|----------------------|-------|
 | Native int4 | ~640 GB | ~50–120 GB free (@0.90 util) | Recommended; MLA keeps KV cache compact |
 | BF16 | ~2 TB | Won't fit | — |
+
+### Laguna M.1 (preset `laguna`) — FP8, single-node 4×GH200
+
+Laguna M.1 (Poolside, released 2026-04-28, Apache 2.0) is a 225B-total /
+23B-active MoE coding model: `LagunaForCausalLM`, 70 layers (3 dense + 67 sparse
+MoE), 256 experts with top-k=16, **dense GQA full attention** (64 q-heads /
+8 KV-heads, 262K context, YaRN), native reasoning + tool calling. It is
+**natively integrated** into transformers (`model_type: laguna`, ≥5.7.0) and
+into vLLM since **v0.21.0** (PR#41129 added the arch and the `poolside_v1`
+tool/reasoning parsers). Unlike GLM-5.x (sparse-MLA/DSA) and Kimi (MLA), Laguna
+uses ordinary attention — so it keeps the **`FLASH_ATTN` backend** and lets
+**CUDAGraph capture run** (no eager override). The standard `CUDAGRAPH_MODE=NONE`
+escape hatch still applies if capture misbehaves on the NGC-torch stack.
+
+Default quant is **block-FP8** (`poolside/Laguna-M.1-FP8`, ~225 GB), which fits a
+**single GH200 node** at TP=4 with room for KV — no cross-node PP, so none of the
+multi-node PP decode wedge that affects glm51/glm52/kimi. FP8 is auto-detected
+from `quantization_config`, so no `--quantization` flag and no special DeepGEMM
+pin (ordinary block-FP8, not glm52's DSA-indexer `fp8_fp4_mqa_logits` path).
+
+| Quantization | Model | Size | Olivia fit |
+|--------------|-------|------|------------|
+| block-FP8 | `poolside/Laguna-M.1-FP8` | ~225 GB | **1 node × 4 GH200** (TP=4); ~150 GB free for KV @0.90 util |
+| BF16 | `poolside/Laguna-M.1` | ~450 GB | 2 nodes × 4 (TP=4 + PP=2) — not the default preset |
+| NVFP4 | `poolside/Laguna-M.1-NVFP4` | ~115 GB | **No** — needs Blackwell FP4 tensor cores (GH200 is Hopper) |
+
+**Runtime specifics auto-applied by `run_vllm_server.sh` when `MODEL` contains
+`Laguna`** (`IS_LAGUNA`): `--tool-call-parser poolside_v1`, `--reasoning-parser
+poolside_v1`, `--enable-auto-tool-choice`, `--trust-remote-code`, thinking-mode
+chat-template kwargs (`--default-chat-template-kwargs '{"enable_thinking":
+true}'`), `MAX_MODEL_LEN=131072` default (native 262K), `FLASH_ATTN` backend, and
+CUDAGraph capture left on. All parsers/knobs are overridable
+(`LAGUNA_TOOL_PARSER`, `LAGUNA_REASONING_PARSER`, `LAGUNA_ENABLE_THINKING=0` for
+instant mode). Expert parallel is **not** auto-enabled (single-node TP already
+shards the 256 experts); set `ENABLE_EXPERT_PARALLEL=1` to try it.
+
+> ⚠️ **Verify on first build/serve** (sourced from the model card / vLLM PR, not
+> yet run on Olivia): the `poolside_v1` parser names, the
+> `--default-chat-template-kwargs` flag, and that **v0.21.0 compiles on NGC
+> 26.03** (the inherited default — the validated vLLM-0.21 Kimi container builds
+> there). If the csrc/`libtorch_stable` ABI wall bites, bump
+> `NGC_PYTORCH_TAG=26.05-py3` (the glm52 base).
+
+### Laguna M.1 Usage
+
+```bash
+# 1. Prefetch the FP8 weights into the persistent HF cache (detached, resumable)
+./olivia.sh prefetch poolside/Laguna-M.1-FP8
+
+# 2. Build the container (vLLM v0.21.0, transformers >=5.7.0)
+./olivia.sh build laguna
+
+# 3. Start the server (single node × 4 GPUs, TP=4)
+./olivia.sh server start laguna
+./olivia.sh server watch
+
+# Serve instant (no reasoning extraction)
+LAGUNA_ENABLE_THINKING=0 ./olivia.sh server start laguna
+# or direct: CONTAINER=vllm-laguna-1-sandbox MODEL=poolside/Laguna-M.1-FP8 ./run_vllm_server.sh
+```
 
 ### Batching Proxy for SSH Tunnels
 

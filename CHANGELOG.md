@@ -38,6 +38,38 @@ re-deployed over the shared script).
 > deploy left the dir untouched; a submitted job's `scontrol Command` is the
 > per-branch script with `WorkDir=CONTAINER_DIR` (shared cache/logs preserved).
 
+### 2026-06-19 — Laguna M.1 preset (Poolside, FP8, single-node 4×GH200)
+
+Adds a `laguna` preset for Poolside's Laguna M.1 (225B total / 23B active MoE
+coding model, `LagunaForCausalLM`, 256 experts top-k=16, dense GQA full
+attention, 262K context). Default quant is block-FP8
+(`poolside/Laguna-M.1-FP8`, ~225 GB), which fits a **single GH200 node** at
+TP=4 — no cross-node pipeline parallel, so none of the multi-node PP decode
+wedge that affects glm51/glm52/kimi. First preset that is natively supported by
+upstream vLLM (≥ v0.21.0, PR#41129) with no graft or custom-code arch, and the
+first to keep ordinary `FLASH_ATTN` + CUDAGraph capture rather than the
+eager/MLA path the GLM-5.x and Kimi MoEs need.
+
+#### Added
+
+- **`laguna` preset** across `olivia.sh` (alias `normalize_preset` +
+  `preset_field`: `poolside/Laguna-M.1-FP8`, single-node 1×4 GPUs, TP=4),
+  `build_vllm_gh200.sh` (`apply_preset` + `show_presets`: pins `vLLM v0.21.0`,
+  `transformers >= 5.7.0`, inherits the NGC 26.03 base), and
+  `run_vllm_server.sh` (`IS_LAGUNA` detection → `--tool-call-parser
+  poolside_v1`, `--reasoning-parser poolside_v1`, `--enable-auto-tool-choice`,
+  `--trust-remote-code`, thinking-mode chat-template kwargs; 131072 default
+  context; FLASH_ATTN; CUDAGraph capture left on).
+- **Override knobs**: `LAGUNA_TOOL_PARSER`, `LAGUNA_REASONING_PARSER`, and
+  `LAGUNA_ENABLE_THINKING` (set `0` for instant mode, no reasoning extraction).
+- **Docs**: Laguna M.1 section + preset/build tables in `CLAUDE.md`, preset
+  table + feature list in `README.md`.
+
+> To verify on first build/serve (sourced from the model card + vLLM PR, not yet
+> run on Olivia): the `poolside_v1` parser names, the
+> `--default-chat-template-kwargs` flag, and that v0.21.0 compiles on NGC 26.03
+> (fallback `NGC_PYTORCH_TAG=26.05-py3`, the glm52 base).
+
 ### 2026-04-21 — GLM-5.1-AWQ-4bit serving end-to-end on 2 × 4 GH200s
 
 First working end-to-end run of `cyankiwi/GLM-5.1-AWQ-4bit` on Olivia. The

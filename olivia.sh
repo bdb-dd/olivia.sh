@@ -880,7 +880,7 @@ cmd_build() {
                 info "To build a new container:"
                 echo "    ./olivia.sh build <preset>" >&2
                 echo "" >&2
-                echo "Available presets: glm51_v19 (alias: glm51), glm51_v20, glm52, glm47, kimi, kimi27, devstral, llama, qwen, generic" >&2
+                echo "Available presets: glm51_v19 (alias: glm51), glm51_v20, glm52, glm47, kimi, kimi27, laguna, devstral, llama, qwen, generic" >&2
                 exit 0
                 ;;
             --presets|-p)
@@ -913,6 +913,12 @@ cmd_build() {
                 echo "             eager vLLM 0.21), no rebuild. native int4 ~560GB,"
                 echo "             8 GPUs (2×4-GPU nodes, TP=4 + PP=2). Thinking-mode only."
                 echo "             Weights on /cluster/work scratch — serve with"
+                echo "             HF_HOME=/cluster/work/projects/nn10104k/huggingface"
+                echo ""
+                echo "  laguna     Laguna M.1 (Poolside, 225B/23B active) MoE coding model"
+                echo "             vLLM: v0.21.0 (native Laguna), transformers>=5.7.0"
+                echo "             FP8 ~225GB, single node (4×GH200, TP=4); poolside_v1 parsers."
+                echo "             Weights too big for project quota — prefetch+serve with"
                 echo "             HF_HOME=/cluster/work/projects/nn10104k/huggingface"
                 echo ""
                 echo "  devstral   Devstral/Mistral models"

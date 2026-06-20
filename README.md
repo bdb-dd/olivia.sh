@@ -264,6 +264,28 @@ Recommended config: **capture + NCCL all-reduce** (de-wedged *and* fast). The ea
 
 > Sweep tools: `bench_sweep.py` (concurrency, streaming SSE) and `bench_serving.py` (TTFT + decode). Re-run after any serving-config change and refresh the tables above.
 
+### Agentic behaviour — Laguna M.1 (`laguna`) · 2026-06-20
+
+First live run of the agentic-eval harness (`evals/`, see `plans/proposed/agentic_evals.md`) — measures *behaviour*, not throughput. Driven through `anthropic_proxy.py` (`:8002`) exactly as Claude Code would, against laguna single-node, thinking on, CUDAGraph capture. Serving note: laguna needs `HF_HOME=/cluster/work/...` (project quota is full; the FP8 weights live on `/cluster/work`).
+
+**L0 — protocol / tool-call conformance** (`evals/runner.py protocol`, 8 fixtures × {nonstream, stream}):
+- **Invariant gate (proxy regression): 1562/1562 clean** — the `poolside_v1` tool/reasoning parser translates faithfully in both modes, and the streaming SSE block grammar holds. This is the headline proxy-health result.
+- **Behavioural: 100%** across tool-selection, arg-schema (incl. enum), multi-turn tool_result threading, parallel tools, no-tool-when-unneeded, hallucination guard, and thinking→tool_use ordering.
+
+**L1 — micro-agent tasks** (`evals/runner.py micro`, 8 sandboxed tasks, oracle-verified, `max_turns=14`):
+
+| metric | value |
+|---|---|
+| success (oracle-verified) | **8/8 (100%)** |
+| median turns to solve | 4.5 |
+| premature-stop / runaway / errors | 0 / 0 / 0 |
+| invalid-tool-turns (protocol break mid-loop) | 0 |
+| thrash (repeated identical calls) | 3 (across 2 tasks) |
+
+Per task (turns): write-file 3 · fix-failing-test 7 · implement-fn 6 · find/report 5 · rename-symbol (multi-file) 10 · count-files 4 · fix-syntax 4 · sum-csv 3 — all solved. Laguna drives the multi-turn loop reliably with clean tool-call validity throughout.
+
+> Eval tools: `evals/runner.py {protocol,micro}` (L0/L1). Offline self-tests: `evals/{protocol,micro}/selftest.py`. Re-run per preset after any proxy/serving change; results land in `evals/results/`.
+
 ## Direct Script Usage
 
 The underlying scripts can be used directly on the cluster without the CLI:

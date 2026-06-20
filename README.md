@@ -306,7 +306,12 @@ Per task (turns): calc-operator-precedence (wrote a recursive-descent precedence
 
 Resolved: 15851, 16255, 16485, 16527, 16801. The signal L1/L2 (both 100%) couldn't give: Laguna's **fixes are reliable** (5/5 correct), but **7/7 failures made no edit at all**.
 
-**Turn-budget experiment (single variable, `max_turns` 40→80 on those 7):** came back **0/7, still `patch=0`** — 6 ran the full 80 turns without editing, one *stopped* at 30 turns declaring done without writing a fix. So it is **not a turn-budget problem**: doubling the budget changed nothing. The failure mode is failing to translate exploration into an *edit* (reads/runs but never commits a `write_file`, or stops prematurely). The lever is **agent scaffolding that forces a patch** (e.g. require a diff before stopping), not more turns or fix quality. A legitimate real-benchmark number (SWE-bench Verified is hard). Slice is django-only (the tractable subset on this cluster — no per-instance Docker); broadening repos/instances and adding glm52/kimi27 is next.
+Two controlled follow-ups, both **refuting easy levers** (logged here because negative results are data):
+
+- **Turn budget** (`max_turns` 40→80 on the 7 no-edit instances): **0/7, still `patch=0`** — 6 ran the full 80 turns without editing, one *stopped* at 30 declaring done. Doubling the budget changed nothing → not a budget problem.
+- **Force-an-edit scaffolding** (stronger "you MUST edit" prompt + a guard refusing to stop on an empty diff): **3/12 — *worse* than baseline.** The guard never fired (`nudges=0`: the failure is exploring to the cap, not voluntarily stopping), and the stronger prompt **backfired** — it broke 2 instances that resolved at baseline (a correct 549-byte fix → a wrong 1271-byte one; a 772-byte fix → no edit at all), trading Laguna's precision for hasty wrong edits. **Reverted.**
+
+Takeaway: Laguna's careful "edit only when confident → 5/5 precision" is a *strength*, not a bug to scaffold away; the real bottleneck is bug **localization**, which neither more turns nor edit-forcing addresses. A legitimate real-benchmark number (SWE-bench Verified is hard). Slice is django-only (the tractable subset on this cluster — no per-instance Docker); broadening repos/instances and adding glm52/kimi27 is next.
 
 > Eval tools: `evals/runner.py {protocol,micro,swe}` (L0/L1/L2, in-repo); `evals/swe_real/run_on_cluster.sh` (L2-real, SLURM on `small`). Offline self-tests: `evals/{protocol,micro}/selftest.py`; harness self-test: `--gold`. Re-run per preset after any proxy/serving change; results in `evals/results/` (L0–L2) and `/cluster/work/.../swe/` (L2-real).
 

@@ -1008,11 +1008,12 @@ def main() -> None:
                         help="Bind address (default: 127.0.0.1)")
     parser.add_argument("--listen-port", type=int, default=8002,
                         help="Proxy listen port (default: 8002)")
-    parser.add_argument("--upstream", default="http://localhost:8000",
-                        help="Upstream OpenAI-compatible URL. Default is vLLM "
-                             "directly (8000). Set to http://localhost:8001 to "
-                             "chain through vllm_proxy, which requires "
-                             "ENABLE_PROXY=1 on the server side.")
+    parser.add_argument("--upstream", default="http://localhost:8003",
+                        help="Upstream OpenAI-compatible URL. Default matches the "
+                             "olivia.sh tunnel's local port (8003 → vLLM directly; "
+                             "8000 is avoided — another local dev service may bind it). "
+                             "Set to http://localhost:8001 to chain through "
+                             "vllm_proxy, which requires ENABLE_PROXY=1 server-side.")
     parser.add_argument("--model", required=True,
                         help="Model name to send upstream "
                              "(e.g. cyankiwi/GLM-5.1-AWQ-4bit)")

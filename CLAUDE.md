@@ -612,7 +612,7 @@ Claude Code ──/v1/messages──► anthropic_proxy ──/v1/chat/completio
 
 **Usage (local machine):**
 ```bash
-# 1. Tunnel to the cluster (forwards localhost:8000 → vllm:8000 on the GPU node).
+# 1. Tunnel to the cluster (forwards localhost:8003 → vllm:8000 on the GPU node).
 ./olivia.sh tunnel up
 
 # 2. Start the Anthropic proxy locally (default listen 127.0.0.1:8002).
@@ -628,7 +628,7 @@ Optionally chain through the batching proxy for SSE compaction over the tunnel: 
 
 **Options:**
 - `--listen-host` / `--listen-port` — bind address (default `127.0.0.1:8002`)
-- `--upstream` — OpenAI-compatible URL (default `http://localhost:8000`, direct vLLM). Set to `http://localhost:8001` to chain through `vllm_proxy` (requires `ENABLE_PROXY=1` server-side).
+- `--upstream` — OpenAI-compatible URL (default `http://localhost:8003`, the olivia.sh tunnel's local port → direct vLLM; `:8000` is avoided because another local dev service may bind it). Set to `http://localhost:8001` to chain through `vllm_proxy` (requires `ENABLE_PROXY=1` server-side).
 - `--model` *(required)* — the model name forwarded to vLLM (e.g. `cyankiwi/GLM-5.1-AWQ-4bit`). All Anthropic model names in client requests are remapped to this single value.
 - `-v` / `--verbose` — log request/response bodies for debugging.
 - `--keepalive-interval N` — seconds of upstream idle before sending a 1-token dummy completion to keep vLLM's Ray compiled-DAG warm (default `180`, set `0` to disable). Works around a multi-node PP instability where the engine wedges on idle → active transitions; pinging the DAG periodically avoids long idle windows.

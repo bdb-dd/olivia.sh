@@ -57,8 +57,8 @@ export REMOTE_CONTAINER_DIR=<path-on-cluster-for-containers>
 
 # Optional (defaults shown)
 export REMOTE_USER=$USER
-export REMOTE_PORT=8000
-export LOCAL_PORT=8000
+export REMOTE_PORT=8000   # cluster-side vLLM port
+export LOCAL_PORT=8003    # local forward; avoids :8000 (another local dev service may bind it)
 ```
 
 ### Direct scripts configuration
@@ -438,8 +438,8 @@ vllm-glm47-1.sif           # Compressed SIF image (optional)
 Interactive chat client with rich terminal UI:
 
 ```bash
-# Basic usage
-python chat_devstral.py localhost --port 8000 --stream
+# Basic usage (port matches the tunnel's local port; default LOCAL_PORT=8003)
+python chat_devstral.py localhost --port 8003 --stream
 
 # Features:
 # - Multi-turn conversation history

@@ -28,7 +28,12 @@ OLIVIA_VERSION="1.0.0"
 REMOTE_USER="${REMOTE_USER:-$USER}"
 REMOTE_HOST="${REMOTE_HOST:-}"
 REMOTE_PORT=8000
-LOCAL_PORT="${LOCAL_PORT:-8000}"
+# Local forward defaults to 8003, NOT 8000: another local dev service (an nginx)
+# may bind :8000 and silently intercept the tunnel if the SSH forward ever drops
+# (you'd talk to it, not vLLM, with no error). 8003 keeps the olivia 800x family
+# together (8001 vllm_proxy batcher, 8002 anthropic_proxy, 8003 tunnel).
+# Override with LOCAL_PORT=<n>. REMOTE_PORT (cluster-side vLLM) stays 8000.
+LOCAL_PORT="${LOCAL_PORT:-8003}"
 # Match the SLURM job name that run_vllm_server.sh's #SBATCH --job-name sets.
 # Using the full `vllm-server` here (not just `vllm`) keeps us from picking up
 # in-flight build jobs, whose name is `build-vllm-gh200` and also contains

@@ -164,10 +164,10 @@ def grep(sandbox: str, pattern: str, path: str = ".") -> ToolResult:
     return ToolResult(_trunc("\n".join(hits)) if hits else "(no matches)")
 
 
-def run_bash(sandbox: str, command: str, timeout: float = 30.0) -> ToolResult:
+def run_bash(sandbox: str, command: str, timeout: float = 30.0, env=None) -> ToolResult:
     try:
         p = subprocess.run(command, shell=True, cwd=sandbox, capture_output=True,
-                           text=True, timeout=timeout)
+                           text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         return ToolResult(f"[timed out after {timeout}s]", is_error=True, returncode=124)
     except Exception as e:  # noqa: BLE001
@@ -182,7 +182,8 @@ def run_bash(sandbox: str, command: str, timeout: float = 30.0) -> ToolResult:
                       stdout=p.stdout or "", stderr=p.stderr or "", returncode=p.returncode)
 
 
-def execute(sandbox: str, name: str, args: dict, bash_timeout: float = 30.0) -> ToolResult:
+def execute(sandbox: str, name: str, args: dict, bash_timeout: float = 30.0,
+            env=None) -> ToolResult:
     args = args or {}
     if name == "read_file":
         return read_file(sandbox, args.get("path", ""))
@@ -193,5 +194,5 @@ def execute(sandbox: str, name: str, args: dict, bash_timeout: float = 30.0) -> 
     if name == "grep":
         return grep(sandbox, args.get("pattern", ""), args.get("path", "."))
     if name == "run_bash":
-        return run_bash(sandbox, args.get("command", ""), timeout=bash_timeout)
+        return run_bash(sandbox, args.get("command", ""), timeout=bash_timeout, env=env)
     return ToolResult(f"error: unknown tool {name!r}", is_error=True)

@@ -337,6 +337,18 @@ if [[ "${IS_GLM52}" == "1" && -z "${CUDAGRAPH_MODE}" ]]; then
     CUDAGRAPH_MODE="NONE"
 fi
 
+# GLM-5.1: default to PIECEWISE CUDAGraph capture (not auto-select's
+# FULL_AND_PIECEWISE). VALIDATED 2026-06-20 on the NGC-26.03 rebuild: PIECEWISE
+# captures cleanly (51/51, no IMA); with the custom all-reduce auto-disabled
+# (DISABLE_CUSTOM_ALL_REDUCE=auto fires since mode!=NONE → graph-safe NCCL) this
+# config ELIMINATES the multi-node PP decode wedge (0 fail 1→64) AND gives
+# ~22 tok/s/stream vs ~5 eager. (The de-wedge is the NCCL all-reduce; capture is
+# the ~4.5× throughput.) See README "## Performance" + the wedge known-issue.
+# Override CUDAGRAPH_MODE=NONE for eager (still de-wedged via NCCL, just slower).
+if [[ "${IS_GLM51}" == "1" && -z "${CUDAGRAPH_MODE}" ]]; then
+    CUDAGRAPH_MODE="PIECEWISE"
+fi
+
 # Any GLM MoE model that uses the glm47/glm45 parser family
 IS_GLM_MOE=0
 if [[ "${IS_GLM47}" == "1" || "${IS_GLM5}" == "1" ]]; then

@@ -215,8 +215,22 @@ Per-stream flat ~17–19 tok/s; TTFT ~1.0 s single-stream; 0 failures (re-confir
 
 > **Cold-start ≈ 40 min** (measured 2026-06-20): the ~640 GB int4 checkpoint loads at ~38 s/shard × 64 shards off Lustre (~270 MB/s), during which the server sits at "weights reserved, 0 % util, `/health` 000" — that is loading, **not** a hang. `./olivia.sh server watch` and any health-wait must allow ~40+ min before the server answers. Cross-node NCCL runs over TCP (`NET/Socket`, no CXI/RDMA plugin), but loading — not NCCL — dominates cold-start.
 
-### GLM-5.1 / GLM-4.7
-- **GLM-5.1** (2 nodes, AWQ): wedges under concurrent decode (`Running ≥ 2`) — serve behind `anthropic_proxy.py` request serialization; effectively single-stream for CLI use.
+### GLM-5.1 (`glm51`) — 2 nodes × 4 GH200, AWQ, **PIECEWISE CUDAGraph capture** · NGC 26.03 · 2026-06-20
+Concurrency sweep (`bench_sweep.py`, `max_tokens=256`, streaming):
+
+| Concurrency | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| Aggregate tok/s  | 22.0 | 44.6 | 87.6 | 170.6 | 246.2 | 626.9 | 894.6 |
+| Per-stream tok/s | 22.0 | 22.3 | 21.9 | 21.3 | 15.4 | 19.6 | 14.0 |
+| p95 TTFT (s)     | 0.09 | 0.08 | 0.14 | 0.19 | 2.54 | 0.41 | 0.68 |
+
+This config runs **0 failures across 1→64** (previously hung at `Running ≥ 2`, forcing `anthropic_proxy.py` serialization). An isolating experiment separates the two effects — on the freshly rebuilt NGC-**26.03** `vllm-glm51-1-sandbox`:
+- **De-wedge = NCCL all-reduce, not capture.** `CUDAGRAPH_MODE=PIECEWISE` auto-disables vLLM's custom all-reduce → graph-safe NCCL. The isolating test — **eager + `DISABLE_CUSTOM_ALL_REDUCE=1`, no capture — also runs 0 failures at concurrency 1–16**, so the *custom all-reduce kernel* was the wedge cause; NCCL fixes it. Capture isn't needed to de-wedge (it just forces the custom kernel off, since it isn't graph-safe).
+- **Throughput = capture.** PIECEWISE capture (51/51 graphs, no IMA — 26.03's inductor handles GLM-DSA capture where **26.05 IMAs** on glm52/Kimi) lifts single-stream from **~5 tok/s** (eager+NCCL) to **~22 tok/s** (~4.5×), holding ~22/stream through 8-way, ~895 tok/s @64.
+
+Recommended config: **capture + NCCL all-reduce** (de-wedged *and* fast). The earlier "wedge → serialize" workaround is **superseded** for this container.
+
+### GLM-4.7
 - **GLM-4.7** (single node, 4 GPUs, AWQ): fast single-node, no multi-node wedge.
 
 > Sweep tools: `bench_sweep.py` (concurrency, streaming SSE) and `bench_serving.py` (TTFT + decode). Re-run after any serving-config change and refresh the tables above.

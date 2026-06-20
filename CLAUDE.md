@@ -126,7 +126,7 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 **Server presets** (with default models):
 | Preset | Default Model | GPUs | Notes |
 |--------|---------------|------|-------|
-| `glm51_v19` (alias `glm51`) | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | TP=4 + PP=2, vLLM v0.19.0, container index 1. Pair with `anthropic_proxy.py` serialization to work around multi-node PP decode wedge. |
+| `glm51_v19` (alias `glm51`) | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | TP=4 + PP=2, vLLM v0.19.0, container index 1. **Defaults to PIECEWISE CUDAGraph capture** (NGC-26.03 rebuild): de-wedged via NCCL all-reduce, ~22 tok/s/stream, 0-fail 1→64. The old serialization workaround is no longer needed. |
 | `glm51_v20` | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | Same as glm51_v19 but on vLLM v0.20.0 + RayExecutorV2, container index 2. **Quarantined** — same wedge as v0.19.0; kept for diagnostic work only. |
 | `glm52` | `RedHatAI/GLM-5.2-FP8` | 12 (3 nodes × 4) | TP=4 + PP=3. Block-FP8 (~755 GB) — does **not** fit 8 GPUs, hence 3 nodes. **Needs vLLM main `091386a` (pinned) + PR#45895** (new skip-topk DSA indexer); not in any release. Same multi-node PP wedge as glm51 → proxy serialization. fp8 KV cache + DeepGEMM (`VLLM_DEEP_GEMM_WARMUP=skip`). |
 | `glm47` | `QuantTrio/GLM-4.7-AWQ` | 4 | TP=4, MTP speculative |
@@ -410,6 +410,17 @@ GLM-5.1 is a 744B-parameter MoE model with DeepSeek Sparse Attention (DSA), acti
 **Important:** On Olivia, glm51 is the only preset that crosses a node boundary today. Internode bandwidth is **HPE Slingshot at 200 Gbit/s (~25 GB/s)**, ~36× slower than intra-node NVLink C2C (900 GB/s). Naive TP=8 across 2 nodes would bottleneck on cross-node all-reduce for every transformer layer. The preset therefore uses **TP=4 intra-node + PP=2 cross-node**: pipeline parallelism only transfers hidden states between stages (not per-layer), so it degrades gracefully on Slingshot-class links.
 
 ### Known issue: multi-node PP decode wedge
+
+**RESOLVED 2026-06-20 — the cause is the custom all-reduce, not capture (confirmed by experiment).** On the rebuilt NGC-26.03 `vllm-glm51-1-sandbox`, `CUDAGRAPH_MODE=PIECEWISE` (which auto-disables the custom all-reduce → graph-safe NCCL all-reduce) runs `bench_sweep.py` **1→64 with 0 failures** (~22 tok/s/stream through 8-way, ~895 tok/s @64; previously hung at `Running ≥ 2`).
+
+**Attribution experiment (the decisive test):** serving **eager + `DISABLE_CUSTOM_ALL_REDUCE=1`** (NCCL all-reduce, *no capture*) → **0 failures at concurrency 1/2/4/8/16 = no wedge**. The only difference from the original wedging config (eager + *custom* all-reduce) is the all-reduce kernel, so **vLLM's custom all-reduce is the wedge cause; NCCL all-reduce fixes it.** Capture is **not** the wedge fix — it merely *requires* the custom kernel off (it isn't graph-safe), so enabling capture incidentally applies the real fix. (This overturned an earlier theory that capture's static-graph determinism fixed a cross-rank dispatch divergence — the experiment disproved it; lesson: validate mechanism claims.)
+
+**Why the custom all-reduce wedged (mechanism):** vLLM's custom all-reduce (the intra-node TP=4 NVLink one/two-shot reduction, run every layer) uses a shared-memory + IPC signaling handshake. Under concurrent decode (`Running ≥ 2`) on this 2-node PP setup, that handshake races/deadlocks when overlapping decode steps contend on the signal flags → a rank blocks forever → step loop stalls, `Running` pinned at 0 tok/s, eventual raylet abort. NCCL's all-reduce uses a robust collective protocol (no shared-mem flag race) and doesn't hang. (Also why swapping the Ray executor — Compiled Graph → RayExecutorV2 — didn't help: the deadlock is in the all-reduce kernel, not the executor.)
+
+**What capture *does* contribute — throughput (~4.5×), not de-wedging:** eager + NCCL all-reduce is only **~5 tok/s/stream** (NCCL's tiny per-decode-step all-reduces are launch/sync-bound in eager). PIECEWISE capture (capture sizes `[1,2,…,512]`; only attention + `sparse_attn_indexer` stay eager) amortizes the per-step overhead via graph replay → **~22 tok/s/stream**. So the recommended config is **capture + NCCL all-reduce**: NCCL de-wedges, capture makes it fast. The serialization workaround below is **superseded** on this container.
+
+---
+*Historical (pre-fix) account:*
 
 GLM-5.1 on Olivia (2×4 GH200, TP=4+PP=2, Slingshot) reproducibly wedges during decode when `Running >= 2` concurrent sequences hit the engine. Prefill completes normally; the first few decode tokens may emit; then generation stops at `0 tok/s` while `Running` stays pinned and the engine step loop never advances. HTTP front-end stays responsive. Eventually Ray raylet aborts with `Fatal Python error: Aborted`.
 

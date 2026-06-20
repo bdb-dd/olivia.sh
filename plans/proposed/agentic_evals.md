@@ -229,3 +229,24 @@ nohup python evals/runner.py micro --preset kimi27 --think on \
 # Report → README ## Agentic table + plans/ per-run doc
 python evals/report.py --suite micro --emit readme,plan
 ```
+
+---
+
+## Next session — broaden the sweep to kimi27 + glm52 (handoff 2026-06-20)
+
+**State:** L0–L2 + L2-real all built, validated, and swept on **Laguna** (PR #3, branch `agentic-evals`). Headline: bare loop **5/12 (42%)** → mini-swe-agent **7/12 (58%)** → Poolside prod agent **72.5%** on a 12-instance django 4.2/5.0 slice — gap is mostly *agent harness, not model*. Cluster harness (small-partition apptainer) and all gotchas documented.
+
+**Goal tomorrow:** cross-model comparison on the *same validated django slice* (apples-to-apples), then optionally broaden repos.
+
+### Phase 1 — cross-model (quick; harness is model-agnostic)
+For each of `kimi27` (2-node) and `glm52` (3-node):
+1. Serve it: `HF_HOME=/cluster/work/projects/nn10104k/huggingface TIME_LIMIT=6:00:00 ./olivia.sh server start <preset>` — **bump TIME_LIMIT** (the 8h default killed a run mid-sweep), note the **head node**, and run promptly. Confirm the served model name via `/v1/models`.
+2. Real agent: `GPU_NODE=<head> MODEL=openai/<served-model> PRESET=<preset>-mini sbatch evals/swe_real/run_mini_on_cluster.sh`
+3. Our bare loop (for the per-model loop-vs-agent delta): `GPU_NODE=<head> MODEL=<served-model> PRESET=<preset> sbatch evals/swe_real/run_on_cluster.sh` (note: this path uses `anthropic_proxy` in-job → set the right model).
+4. Update README `## Performance > Agentic` with the cross-model table.
+
+### Phase 2 — broaden repos (bigger; beyond django)
+django was the only no-Docker-tractable repo. Proper route: **mini-swe-agent's native `--environment-class singularity`** pulls the official `sweb.eval.*` images via apptainer on the `small` partition (the Docker→apptainer path, automated) → full multi-repo Verified. Spike 1 instance first to confirm image-pull + (no) nested-apptainer issues. Alt: extend the clone+pip approach to more pure-python repos.
+
+### Reusable assets already on the cluster (`/cluster/work/projects/nn10104k/swe/`)
+`python311.sif`, `miniswe-venv` (mini-swe-agent installed), the django clone+venv, and the `agentic-evals` deploy. Just point at a new server. Gotchas (all live in the code): `HF_HOME=/cluster/work`; `no_proxy` must include the vLLM head node; `MSWEA_COST_TRACKING=ignore_errors`; mini-swe-agent talks to the OpenAI endpoint **directly** (no anthropic_proxy, since it's bash-in-markdown not tool-calls).

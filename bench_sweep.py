@@ -15,13 +15,18 @@ PROMPT = ("Explain in depth how a B-tree database index works, including node "
           "splits, rebalancing on insert and delete, and why fan-out matters.")
 
 
-def one_request(url, model, prompt, max_tokens, idx, out):
-    payload = json.dumps({
+def one_request(url, model, prompt, max_tokens, idx, out, ctk=None):
+    body = {
         "model": model,
         "messages": [{"role": "user", "content": f"{prompt} (variant {idx})"}],
         "max_tokens": max_tokens, "temperature": 1.0, "top_p": 0.95,
         "stream": True, "stream_options": {"include_usage": True},
-    }).encode()
+    }
+    # Optional chat-template kwargs (e.g. {"enable_thinking": false}) to toggle
+    # reasoning per-request, overriding the server's --default-chat-template-kwargs.
+    if ctk:
+        body["chat_template_kwargs"] = ctk
+    payload = json.dumps(body).encode()
     req = urllib.request.Request(f"{url}/v1/chat/completions", data=payload,
                                  headers={"Content-Type": "application/json"})
     t0 = time.perf_counter(); ttft = None; toks = 0
@@ -51,10 +56,10 @@ def one_request(url, model, prompt, max_tokens, idx, out):
         out[idx] = {"ok": False, "err": str(e), "total": time.perf_counter() - t0}
 
 
-def run_level(url, model, prompt, max_tokens, concurrency):
+def run_level(url, model, prompt, max_tokens, concurrency, ctk=None):
     out = {}
     threads = [threading.Thread(target=one_request,
-                                args=(url, model, prompt, max_tokens, i, out))
+                                args=(url, model, prompt, max_tokens, i, out, ctk))
                for i in range(concurrency)]
     t0 = time.perf_counter()
     for t in threads: t.start()
@@ -85,8 +90,12 @@ if __name__ == "__main__":
     ap.add_argument("--levels", default="1,2,4,8,16,32")
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--prompt", default=PROMPT)
+    ap.add_argument("--chat-template-kwargs", default=None,
+                    help='JSON dict passed as chat_template_kwargs, e.g. '
+                         '\'{"enable_thinking": false}\' to disable reasoning')
     a = ap.parse_args()
+    ctk = json.loads(a.chat_template_kwargs) if a.chat_template_kwargs else None
     print("concurrency,agg_tok_s,median_per_stream_tok_s,median_ttft_s,p95_ttft_s,failures,total_tokens,wall_s",
           flush=True)
     for lvl in [int(x) for x in a.levels.split(",")]:
-        run_level(a.url, a.model, a.prompt, a.max_tokens, lvl)
+        run_level(a.url, a.model, a.prompt, a.max_tokens, lvl, ctk)

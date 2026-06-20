@@ -14,6 +14,9 @@
 # 1 node (SLURM reasons: "1 task needs only 1 node"). Setting #SBATCH --gpus=4
 # conflicts with --gpus-per-node (SLURM: "4 GPUs fits on 1 node"). If you sbatch
 # this script directly (not via olivia.sh), remember to pass --gpus=N yourself.
+# Job name: olivia.sh overrides the static --job-name=vllm-server above with a
+# per-branch --job-name=vllm-<DEPLOY_KEY>, so concurrent agents' servers don't
+# collide in squeue-based resolution. Direct sbatch keeps the plain vllm-server.
 
 # =============================================================================
 # Run vLLM Server on GH200

@@ -284,7 +284,17 @@ First live run of the agentic-eval harness (`evals/`, see `plans/proposed/agenti
 
 Per task (turns): write-file 3 · fix-failing-test 7 · implement-fn 6 · find/report 5 · rename-symbol (multi-file) 10 · count-files 4 · fix-syntax 4 · sum-csv 3 — all solved. Laguna drives the multi-turn loop reliably with clean tool-call validity throughout.
 
-> Eval tools: `evals/runner.py {protocol,micro}` (L0/L1). Offline self-tests: `evals/{protocol,micro}/selftest.py`. Re-run per preset after any proxy/serving change; results land in `evals/results/`.
+**L2 — agentic coding** (`evals/runner.py swe`, 5 harder multi-file tasks, `max_turns=25`): a buggy mini-codebase + problem statement, graded by a **hidden** regression suite written only *after* the loop ends — the agent never sees the test (SWE-bench-style).
+
+| metric | value |
+|---|---|
+| success (oracle-verified) | **5/5 (100%)** |
+| median turns to solve | 5 |
+| premature-stop / runaway / errors / invalid-tool-turns | 0 / 0 / 0 / 0 |
+
+Per task (turns): calc-operator-precedence (wrote a recursive-descent precedence parser) 16 · interval-merge-adjacency 4 · lru-cache-recency 5 · topo-sort-cycle-detection 6 · csv-quoted-field-parsing 4 — all solved against the hidden grader. This slice did **not** find Laguna's ceiling (it's a strong coding agent on well-defined bugs); the real SWE-bench Verified dataset (per-instance Docker) is the documented next step.
+
+> Eval tools: `evals/runner.py {protocol,micro,swe}` (L0/L1/L2). Offline self-tests: `evals/{protocol,micro}/selftest.py`. Re-run per preset after any proxy/serving change; results land in `evals/results/`.
 
 ## Direct Script Usage
 

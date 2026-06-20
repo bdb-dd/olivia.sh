@@ -23,6 +23,7 @@ class RunConfig:
     bash_timeout: float = 30.0
     no_bash: bool = False
     keep_sandbox: bool = False
+    label: str = "L1 micro-agent"
 
 
 def _prepare_task(task: dict, cfg: RunConfig) -> dict:
@@ -96,7 +97,7 @@ def _summarize(records: list, skipped: list, cfg: RunConfig) -> dict:
 
 def _print_scorecard(summary: dict, records: list, cfg: RunConfig) -> None:
     print()
-    print(f"L1 micro-agent — preset={summary['preset']}  base={summary['base_url']}  "
+    print(f"{cfg.label} — preset={summary['preset']}  base={summary['base_url']}  "
           f"tasks={len(records)} runs  max_turns={cfg.max_turns}")
     if summary["skipped"]:
         print(f"  skipped (need bash, --no-bash set): {', '.join(summary['skipped'])}")

@@ -95,6 +95,7 @@ def _run_tasks(args: argparse.Namespace, label: str) -> int:
         wanted = {s.strip() for s in args.only.split(",")}
         tasks = [t for t in tasks if t.get("id") in wanted]
     out_path = args.out or os.path.join(DEFAULT_RESULTS_DIR, f"{label}-{args.preset}.json")
+    display = {"micro": "L1 micro-agent", "swe": "L2 swe (agentic coding)"}.get(label, label)
     cfg = micro_runner.RunConfig(
         base_url=args.base_url,
         model=args.model or PRESET_MODELS.get(args.preset, "local-eval"),
@@ -104,6 +105,7 @@ def _run_tasks(args: argparse.Namespace, label: str) -> int:
         bash_timeout=args.bash_timeout,
         no_bash=args.no_bash,
         keep_sandbox=args.keep_sandbox,
+        label=display,
     )
     summary = micro_runner.run(cfg, tasks, out_path=out_path)
     # "Soft" gate: non-zero if nothing succeeded (likely a wiring/endpoint problem).

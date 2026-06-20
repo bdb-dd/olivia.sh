@@ -1,0 +1,32 @@
+{
+  "id": "enum-unit-args",
+  "category": "arg-schema",
+  "description": "Tool has a required enum-constrained 'unit' arg; the prompt names the unit explicitly. A competent agent fills both required fields with schema-valid (enum-respecting) values.",
+  "request": {
+    "system": "You are a helpful assistant with access to tools. Use them when needed and respect their argument schemas.",
+    "messages": [
+      {"role": "user", "content": "What's the temperature in Berlin right now, in celsius?"}
+    ],
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather for a location in a specified unit.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "location": {"type": "string"},
+            "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+          },
+          "required": ["location", "unit"]
+        }
+      }
+    ],
+    "max_tokens": 512
+  },
+  "expect": [
+    {"check": "calls_tool", "tool": "get_weather"},
+    {"check": "tool_args_valid", "tool": "get_weather"},
+    {"check": "tool_args_include", "tool": "get_weather", "keys": ["location", "unit"]},
+    {"check": "tool_args_equal", "tool": "get_weather", "args": {"unit": "celsius"}}
+  ]
+}

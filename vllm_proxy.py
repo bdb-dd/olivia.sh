@@ -85,6 +85,133 @@ class EventBuffer:
         return out
 
 
+async def forward_nonstream(session: aiohttp.ClientSession, url: str, body: dict) -> web.Response:
+    """Forward a non-streaming chat/completions request and return the JSON."""
+    async with session.post(
+        url, json=body, headers={"Content-Type": "application/json"}
+    ) as resp:
+        data = await resp.json()
+        return web.json_response(data, status=resp.status)
+
+
+async def forward_stream(
+    session: aiohttp.ClientSession,
+    url: str,
+    request: web.Request,
+    body: dict,
+    batch_config: BatchConfig,
+) -> web.StreamResponse:
+    """Forward a streaming chat/completions request with SSE batching.
+
+    Batches raw SSE bytes before forwarding. We do NOT inspect or rewrite delta
+    payloads — that lets the proxy work for any delta field (content, reasoning,
+    tool_calls, ...) without per-format code. Shared by the single-upstream
+    ``VLLMProxy`` and the multi-model ``model_router``.
+    """
+    response = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        }
+    )
+    await response.prepare(request)
+
+    buffer = EventBuffer()
+
+    async def flush_buffer():
+        if buffer.events:
+            await response.write(buffer.flush())
+
+    try:
+        async with session.post(
+            url, json=body, headers={"Content-Type": "application/json"}
+        ) as upstream:
+            # iter_any instead of line-by-line: reading raw bytes lets us
+            # forward exact upstream framing, and lines are newline-terminated
+            # SSE frames so we still split correctly.
+            pending = b""
+            async for chunk in upstream.content.iter_any():
+                pending += chunk
+                # Split into complete SSE lines (keep trailing partial line
+                # in `pending` for the next iteration).
+                while b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                    # Re-attach the newline so downstream parsers see
+                    # framing exactly as vLLM emits it.
+                    line_with_nl = line + b"\n"
+
+                    # Inspect the line just enough to (a) detect [DONE],
+                    # (b) detect finish events that should flush+forward
+                    # immediately, (c) sniff content/reasoning text for
+                    # newline-flush heuristic. No payload rewriting.
+                    stripped = line.strip()
+                    if not stripped or not stripped.startswith(b"data: "):
+                        # Forward blank lines / comments as-is (preserves
+                        # SSE inter-event spacing).
+                        buffer.add(line_with_nl)
+                        continue
+
+                    data_str = stripped[6:].decode("utf-8", errors="replace")
+
+                    if data_str == "[DONE]":
+                        await flush_buffer()
+                        await response.write(line_with_nl)
+                        # Drain any remaining bytes (usually empty) and
+                        # exit the outer chunk loop on next iteration.
+                        if pending.strip():
+                            await response.write(pending)
+                        pending = b""
+                        break
+
+                    # For known JSON events: peek to extract finish flag
+                    # and content text; if parse fails, just batch as-is.
+                    text_for_newline_check = ""
+                    is_finish_event = False
+                    try:
+                        data = json.loads(data_str)
+                        choices = data.get("choices", [])
+                        if choices:
+                            delta = choices[0].get("delta") or {}
+                            # Sample any text-bearing delta field for the
+                            # newline-flush heuristic.
+                            for fld in ("content", "reasoning", "reasoning_content"):
+                                v = delta.get(fld)
+                                if isinstance(v, str):
+                                    text_for_newline_check += v
+                            if choices[0].get("finish_reason"):
+                                is_finish_event = True
+                    except json.JSONDecodeError:
+                        pass
+
+                    buffer.add(line_with_nl, text_for_newline_check)
+
+                    if is_finish_event:
+                        # Flush immediately so the client sees finish_reason
+                        # without waiting for the timer.
+                        await flush_buffer()
+                    elif buffer.should_flush(batch_config):
+                        await flush_buffer()
+                else:
+                    # No newline yet; check if a time-based flush should
+                    # fire so we don't sit on partially-batched data while
+                    # the upstream is mid-chunk.
+                    if buffer.should_flush(batch_config):
+                        await flush_buffer()
+            # Final drain in case the upstream ended without [DONE].
+            if pending:
+                buffer.add(pending)
+            await flush_buffer()
+
+    except Exception as e:
+        error_event = {"error": str(e)}
+        await response.write(f"data: {json.dumps(error_event)}\n\n".encode())
+
+    return response
+
+
 class VLLMProxy:
     """Proxy server that batches vLLM SSE tokens."""
 
@@ -107,125 +234,10 @@ class VLLMProxy:
         except json.JSONDecodeError:
             return web.json_response({"error": "Invalid JSON"}, status=400)
 
-        is_streaming = body.get("stream", False)
-
-        if not is_streaming:
-            # Non-streaming: pass through directly
-            async with self.session.post(
-                f"{self.vllm_url}/v1/chat/completions",
-                json=body,
-                headers={"Content-Type": "application/json"}
-            ) as resp:
-                data = await resp.json()
-                return web.json_response(data, status=resp.status)
-
-        # Streaming: batch raw SSE bytes before forwarding. We do NOT inspect
-        # or rewrite delta payloads — that lets the proxy work for any delta
-        # field (content, reasoning, tool_calls, ...) without per-format code.
-        response = web.StreamResponse(
-            status=200,
-            headers={
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",  # Disable nginx buffering
-            }
-        )
-        await response.prepare(request)
-
-        buffer = EventBuffer()
-
-        async def flush_buffer():
-            if buffer.events:
-                await response.write(buffer.flush())
-
-        try:
-            async with self.session.post(
-                f"{self.vllm_url}/v1/chat/completions",
-                json=body,
-                headers={"Content-Type": "application/json"}
-            ) as upstream:
-                # iter_chunked instead of line-by-line: reading raw bytes lets
-                # us forward exact upstream framing, and lines are
-                # newline-terminated SSE frames so we still split correctly.
-                pending = b""
-                async for chunk in upstream.content.iter_any():
-                    pending += chunk
-                    # Split into complete SSE lines (keep trailing partial line
-                    # in `pending` for the next iteration).
-                    while b"\n" in pending:
-                        line, pending = pending.split(b"\n", 1)
-                        # Re-attach the newline so downstream parsers see
-                        # framing exactly as vLLM emits it.
-                        line_with_nl = line + b"\n"
-
-                        # Inspect the line just enough to (a) detect [DONE],
-                        # (b) detect finish events that should flush+forward
-                        # immediately, (c) sniff content/reasoning text for
-                        # newline-flush heuristic. No payload rewriting.
-                        stripped = line.strip()
-                        if not stripped or not stripped.startswith(b"data: "):
-                            # Forward blank lines / comments as-is (preserves
-                            # SSE inter-event spacing).
-                            buffer.add(line_with_nl)
-                            continue
-
-                        data_str = stripped[6:].decode("utf-8", errors="replace")
-
-                        if data_str == "[DONE]":
-                            await flush_buffer()
-                            await response.write(line_with_nl)
-                            # Drain any remaining bytes (usually empty) and
-                            # exit the outer chunk loop on next iteration.
-                            if pending.strip():
-                                await response.write(pending)
-                            pending = b""
-                            break
-
-                        # For known JSON events: peek to extract finish flag
-                        # and content text; if parse fails, just batch as-is.
-                        text_for_newline_check = ""
-                        is_finish_event = False
-                        try:
-                            data = json.loads(data_str)
-                            choices = data.get("choices", [])
-                            if choices:
-                                delta = choices[0].get("delta") or {}
-                                # Sample any text-bearing delta field for the
-                                # newline-flush heuristic.
-                                for fld in ("content", "reasoning", "reasoning_content"):
-                                    v = delta.get(fld)
-                                    if isinstance(v, str):
-                                        text_for_newline_check += v
-                                if choices[0].get("finish_reason"):
-                                    is_finish_event = True
-                        except json.JSONDecodeError:
-                            pass
-
-                        buffer.add(line_with_nl, text_for_newline_check)
-
-                        if is_finish_event:
-                            # Flush immediately so the client sees finish_reason
-                            # without waiting for the timer.
-                            await flush_buffer()
-                        elif buffer.should_flush(self.batch_config):
-                            await flush_buffer()
-                    else:
-                        # No newline yet; check if a time-based flush should
-                        # fire so we don't sit on partially-batched data while
-                        # the upstream is mid-chunk.
-                        if buffer.should_flush(self.batch_config):
-                            await flush_buffer()
-                # Final drain in case the upstream ended without [DONE].
-                if pending:
-                    buffer.add(pending)
-                await flush_buffer()
-
-        except Exception as e:
-            error_event = {"error": str(e)}
-            await response.write(f"data: {json.dumps(error_event)}\n\n".encode())
-
-        return response
+        url = f"{self.vllm_url}/v1/chat/completions"
+        if not body.get("stream", False):
+            return await forward_nonstream(self.session, url, body)
+        return await forward_stream(self.session, url, request, body, self.batch_config)
 
     async def proxy_passthrough(self, request: web.Request) -> web.Response:
         """Pass through non-streaming endpoints directly."""

@@ -80,6 +80,7 @@ Unified CLI for all operations. Uses SSH ControlMaster for single 2FA authentica
 | `chat` | Connect to vLLM and start interactive chat |
 | `build` | Build vLLM containers |
 | `server` | Manage vLLM server (start, stop, logs) |
+| `proxy` | Durable multi-model router on the small partition (start, tunnel, status) |
 | `tunnel` | Manage SSH tunnel to GPU node |
 | `status` | Show cluster and connection status |
 | `--kill-all` | Close tunnel and SSH connection |
@@ -157,6 +158,34 @@ Unified CLI for all operations. Uses SSH ControlMaster for single 2FA authentica
 ./olivia.sh tunnel up          # Open tunnel to vLLM server
 ./olivia.sh tunnel down        # Close tunnel
 ```
+
+### Proxy Module (durable multi-model router)
+
+A CPU-only reverse proxy on Olivia's **`small`** partition (up to a 7-day
+walltime) that gives clients **one stable endpoint** routing to whichever GPU
+server is live. Select a model by the request's `model` field — a preset name
+(`glm51`, `kimi27`, ...), alias, or served repo id — and the router finds the
+backend by listing running `vllm-*` jobs and **probing each `/v1/models`**, so it
+works regardless of job naming; you never need to know the node or container
+index. It replaces the (now-removed) login-node relay with a queue-system job
+(the NRIS-policy-correct place for a long-lived process), and **auto-stops after
+30 min with no GPU servers up** so an idle CPU job doesn't bill its reservation.
+Full design + Sigma2 policy analysis:
+[`plans/proposed/small_partition_proxy.md`](plans/proposed/small_partition_proxy.md).
+
+```bash
+./olivia.sh proxy start        # Deploy + submit the router (small partition)
+./olivia.sh server start glm51 # Start GPU servers as usual; router picks them up (~15s)
+./olivia.sh proxy tunnel       # Forward localhost:8003 -> router node
+curl localhost:8003/v1/models  # See which presets are currently live
+./olivia.sh proxy status       # Router job + live models
+./olivia.sh proxy stop         # Cancel the router (it bills its small reservation while up)
+```
+
+> Compute nodes aren't internet-facing, so the laptop still tunnels in through
+> the login node — but the tunnel target (the `small` node) is now stable for the
+> job's lifetime instead of moving on every GPU job restart. On-cluster
+> validation is pending (see the plan doc's checklist).
 
 ## Model Presets
 

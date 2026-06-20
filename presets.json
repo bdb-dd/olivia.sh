@@ -1,0 +1,109 @@
+{
+  "_comment": [
+    "Single source of truth for model presets, consumed by BOTH the bash CLI",
+    "(olivia.sh, via presets.py) and the Python model router (model_router.py).",
+    "Previously this data lived in olivia.sh's preset_field()/normalize_preset()",
+    "case statements; it was extracted here so the router and the CLI agree on",
+    "exactly which preset maps to which model / container / node.",
+    "",
+    "Per-preset fields:",
+    "  aliases            - alternate names the CLI and router accept (case-insensitive)",
+    "  model              - HuggingFace repo id passed to vLLM as MODEL (the served name unless overridden)",
+    "  served_model_name  - optional; what vLLM serves the model AS (defaults to `model`). Routing also matches this.",
+    "  nodes / gpus / pp  - SLURM/vLLM shape: NUM_NODES, GPUs-per-node (intra-node TP), pipeline-parallel size",
+    "  container_prefix   - sandbox name is vllm-<container_prefix>-<index>-sandbox",
+    "  index              - default container index for the preset",
+    "  port               - vLLM serve port. Defaults to 8000 for every preset because each server job owns",
+    "                       its GPU node(s) exclusively, so two models never collide on a node — the router",
+    "                       tells them apart by the per-preset SLURM job name (vllm-server-<preset>), not the",
+    "                       port. Override per preset only if you ever co-locate servers on one node.",
+    "  description        - human-readable summary"
+  ],
+  "version": 1,
+  "defaults": {
+    "nodes": 1,
+    "gpus": 4,
+    "pp": 1,
+    "index": 1,
+    "port": 8000
+  },
+  "presets": {
+    "glm51_v19": {
+      "aliases": ["glm51", "glm-5.1", "glm5.1"],
+      "model": "cyankiwi/GLM-5.1-AWQ-4bit",
+      "nodes": 2, "gpus": 4, "pp": 2,
+      "container_prefix": "glm51", "index": 1,
+      "description": "GLM-5.1 744B MoE+DSA, AWQ-4bit, vLLM v0.19.0 (recipe default)"
+    },
+    "glm51_v20": {
+      "aliases": [],
+      "model": "cyankiwi/GLM-5.1-AWQ-4bit",
+      "nodes": 2, "gpus": 4, "pp": 2,
+      "container_prefix": "glm51", "index": 2,
+      "description": "GLM-5.1 on vLLM v0.20.0 + RayExecutorV2 (quarantined; same wedge)"
+    },
+    "glm52": {
+      "aliases": ["glm-5.2", "glm5.2"],
+      "model": "RedHatAI/GLM-5.2-FP8",
+      "nodes": 3, "gpus": 4, "pp": 3,
+      "container_prefix": "glm52", "index": 1,
+      "description": "GLM-5.2 744B MoE+DSA, block-FP8, 3-node TP=4+PP=3"
+    },
+    "glm47": {
+      "aliases": ["glm-4.7"],
+      "model": "QuantTrio/GLM-4.7-AWQ",
+      "nodes": 1, "gpus": 4, "pp": 1,
+      "container_prefix": "glm47", "index": 1,
+      "description": "GLM-4.7 358B, AWQ, single-node TP=4"
+    },
+    "kimi": {
+      "aliases": ["kimi26", "kimi-k2.6", "kimi_k26"],
+      "model": "moonshotai/Kimi-K2.6",
+      "nodes": 2, "gpus": 4, "pp": 2,
+      "container_prefix": "kimi", "index": 4,
+      "description": "Kimi K2.6 1T MoE (32B active), native int4, MLA, multimodal"
+    },
+    "kimi27": {
+      "aliases": ["kimi-k2.7", "kimi_k27", "kimi-k2.7-code", "kimi27code"],
+      "model": "moonshotai/Kimi-K2.7-Code",
+      "nodes": 2, "gpus": 4, "pp": 2,
+      "container_prefix": "kimi", "index": 4,
+      "description": "Kimi K2.7-Code 1T MoE (32B active), native int4 (reuses kimi container)"
+    },
+    "laguna": {
+      "aliases": ["laguna-m1", "laguna_m1", "lagunam1", "laguna-m.1", "laguna_m.1"],
+      "model": "poolside/Laguna-M.1-FP8",
+      "nodes": 1, "gpus": 4, "pp": 1,
+      "container_prefix": "laguna", "index": 1,
+      "description": "Laguna M.1 225B MoE (23B active), block-FP8, single-node TP=4, CUDAGraph on"
+    },
+    "devstral": {
+      "aliases": ["mistral"],
+      "model": "mistralai/Devstral-2-123B-Instruct-2512",
+      "nodes": 1, "gpus": 4, "pp": 1,
+      "container_prefix": "devstral", "index": 1,
+      "description": "Devstral 2 123B, single-node TP=4"
+    },
+    "llama": {
+      "aliases": ["llama3"],
+      "model": "meta-llama/Llama-3.3-70B-Instruct",
+      "nodes": 1, "gpus": 4, "pp": 1,
+      "container_prefix": "llama", "index": 1,
+      "description": "Llama 3.3 70B Instruct, single-node TP=4"
+    },
+    "qwen": {
+      "aliases": ["qwen2"],
+      "model": "Qwen/Qwen2.5-72B-Instruct",
+      "nodes": 1, "gpus": 4, "pp": 1,
+      "container_prefix": "qwen", "index": 1,
+      "description": "Qwen 2.5 72B Instruct, single-node TP=4"
+    },
+    "generic": {
+      "aliases": [],
+      "model": "",
+      "nodes": 1, "gpus": 4, "pp": 1,
+      "container_prefix": "generic", "index": 1,
+      "description": "Generic build defaults (no default model)"
+    }
+  }
+}

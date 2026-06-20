@@ -164,7 +164,7 @@ Mechanism notes:
 ./olivia.sh tunnel             # Show tunnel status
 ./olivia.sh tunnel up          # Open tunnel to vLLM server
 ./olivia.sh tunnel refresh     # Re-point tunnel after the job moved nodes
-./olivia.sh tunnel down        # Close tunnel (also stops the login-node relay)
+./olivia.sh tunnel down        # Close tunnel
 ./olivia.sh reconnect          # Re-auth after a drop and restore the tunnel
 ```
 
@@ -181,18 +181,69 @@ single 2FA covers a long idle window and survives the terminal closing.
   any recorded tunnel. Unattended auto-reconnect (autossh) is intentionally not
   used because a fresh connection needs an interactive OTP.
 
-**Login-node follow-the-node relay (opt-in: `--login-proxy` / `LOGIN_PROXY=1`):**
-Normally the local forward targets the GPU node directly, so a job moving to a
-new node requires re-pointing the forward. With `--login-proxy`, the laptop
-forwards to a *fixed* login-node port and a small user-space Python relay on the
-login node (`~/.olivia/relay.py`, managed by olivia.sh) forwards to the current
-GPU node. Node moves then only re-point the relay; the local forward is never
-disturbed. `LOGIN_PROXY_PORT` defaults to `18000`.
+> For a *durable* endpoint that survives GPU job restarts (the old `--login-proxy`
+> login-node relay, now removed), use the `proxy` module below — a router on the
+> `small` partition, which is the NRIS-policy-correct place for a long-lived
+> process. The direct `tunnel` is still the simplest path for a quick single-server
+> session.
 
-> ⚠️ This runs a long-lived process on the *shared* login node — check the NRIS
-> acceptable-use policy before relying on it. Validate on the cluster: it
-> assumes the login node can reach `<gpu-node>:8000` directly (the same path the
-> direct forward already uses) and that `python3` is on the login node.
+#### Proxy Module (durable multi-model router)
+```bash
+./olivia.sh proxy start        # Deploy router files + submit the router (small partition, 7-day walltime)
+./olivia.sh proxy tunnel       # Forward localhost:8003 -> router node (point clients here)
+./olivia.sh proxy status       # Router job + which model presets are currently serving
+./olivia.sh proxy logs         # Tail the router log
+./olivia.sh proxy stop         # Cancel the router job
+./olivia.sh proxy deploy       # Upload router files only
+```
+
+A CPU-only reverse proxy (`model_router.py`) submitted to the **`small`**
+partition that gives clients **one stable endpoint** routing to whichever GPU
+(`accel`) server is live. The client selects a model by the request's `model`
+field — a **preset name** (`glm51`, `kimi27`, ...), an alias, or the served repo
+id — which the router resolves to a preset (`presets.json`) and thus to a live
+backend. Clients never need to know the node or container index. See the full
+design + policy analysis in `plans/proposed/small_partition_proxy.md`.
+
+**Discovery is job-name-independent:** the router lists the user's running
+`vllm-*` jobs via `squeue`, then **probes each node's `/v1/models`** to learn
+what it actually serves, building a {served model → node} map. So it works
+regardless of how servers are named (`vllm-server`, or the per-branch
+`vllm-<DEPLOY_KEY>` from the concurrent-agent isolation scheme) — no per-preset
+job naming required. A server still loading just isn't in the map yet.
+
+Why the small partition: it is the policy-correct home for a long-lived process
+(NRIS: *"always use the queue system"*), allows partial-node allocation (the job
+asks for just 2 CPUs / 4 GiB), and permits a **7-day** walltime — far more
+durable than the ~8 h GPU job, and the policy-clean replacement for the
+(now-removed) login-node relay. Compute nodes are not internet-facing, so the
+laptop still tunnels in through the login node — but the tunnel target (the
+`small` node) is stable for the job's lifetime instead of moving every GPU job
+restart.
+
+**Auto-spindown:** an idle CPU job still bills its `small` reservation, so the
+router **shuts itself down after 30 min with no GPU servers running** (default;
+`ROUTER_EMPTY_TIMEOUT` seconds, `0` disables). Exiting ends the SLURM job and
+frees the allocation. There's a full grace window at startup before any server
+exists, and transient squeue/probe errors don't count toward the timeout.
+
+Typical flow:
+```bash
+./olivia.sh proxy start                 # bring up the durable router
+./olivia.sh server start glm51          # start one or more GPU servers as usual
+./olivia.sh server start laguna         #   (router picks them up within ~15s)
+./olivia.sh proxy tunnel                # forward localhost:8003 to the router
+curl localhost:8003/v1/models           # see which models are live
+python anthropic_proxy.py --model glm51 --upstream http://localhost:8003   # Claude Code
+```
+
+Notes:
+- All servers serve on port 8000 (each job owns its node, so no collision); the
+  router discovers them by probing `/v1/models`, not by job name or port.
+- `OLIVIA_PROXY_TOKEN` (env) optionally requires a bearer token / `x-api-key`.
+- `ROUTER_EMPTY_TIMEOUT` (env, default 1800) tunes the idle auto-spindown.
+- **On-cluster validation pending** — see the plan doc's "Remaining on-cluster
+  validation" checklist.
 
 #### Global Options
 ```bash
@@ -283,7 +334,13 @@ The build script includes predefined configurations for common models. Run witho
 
 Custom MODEL_ID values are also supported - they will use generic defaults.
 
-To add a new preset, edit the `apply_preset()` function in `build_vllm_gh200.sh`.
+To add a new preset, edit the `apply_preset()` function in `build_vllm_gh200.sh`
+(build-time vLLM/transformers versions) **and** add the entry to **`presets.json`**
+(runtime model/aliases/container/shape). `presets.json` is the single source of
+truth for the runtime preset table: `olivia.sh` (via `presets.py`) and the
+durable router (`model_router.py`) both read it, so the CLI and the router stay in
+sync. The old `preset_field`/`normalize_preset` case statements in `olivia.sh`
+were extracted into `presets.json` — don't re-add per-preset data to the bash.
 
 ### Server Script (`run_vllm_server.sh`)
 Runs vLLM server with GH200-optimized settings:

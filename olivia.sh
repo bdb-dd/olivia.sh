@@ -52,6 +52,16 @@ LOCAL_PATCHES_DIR="${SCRIPT_DIR}/patches"
 # Chat-template override for GLM-5.1 (see run_vllm_server.sh for why).
 LOCAL_GLM51_CHAT_TEMPLATE="${SCRIPT_DIR}/templates/glm51_chat_template.jinja"
 CHAT_SCRIPT="${SCRIPT_DIR}/chat_devstral.py"
+# Preset registry — single source of truth (presets.json), queried via presets.py.
+# preset_field()/normalize_preset() delegate here so the bash CLI and the Python
+# model router (model_router.py) agree on the preset table.
+PRESETS_PY="${SCRIPT_DIR}/presets.py"
+PRESETS_JSON="${SCRIPT_DIR}/presets.json"
+OLIVIA_PY="${OLIVIA_PY:-python3}"
+# Local helper scripts deployed to the cluster for the durable model router.
+LOCAL_PROXY_SCRIPT="${SCRIPT_DIR}/run_proxy.sh"
+LOCAL_ROUTER_SCRIPT="${SCRIPT_DIR}/model_router.py"
+LOCAL_VLLM_PROXY_SCRIPT="${SCRIPT_DIR}/vllm_proxy.py"
 
 # --- Per-branch deploy isolation -------------------------------------------
 # The deployed cluster scripts (run_vllm_server.sh, build_vllm_gh200.sh) + aux
@@ -86,13 +96,9 @@ SSH_CONTROL_PERSIST="${SSH_CONTROL_PERSIST:-12h}"
 SSH_ALIVE_INTERVAL="${SSH_ALIVE_INTERVAL:-30}"
 SSH_ALIVE_COUNT="${SSH_ALIVE_COUNT:-3}"
 
-# Optional login-node relay (opt-in via LOGIN_PROXY=1 or `--login-proxy`).
-# The laptop forwards to a FIXED login-node port and a lightweight user-space
-# relay on the login node follows the GPU node across job restarts, so node
-# churn never tears down the local forward. NOTE: this runs a long-lived
-# process on the shared login node - check the NRIS acceptable-use policy.
-LOGIN_PROXY="${LOGIN_PROXY:-0}"
-LOGIN_PROXY_PORT="${LOGIN_PROXY_PORT:-18000}"
+# (Removed: the opt-in login-node relay. A long-lived process on the shared login
+# node is against NRIS policy; the durable `proxy` module — a router on the small
+# partition — is the policy-correct replacement. See the Proxy module below.)
 
 # State files
 TUNNEL_NODE_FILE="/tmp/olivia-tunnel-${LOCAL_PORT}.node"
@@ -239,136 +245,10 @@ close_master_connection() {
     fi
 }
 
-# =============================================================================
-# Login-node relay (opt-in: LOGIN_PROXY=1)
-# =============================================================================
-# A tiny user-space TCP relay on the login node that listens on a fixed port
-# and forwards to the CURRENT GPU node:REMOTE_PORT. The laptop forward then
-# targets the stable login-node port, so when the SLURM job moves to a new node
-# we only re-point the relay (cheap, over the existing master) instead of
-# tearing down the local forward. The login node can already reach the compute
-# node's port directly over the internal network (same path the direct forward
-# uses), so no inner SSH hop is needed.
-
-# Deploy the relay script to the login node (idempotent, tiny).
-login_proxy_deploy() {
-    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
-        'mkdir -p "$HOME/.olivia" && cat > "$HOME/.olivia/relay.py"' <<'PYEOF'
-import asyncio
-import sys
-
-
-async def _pipe(reader, writer):
-    try:
-        while True:
-            data = await reader.read(65536)
-            if not data:
-                break
-            writer.write(data)
-            await writer.drain()
-    except Exception:
-        pass
-    finally:
-        try:
-            writer.close()
-        except Exception:
-            pass
-
-
-async def _handle(local_reader, local_writer, host, port):
-    try:
-        remote_reader, remote_writer = await asyncio.open_connection(host, port)
-    except Exception:
-        local_writer.close()
-        return
-    await asyncio.gather(
-        _pipe(local_reader, remote_writer),
-        _pipe(remote_reader, local_writer),
-    )
-
-
-async def _main():
-    listen_port = int(sys.argv[1])
-    upstream_host = sys.argv[2]
-    upstream_port = int(sys.argv[3])
-    server = await asyncio.start_server(
-        lambda r, w: _handle(r, w, upstream_host, upstream_port),
-        "127.0.0.1",
-        listen_port,
-    )
-    async with server:
-        await server.serve_forever()
-
-
-if __name__ == "__main__":
-    asyncio.run(_main())
-PYEOF
-}
-
-# Start or re-point the relay at the given GPU node.
-login_proxy_ensure() {
-    local gpu_node="$1"
-
-    if ! login_proxy_deploy; then
-        error "Failed to deploy login-node relay script"
-        return 1
-    fi
-
-    info "Pointing login-node relay (:${LOGIN_PROXY_PORT}) at ${gpu_node}:${REMOTE_PORT}..."
-
-    local out
-    if ! out=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" bash -s -- \
-        "${LOGIN_PROXY_PORT}" "${gpu_node}" "${REMOTE_PORT}" <<'REMOTE_EOF'
-set -u
-PORT="$1"; NODE="$2"; UPSTREAM="$3"
-DIR="$HOME/.olivia"
-PIDFILE="$DIR/relay-$PORT.pid"
-LOGFILE="$DIR/relay-$PORT.log"
-
-# Stop any existing relay on this port.
-if [ -f "$PIDFILE" ]; then
-    OLDPID=$(cat "$PIDFILE" 2>/dev/null || true)
-    if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
-        kill "$OLDPID" 2>/dev/null || true
-        sleep 1
-    fi
-fi
-
-nohup python3 "$DIR/relay.py" "$PORT" "$NODE" "$UPSTREAM" >"$LOGFILE" 2>&1 &
-echo $! > "$PIDFILE"
-sleep 1
-NEWPID=$(cat "$PIDFILE" 2>/dev/null || true)
-if [ -n "$NEWPID" ] && kill -0 "$NEWPID" 2>/dev/null; then
-    echo "relay-up pid=$NEWPID"
-else
-    echo "relay-failed"
-    tail -n 20 "$LOGFILE" 2>/dev/null || true
-    exit 1
-fi
-REMOTE_EOF
-    ); then
-        error "Login-node relay failed to start"
-        [[ -n "$out" ]] && echo "$out" >&2
-        return 1
-    fi
-
-    success "Login-node relay running (${out#relay-up })"
-    return 0
-}
-
-# Stop the relay on LOGIN_PROXY_PORT.
-login_proxy_stop() {
-    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" bash -s -- "${LOGIN_PROXY_PORT}" <<'REMOTE_EOF' 2>/dev/null || true
-PORT="$1"
-DIR="$HOME/.olivia"
-PIDFILE="$DIR/relay-$PORT.pid"
-if [ -f "$PIDFILE" ]; then
-    PID=$(cat "$PIDFILE" 2>/dev/null || true)
-    [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
-    rm -f "$PIDFILE"
-fi
-REMOTE_EOF
-}
+# (Removed: the login-node relay functions — login_proxy_deploy/ensure/stop.
+# Running a long-lived relay on the shared login node is against NRIS policy;
+# the `proxy` module — a durable router on the small partition — is the
+# policy-correct replacement. See the Proxy module below.)
 
 # =============================================================================
 # Tunnel management
@@ -398,7 +278,8 @@ kill_tunnel() {
     local node target
     node=$(cat "${TUNNEL_NODE_FILE}" 2>/dev/null || echo "")
     # The cancel spec must match the forward spec exactly; prefer the stored
-    # target (handles login-proxy mode), fall back to the direct node target.
+    # target (e.g. the router node:port written by `proxy tunnel`), fall back to
+    # the direct GPU node target.
     target=$(cat "${TUNNEL_TARGET_FILE}" 2>/dev/null || echo "${node}:${REMOTE_PORT}")
 
     info "Canceling port forward (localhost:${LOCAL_PORT} -> ${target})..."
@@ -406,20 +287,6 @@ kill_tunnel() {
         -L "${LOCAL_PORT}:${target}" \
         -o "ControlPath=${SSH_CONTROL_SOCKET}" \
         "${REMOTE_USER}@${REMOTE_HOST}" 2>/dev/null || true
-
-    # A localhost:<port> target means we went via the login-node relay; stop it.
-    # Only reach out if the master is alive - otherwise ssh_run would open a
-    # fresh (2FA-prompting) connection just to tear down.
-    if [[ "$target" == localhost:* ]]; then
-        LOGIN_PROXY_PORT="${target#localhost:}"
-        if is_master_alive; then
-            login_proxy_stop
-        else
-            warn "Master connection down; login-node relay (:${LOGIN_PROXY_PORT}) may still be running"
-            echo "    It will be reaped on the next --login-proxy use, or stop it manually:" >&2
-            echo "    ssh ${REMOTE_HOST} 'kill \$(cat ~/.olivia/relay-${LOGIN_PROXY_PORT}.pid)'" >&2
-        fi
-    fi
 
     rm -f "${TUNNEL_NODE_FILE}" "${TUNNEL_TARGET_FILE}"
     success "Tunnel closed"
@@ -462,16 +329,10 @@ find_vllm_node() {
 
 setup_tunnel() {
     local gpu_node="$1"
-
-    # The remote end of the local -L forward. In login-proxy mode this is a
-    # FIXED login-node port (so node moves don't disturb the local forward); in
-    # direct mode it is the GPU node itself.
-    local target
-    if [[ "${LOGIN_PROXY}" == "1" ]]; then
-        target="localhost:${LOGIN_PROXY_PORT}"
-    else
-        target="${gpu_node}:${REMOTE_PORT}"
-    fi
+    # Direct forward to the GPU node serving on REMOTE_PORT. (For a stable
+    # endpoint that survives GPU job restarts, use `proxy tunnel` instead — it
+    # forwards to the durable router on the small partition.)
+    local target="${gpu_node}:${REMOTE_PORT}"
 
     local stored_target=""
     [[ -f "${TUNNEL_TARGET_FILE}" ]] && stored_target=$(cat "${TUNNEL_TARGET_FILE}")
@@ -479,18 +340,7 @@ setup_tunnel() {
     if is_tunnel_alive && [[ "$stored_target" == "$target" ]]; then
         local existing_node
         existing_node=$(get_tunnel_node)
-        if [[ "${LOGIN_PROXY}" == "1" ]]; then
-            # Local forward already up to the fixed login port; just (re)point
-            # the relay at the current node - no local teardown needed.
-            login_proxy_ensure "$gpu_node" || return 1
-            echo "$gpu_node" > "${TUNNEL_NODE_FILE}"
-            if [[ "$existing_node" == "$gpu_node" ]]; then
-                success "Tunnel active; relay already on ${gpu_node}"
-            else
-                success "Tunnel active; relay repointed ${existing_node} -> ${gpu_node}"
-            fi
-            return 0
-        elif [[ "$existing_node" == "$gpu_node" ]]; then
+        if [[ "$existing_node" == "$gpu_node" ]]; then
             success "Tunnel already active to ${gpu_node} on port ${LOCAL_PORT}"
             return 0
         else
@@ -498,13 +348,9 @@ setup_tunnel() {
             kill_tunnel
         fi
     elif is_tunnel_alive; then
-        # Mode or target changed (e.g. switching to/from login-proxy); rebuild.
+        # Target changed (e.g. a previous `proxy tunnel`); rebuild.
         warn "Tunnel target changed; rebuilding"
         kill_tunnel
-    fi
-
-    if [[ "${LOGIN_PROXY}" == "1" ]]; then
-        login_proxy_ensure "$gpu_node" || return 1
     fi
 
     info "Setting up tunnel: localhost:${LOCAL_PORT} -> ${target}"
@@ -527,11 +373,7 @@ setup_tunnel() {
     echo "$target" > "${TUNNEL_TARGET_FILE}"
     success "Tunnel established"
     echo "    Local:  localhost:${LOCAL_PORT}" >&2
-    if [[ "${LOGIN_PROXY}" == "1" ]]; then
-        echo "    Path:   localhost:${LOCAL_PORT} -> ${REMOTE_HOST}:${LOGIN_PROXY_PORT} -> ${gpu_node}:${REMOTE_PORT}" >&2
-    else
-        echo "    Remote: ${gpu_node}:${REMOTE_PORT}" >&2
-    fi
+    echo "    Remote: ${gpu_node}:${REMOTE_PORT}" >&2
 }
 
 # =============================================================================
@@ -1131,138 +973,25 @@ EOF
 # MODULE: Server
 # =============================================================================
 
-# Canonicalize a preset name: lowercase + map aliases to a canonical token.
-# This is the ONLY place that knows about aliases, so every other preset lookup
-# can match canonical tokens only. Unknown names pass through (lowercased) and
-# are treated as a custom MODEL_ID downstream.
-# (lowercase via `tr` rather than ${1,,} — macOS ships bash 3.2.)
-normalize_preset() {
-    local p
-    p=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
-    case "$p" in
-        glm51|glm-5.1|glm5.1|glm51_v19) echo "glm51_v19" ;;
-        glm51_v20)                      echo "glm51_v20" ;;
-        glm52|glm-5.2|glm5.2)           echo "glm52" ;;
-        glm47|glm-4.7)                  echo "glm47" ;;
-        kimi|kimi26|kimi-k2.6|kimi_k26) echo "kimi" ;;
-        kimi27|kimi-k2.7|kimi_k27|kimi-k2.7-code|kimi27code) echo "kimi27" ;;
-        laguna|laguna-m1|laguna_m1|lagunam1|laguna-m.1|laguna_m.1) echo "laguna" ;;
-        devstral|mistral)               echo "devstral" ;;
-        llama|llama3)                   echo "llama" ;;
-        qwen|qwen2)                     echo "qwen" ;;
-        generic)                        echo "generic" ;;
-        *)                              echo "$p" ;;
-    esac
+# Preset registry accessor — runs presets.py against presets.json. ALL preset
+# data (models, aliases, container prefixes, shapes, ports) lives there now as
+# the single source of truth shared with the Python router (model_router.py).
+# Replaces the giant bash case statements that used to live here.
+preset_query() {
+    "${OLIVIA_PY}" "${PRESETS_PY}" "$@"
 }
 
-# Single source of truth for per-preset runtime config. Given a (raw) preset
-# name and a field, emit that field's value. All per-preset data lives in the
-# one case statement below — add or change a preset here and every accessor
-# (get_default_model / get_preset_resources / resolve_container_* /
-# get_preset_default_index) picks it up.
-#
-# Fields: model | nodes | gpus | pp | resources | prefix | index
-preset_field() {
-    local canon field
-    canon=$(normalize_preset "$1")
-    field="$2"
-    # Defaults: single-node 4-GPU (matches run_vllm_server.sh #SBATCH directives),
-    # container prefix == canonical name, index 1, no default model.
-    local prefix="$canon" index="1" model="" nodes="1" gpus="4" pp="1"
-    case "$canon" in
-        glm51_v19)
-            # glm51_v19/glm51_v20 share the "glm51" container prefix; the index
-            # encodes the vLLM version (1 = v0.19.0, 2 = v0.20.0).
-            prefix="glm51"; index="1"
-            model="cyankiwi/GLM-5.1-AWQ-4bit"
-            # 744B MoE AWQ (~430GB) needs 8 GPUs. TP=4 intra-node (NVLink) +
-            # PP=2 cross-node (Slingshot) — PP tolerates the ~25 GB/s cross-node
-            # fabric far better than naive TP=8 would.
-            nodes="2"; gpus="4"; pp="2"
-            ;;
-        glm51_v20)
-            prefix="glm51"; index="2"
-            model="cyankiwi/GLM-5.1-AWQ-4bit"
-            nodes="2"; gpus="4"; pp="2"
-            ;;
-        glm52)
-            # GLM-5.2 (744B MoE+DSA, successor to 5.1). No AWQ-4bit quant exists
-            # yet, so the runnable quant today is block-FP8 (~755 GB). At
-            # ~94 GB/GPU it does NOT fit 8×GH200, so glm52 spans 3 nodes:
-            # TP=4 intra-node (NVLink) + PP=3 cross-node (Slingshot) = 12 GPUs.
-            # Default model is the RedHatAI re-host (byte-identical to the
-            # official zai-org/GLM-5.2-FP8). Swap to an AWQ-4bit repo + 2-node
-            # PP=2 once one is published (mirrors glm51).
-            model="RedHatAI/GLM-5.2-FP8"
-            nodes="3"; gpus="4"; pp="3"
-            ;;
-        glm47)
-            model="QuantTrio/GLM-4.7-AWQ"
-            ;;
-        kimi)
-            # Kimi K2.6 (1T MoE, 32B active). The base repo ships Moonshot's
-            # native int4 (compressed-tensors, ~640GB) — there is no separate
-            # -AWQ repo. ~640GB → 8 GPUs / 2 nodes, same TP=4 + PP=2 as glm51.
-            # index 4 = the validated eager vLLM 0.21 container
-            # (vllm-kimi-4-sandbox, shared with kimi27) — carries the
-            # reasoning_tokens patches and is what the K2.6 deployment runs on.
-            # (Was the default index 1 = legacy vLLM 0.19 vllm-kimi-1-sandbox.)
-            prefix="kimi"; index="4"
-            model="moonshotai/Kimi-K2.6"
-            nodes="2"; gpus="4"; pp="2"
-            ;;
-        kimi27)
-            # Kimi K2.7-Code (1T MoE, 32B active): coding-focused successor to
-            # K2.6. SAME KimiK25ForConditionalGeneration arch + native int4
-            # (compressed-tensors ~560GB), so it reuses the "kimi" container
-            # (index 4 = the validated eager vLLM 0.21 build) with no rebuild.
-            # 8 GPUs / 2 nodes, TP=4 + PP=2. Thinking-mode only (temp 1.0,
-            # top_p 0.95). Weights live on /cluster/work scratch (the project
-            # quota is full with K2.6) -> serve with HF_HOME pointed at the
-            # scratch cache: HF_HOME=/cluster/work/projects/nn10104k/huggingface
-            prefix="kimi"; index="4"
-            model="moonshotai/Kimi-K2.7-Code"
-            nodes="2"; gpus="4"; pp="2"
-            ;;
-        laguna)
-            # Laguna M.1 (Poolside): 225B total / 23B active MoE coding model
-            # (LagunaForCausalLM, 256 experts top-k=16, dense GQA full attention,
-            # 256K context). Default quant is block-FP8 (poolside/Laguna-M.1-FP8,
-            # ~225 GB) which fits a SINGLE GH200 node at TP=4 — no cross-node PP,
-            # unlike glm52's 3-node FP8. Single-node defaults (nodes=1/gpus=4/pp=1)
-            # apply. Native vLLM support (>=0.21.0); ordinary attention so it keeps
-            # FLASH_ATTN and lets CUDAGraph capture run (no eager override).
-            model="poolside/Laguna-M.1-FP8"
-            ;;
-        devstral)
-            model="mistralai/Devstral-2-123B-Instruct-2512"
-            ;;
-        llama)
-            model="meta-llama/Llama-3.3-70B-Instruct"
-            ;;
-        qwen)
-            model="Qwen/Qwen2.5-72B-Instruct"
-            ;;
-        generic)
-            ;;
-        *)
-            # Custom/unknown preset: keep the raw name for the container prefix
-            # so it matches build_vllm_gh200.sh's MODEL_ID="${preset}" (which
-            # preserves case); no default model, single-node defaults.
-            prefix="$1"
-            ;;
-    esac
-    case "$field" in
-        model)     echo "$model" ;;
-        nodes)     echo "$nodes" ;;
-        gpus)      echo "$gpus" ;;
-        pp)        echo "$pp" ;;
-        resources) echo "$nodes $gpus $pp" ;;
-        prefix)    echo "$prefix" ;;
-        index)     echo "$index" ;;
-        *)         echo "" ;;
-    esac
-}
+# Canonicalize a preset name: lowercase + map aliases to a canonical token.
+# Unknown names pass through (lowercased) and are treated as a custom MODEL_ID
+# downstream. (Was a bash case statement; now delegates to presets.py.)
+normalize_preset() { preset_query normalize "$1"; }
+
+# Per-preset runtime config accessor. Given a (raw) preset name and a field,
+# emit that field's value from presets.json (via presets.py). The data — models,
+# shapes, container prefixes/indices, and canonical ports — used to live in a
+# bash case statement here; it now lives in presets.json so the router shares it.
+# Fields: model | served_name | nodes | gpus | pp | resources | prefix | index | port | container
+preset_field() { preset_query field "$1" "$2"; }
 
 # Thin accessors over preset_field — kept as named functions so call sites read
 # clearly and don't all have to learn the field names.
@@ -1270,6 +999,7 @@ get_default_model()        { preset_field "$1" model; }
 get_preset_resources()     { preset_field "$1" resources; }  # "num_nodes gpus_per_node pp_size"
 resolve_container_prefix() { preset_field "$1" prefix; }
 get_preset_default_index() { preset_field "$1" index; }
+get_preset_port()          { preset_field "$1" port; }
 
 # Resolve preset + index to a container sandbox name.
 resolve_container_name() {
@@ -2161,9 +1891,8 @@ tunnel_status() {
         success "Tunnel ACTIVE"
         echo "    Node:   $node"
         echo "    Local:  localhost:${LOCAL_PORT}"
-        if [[ "$target" == localhost:* ]]; then
-            echo "    Mode:   login-proxy (relay on ${REMOTE_HOST}:${target#localhost:})"
-            echo "    Path:   localhost:${LOCAL_PORT} -> ${REMOTE_HOST}:${target#localhost:} -> ${node}:${REMOTE_PORT}"
+        if [[ -n "$target" ]]; then
+            echo "    Remote: ${target}"
         else
             echo "    Remote: ${node}:${REMOTE_PORT}"
         fi
@@ -2179,8 +1908,6 @@ cmd_tunnel() {
     # Flags apply to up/refresh.
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --login-proxy)      LOGIN_PROXY=1; shift ;;
-            --login-proxy-port) LOGIN_PROXY_PORT="$2"; shift 2 ;;
             --port)             set_local_port "$2"; shift 2 ;;
             -h|--help)          cmd_tunnel_help; exit 0 ;;
             *) error "Unknown tunnel option: $1"; cmd_tunnel_help; exit 1 ;;
@@ -2226,22 +1953,248 @@ Manage SSH tunnel to vLLM server.
 Actions:
     up, open, start     Open tunnel to running vLLM server
     refresh             Re-point tunnel at the current node (after a job move)
-    down, close, kill   Close tunnel (and stop the login-node relay if used)
+    down, close, kill   Close tunnel
     status              Show tunnel status (default)
 
 Options:
     --port PORT             Local port (default: ${LOCAL_PORT})
-    --login-proxy           Route via a fixed login-node relay that follows the
-                            GPU node across job restarts (opt-in; runs a small
-                            long-lived process on the shared login node)
-    --login-proxy-port PORT Login-node relay port (default: ${LOGIN_PROXY_PORT})
 
 Examples:
-    ./olivia.sh tunnel up                  Open a direct tunnel
-    ./olivia.sh tunnel up --login-proxy    Open via the follow-the-node relay
+    ./olivia.sh tunnel up                  Open a direct tunnel to the GPU node
     ./olivia.sh tunnel refresh             Re-point after the job moved nodes
     ./olivia.sh tunnel down                Close tunnel
     ./olivia.sh tunnel status              Check tunnel status
+
+For a durable endpoint that survives GPU job restarts, use the router instead:
+    ./olivia.sh proxy start && ./olivia.sh proxy tunnel
+EOF
+}
+
+# =============================================================================
+# MODULE: Proxy (durable multi-model router on the small partition)
+# =============================================================================
+# A CPU-only reverse proxy submitted to the `small` partition that routes by the
+# request's `model` field (preset name / alias / served repo id) to whichever GPU
+# server is live. See plans/proposed/small_partition_proxy.md. It replaces the
+# login-node relay with a queue-system job (NRIS-policy-clean) and gives clients
+# ONE stable endpoint that survives GPU job restarts.
+
+ROUTER_JOB_NAME="olivia-router"
+ROUTER_REMOTE_PORT="${ROUTER_REMOTE_PORT:-8080}"   # router listen port on the small node
+
+# Head node of the RUNNING job whose name EXACTLY matches `pattern` (same
+# exact-field resolution as find_job_id/find_vllm_node). Expands a compressed
+# nodelist to the head node. Used to locate the router's small node.
+find_job_node() {
+    local pattern="$1"
+    local squeue_output
+    squeue_output=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "squeue -u \$USER -h -o '%j %N %T'" 2>/dev/null) || return 1
+    local job_line
+    job_line=$(echo "$squeue_output" | awk -v n="$pattern" '$1==n && $NF=="RUNNING"' | head -n1) || true
+    [[ -z "$job_line" ]] && return 1
+    local raw; raw=$(echo "$job_line" | awk '{print $2}')
+    if [[ "$raw" == *"["* || "$raw" == *","* ]]; then
+        local ex; ex=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "scontrol show hostnames '${raw}' 2>/dev/null | head -n1" 2>/dev/null) || ex=""
+        [[ -n "$ex" ]] && { echo "$ex"; return 0; }
+    fi
+    echo "$raw"
+}
+
+find_router_node() { find_job_node "${ROUTER_JOB_NAME}"; }
+
+# Files the router needs on the cluster (deployed into DEPLOY_DIR alongside the
+# server scripts; the per-branch deploy dir keeps concurrent branches isolated).
+proxy_files() {
+    printf '%s\n' \
+        "${LOCAL_ROUTER_SCRIPT}" "${PRESETS_PY}" "${PRESETS_JSON}" \
+        "${LOCAL_VLLM_PROXY_SCRIPT}" "${LOCAL_PROXY_SCRIPT}"
+}
+
+deploy_proxy_files() {
+    require_remote_config || return 1
+    local f
+    while IFS= read -r f; do
+        [[ -f "$f" ]] || { error "Missing router file: $f"; return 1; }
+    done < <(proxy_files)
+
+    info "Deploying router files to ${REMOTE_HOST}:${DEPLOY_DIR}/"
+    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+        "mkdir -p '${DEPLOY_DIR}' '${REMOTE_CONTAINER_DIR}/logs'" || return 1
+    while IFS= read -r f; do
+        if ! scp_run "$f" "${REMOTE_USER}@${REMOTE_HOST}:${DEPLOY_DIR}/"; then
+            error "Failed to upload $(basename "$f")"; return 1
+        fi
+    done < <(proxy_files)
+    success "Router files deployed"
+}
+
+proxy_start() {
+    require_remote_config || return 1
+    ensure_master_connection || return 1
+    deploy_proxy_files || return 1
+
+    local existing
+    if existing=$(find_job_id "${ROUTER_JOB_NAME}" 2>/dev/null); then
+        warn "Router already running (job ${existing})"
+        echo "    Tunnel to it: ./olivia.sh proxy tunnel" >&2
+        return 0
+    fi
+
+    info "Submitting router job to the small partition..."
+    local env_vars="ROUTER_DIR=${DEPLOY_DIR} ROUTER_PORT=${ROUTER_REMOTE_PORT}"
+    [[ -n "${ROUTER_VENV:-}" ]] && env_vars+=" ROUTER_VENV=${ROUTER_VENV}"
+    [[ -n "${ROUTER_EMPTY_TIMEOUT:-}" ]] && env_vars+=" ROUTER_EMPTY_TIMEOUT=${ROUTER_EMPTY_TIMEOUT}"
+    [[ -n "${ROUTER_BACKEND_PORT:-}" ]] && env_vars+=" ROUTER_BACKEND_PORT=${ROUTER_BACKEND_PORT}"
+    [[ -n "${OLIVIA_PROXY_TOKEN:-}" ]] && env_vars+=" OLIVIA_PROXY_TOKEN=${OLIVIA_PROXY_TOKEN}"
+
+    local out
+    if ! out=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+        "cd '${REMOTE_CONTAINER_DIR}' && ${env_vars} sbatch '${DEPLOY_DIR}/run_proxy.sh'" 2>&1); then
+        error "Failed to submit router job"; echo "$out" >&2; return 1
+    fi
+    local job_id; job_id=$(echo "$out" | grep -oE '[0-9]+' | tail -1)
+    success "Submitted router job ${job_id}"
+    echo "    Status:  ./olivia.sh proxy status" >&2
+    echo "    Logs:    ./olivia.sh proxy logs" >&2
+    echo "    Tunnel:  ./olivia.sh proxy tunnel   (forwards localhost:${LOCAL_PORT})" >&2
+}
+
+proxy_status() {
+    require_remote_config || return 1
+    ensure_master_connection || return 1
+    local line
+    line=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+        "squeue -u \$USER -h -o '%i|%T|%N|%M' --name=${ROUTER_JOB_NAME}" 2>/dev/null) || true
+    if [[ -z "$line" ]]; then
+        warn "Router not running"
+        echo "    Start it with: ./olivia.sh proxy start" >&2
+        return 0
+    fi
+    local jid state node elapsed
+    IFS='|' read -r jid state node elapsed <<<"$line"
+    header "Durable model router"
+    echo "    Job:    ${jid} (${state}, up ${elapsed})"
+    echo "    Node:   ${node}:${ROUTER_REMOTE_PORT}"
+
+    # Running vLLM server jobs (any naming); the router maps each to its served
+    # model by probing /v1/models. `^vllm-` excludes build-vllm-gh200 jobs.
+    local servers
+    servers=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
+        "squeue -u \$USER -h -o '%j %T' | awk '\$2==\"RUNNING\" && \$1 ~ /^vllm-/ {print \$1}'" 2>/dev/null) || true
+    if [[ -n "$servers" ]]; then
+        echo "    Servers: $(echo "$servers" | paste -sd ', ' -)  (router probes each /v1/models)"
+    else
+        echo "    Servers: (none running — start one with 'server start';"
+        echo "              router auto-stops after its idle window with no servers)"
+    fi
+}
+
+proxy_logs() {
+    require_remote_config || return 1
+    ensure_master_connection || return 1
+    local jid
+    if ! jid=$(find_job_id "${ROUTER_JOB_NAME}"); then
+        error "Router not running"; return 1
+    fi
+    local log_file="${REMOTE_CONTAINER_DIR}/logs/olivia_router_${jid}.log"
+    info "Tailing ${log_file} (Ctrl+C to stop)"
+    ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "tail -n 50 -f '${log_file}'"
+}
+
+proxy_stop() {
+    require_remote_config || return 1
+    ensure_master_connection || return 1
+    cancel_job "${ROUTER_JOB_NAME}"
+}
+
+proxy_tunnel() {
+    require_remote_config || return 1
+    ensure_master_connection || return 1
+    local node
+    if ! node=$(find_router_node); then
+        error "Router not running — start it with: ./olivia.sh proxy start"
+        return 1
+    fi
+    # The router node is stable for the job's lifetime (up to 7 days), so unlike
+    # the GPU tunnel this target rarely changes. Replace any existing forward on
+    # this local port (direct GPU tunnel or a stale router tunnel).
+    if lsof -i ":${LOCAL_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
+        warn "localhost:${LOCAL_PORT} already forwarding — closing it first"
+        kill_tunnel || true
+    fi
+    info "Setting up router tunnel: localhost:${LOCAL_PORT} -> ${node}:${ROUTER_REMOTE_PORT}"
+    if ! ssh -O forward -L "${LOCAL_PORT}:${node}:${ROUTER_REMOTE_PORT}" \
+        -o "ControlPath=${SSH_CONTROL_SOCKET}" "${REMOTE_USER}@${REMOTE_HOST}" 2>&1; then
+        error "Failed to set up router tunnel"; return 1
+    fi
+    sleep 1
+    if ! lsof -i ":${LOCAL_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
+        error "Tunnel failed - port ${LOCAL_PORT} not listening"; return 1
+    fi
+    echo "$node" > "${TUNNEL_NODE_FILE}"
+    echo "${node}:${ROUTER_REMOTE_PORT}" > "${TUNNEL_TARGET_FILE}"
+    success "Router tunnel established"
+    echo "    Local:  localhost:${LOCAL_PORT}  ->  ${node}:${ROUTER_REMOTE_PORT}" >&2
+    echo "    Models: curl localhost:${LOCAL_PORT}/v1/models" >&2
+    echo "    Claude: python anthropic_proxy.py --model <preset> --upstream http://localhost:${LOCAL_PORT}" >&2
+}
+
+cmd_proxy() {
+    local action="${1:-status}"
+    shift || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --port)        set_local_port "$2"; shift 2 ;;
+            --router-port) ROUTER_REMOTE_PORT="$2"; shift 2 ;;
+            -h|--help)     cmd_proxy_help; exit 0 ;;
+            *) error "Unknown proxy option: $1"; cmd_proxy_help; exit 1 ;;
+        esac
+    done
+    case "$action" in
+        start)        proxy_start ;;
+        status)       proxy_status ;;
+        stop|cancel)  proxy_stop ;;
+        logs)         proxy_logs ;;
+        deploy)       deploy_proxy_files ;;
+        tunnel|up)    proxy_tunnel ;;
+        -h|--help)    cmd_proxy_help; exit 0 ;;
+        *) error "Unknown proxy action: $action"; cmd_proxy_help; exit 1 ;;
+    esac
+}
+
+cmd_proxy_help() {
+    cat <<EOF
+Usage: ./olivia.sh proxy <action> [options]
+
+Durable multi-model router on the small (CPU) partition. ONE stable endpoint
+that routes by the request's \`model\` field (preset name / alias / served repo
+id) to whichever GPU server is live — clients don't need to know the node or
+container index. Replaces the login-node relay with a queue-system job.
+
+Actions:
+    start       Deploy router files + submit the router job (small partition, 7-day walltime)
+    status      Show router job + which model presets are currently serving (default)
+    tunnel      Forward localhost:${LOCAL_PORT} -> router node (then point clients here)
+    logs        Tail the router log
+    stop        Cancel the router job
+    deploy      Upload router files only (model_router.py, presets.*, vllm_proxy.py, run_proxy.sh)
+
+Options:
+    --port PORT         Local port for the tunnel (default: ${LOCAL_PORT})
+    --router-port PORT  Router listen port on the small node (default: ${ROUTER_REMOTE_PORT})
+
+Examples:
+    ./olivia.sh proxy start            # bring up the durable router
+    ./olivia.sh proxy tunnel           # forward localhost:${LOCAL_PORT} to it
+    curl localhost:${LOCAL_PORT}/v1/models      # see which presets are live
+    python anthropic_proxy.py --model glm51 --upstream http://localhost:${LOCAL_PORT}
+
+Notes:
+    - The router finds each model by its SLURM job name (vllm-server-<preset>),
+      set automatically by 'server start'. Start servers as usual; the router
+      picks them up within ~15s.
+    - The CPU job bills its small reservation while up. Stop it when idle:
+      ./olivia.sh proxy stop
 EOF
 }
 
@@ -2290,14 +2243,6 @@ cmd_chat() {
                 ;;
             --port)
                 set_local_port "$2"
-                shift 2
-                ;;
-            --login-proxy)
-                LOGIN_PROXY=1
-                shift
-                ;;
-            --login-proxy-port)
-                LOGIN_PROXY_PORT="$2"
                 shift 2
                 ;;
             --no-store)
@@ -2438,8 +2383,6 @@ Options:
     --no-stream             Disable streaming in chat
     --resume [ID]           Resume most recent stored conversation, or specific ID
     --no-store              Disable conversation persistence for this session
-    --login-proxy           Route via the follow-the-node login-node relay
-    --login-proxy-port PORT Login-node relay port (default: ${LOGIN_PROXY_PORT})
     -h, --help              Show this help
 
 Examples:
@@ -2448,7 +2391,6 @@ Examples:
     ./olivia.sh chat --tunnel-only     Just set up tunnel
     ./olivia.sh chat --resume          Resume most recent conversation
     ./olivia.sh chat --resume 12       Resume conversation #12
-    ./olivia.sh chat --login-proxy     Connect via the follow-the-node relay
 EOF
 }
 
@@ -2528,9 +2470,7 @@ cmd_status() {
         success "SSH Tunnel: ACTIVE"
         echo "    Node:   $node"
         echo "    Local:  localhost:${LOCAL_PORT}"
-        if [[ "$target" == localhost:* ]]; then
-            echo "    Mode:   login-proxy (relay on ${REMOTE_HOST}:${target#localhost:})"
-        fi
+        [[ -n "$target" ]] && echo "    Remote: ${target}"
     else
         warn "SSH Tunnel: NOT ACTIVE"
     fi
@@ -3250,7 +3190,6 @@ cmd_reconnect() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --port)             set_local_port "$2"; shift 2 ;;
-            --login-proxy-port) LOGIN_PROXY_PORT="$2"; shift 2 ;;
             -h|--help)
                 echo "Usage: ./olivia.sh reconnect [--port PORT]"
                 echo "Re-establish the SSH master connection and restore the recorded tunnel."
@@ -3266,20 +3205,23 @@ cmd_reconnect() {
     close_master_connection
     ensure_master_connection || exit 1
 
-    # Restore a previously-recorded tunnel, inferring the mode from its target.
+    # Restore a previously-recorded tunnel. A target ending in the router port
+    # means it was a `proxy tunnel` (to the durable router); otherwise it was a
+    # direct GPU tunnel.
     if [[ -f "${TUNNEL_TARGET_FILE}" || -f "${TUNNEL_NODE_FILE}" ]]; then
         local target
         target=$(cat "${TUNNEL_TARGET_FILE}" 2>/dev/null || echo "")
-        if [[ "$target" == localhost:* ]]; then
-            LOGIN_PROXY=1
-            LOGIN_PROXY_PORT="${target#localhost:}"
-        fi
-        local gpu_node
-        if gpu_node=$(find_vllm_node); then
-            info "Restoring tunnel..."
-            setup_tunnel "$gpu_node"
+        if [[ "$target" == *":${ROUTER_REMOTE_PORT}" ]]; then
+            info "Restoring router tunnel..."
+            proxy_tunnel
         else
-            warn "No running vLLM job found; tunnel not restored"
+            local gpu_node
+            if gpu_node=$(find_vllm_node); then
+                info "Restoring tunnel..."
+                setup_tunnel "$gpu_node"
+            else
+                warn "No running vLLM job found; tunnel not restored"
+            fi
         fi
     fi
 }
@@ -3298,6 +3240,7 @@ Commands:
     chat        Connect to vLLM server and start chat (default)
     build       Build vLLM containers
     server      Manage vLLM server (deploy, restart, logs)
+    proxy       Durable multi-model router on the small partition (start, tunnel, status)
     prefetch    Download model weights into persistent HF_HOME (login node)
     tunnel      Manage SSH tunnel
     reconnect   Re-establish the SSH master after a drop and restore the tunnel
@@ -3311,8 +3254,6 @@ Global Options:
 
 Connection durability (env overrides):
     SSH_CONTROL_PERSIST  How long the 2FA'd master persists when idle (default: ${SSH_CONTROL_PERSIST})
-    LOGIN_PROXY=1        Route the tunnel via a fixed login-node relay that
-                         follows the GPU node across job restarts (opt-in)
 
 Examples:
     $(basename "$0") chat               Connect to vLLM and chat
@@ -3357,6 +3298,9 @@ main() {
             ;;
         server)
             cmd_server "$@"
+            ;;
+        proxy)
+            cmd_proxy "$@"
             ;;
         prefetch)
             cmd_prefetch "$@"

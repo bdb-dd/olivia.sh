@@ -763,6 +763,51 @@ else:
 PYPATCH_MINLATENCY
 
 # -----------------------------------------------------------------------------
+# Stub stable-ABI get_cuda_view_from_cpu_tensor on older NGC torch (<26.05)
+# -----------------------------------------------------------------------------
+# vLLM-main's csrc/libtorch_stable/cuda_view.cu builds tensors with
+# torch::stable::from_blob passing CAPTURING-LAMBDA deleters and reads
+# Tensor::layout(). NGC 26.03/26.04 torch (2.11) only has the plain DeleterFnPtr
+# from_blob overload and no Tensor::layout(), so _C_stable_libtorch fails to
+# compile — the documented reason glm52 was pinned to 26.05 (see apply_preset).
+# The op is NOT dispatched at runtime (vLLM calls the _C variant — see
+# vllm/utils/torch_utils.py), so we stub the stable variant: the extension still
+# compiles/imports, and the dead op throws a clear error if ever called. Gated
+# to bases older than 26.05 (or CUDA_VIEW_STABLE_STUB=1). Idempotent; fails loud
+# if the upstream anchor disappears.
+if [[ "${NGC_PYTORCH_TAG}" == 26.03* || "${NGC_PYTORCH_TAG}" == 26.04* || "${CUDA_VIEW_STABLE_STUB:-0}" == "1" ]]; then
+python3 << 'PYPATCH_CUDA_VIEW_STABLE'
+import re, sys
+f = "/opt/vllm/csrc/libtorch_stable/cuda_view.cu"
+try:
+    src = open(f).read()
+except FileNotFoundError:
+    print("PYPATCH_CUDA_VIEW_STABLE: file absent, skipping"); raise SystemExit(0)
+if "stable-ABI variant unimplemented on NGC" in src:
+    print("PYPATCH_CUDA_VIEW_STABLE: already applied"); raise SystemExit(0)
+stub = (
+    "torch::stable::Tensor get_cuda_view_from_cpu_tensor(\n"
+    "    torch::stable::Tensor& cpu_tensor) {\n"
+    "  // NGC<26.05 port: torch::stable::from_blob lacks the capturing-deleter\n"
+    "  // overload (26.03/2.11 has only DeleterFnPtr) and Tensor::layout() is\n"
+    "  // absent. Not dispatched at runtime (vLLM uses the _C op, torch_utils.py),\n"
+    "  // so stub it so _C_stable_libtorch compiles/imports on this base.\n"
+    "  STD_TORCH_CHECK(false, \"get_cuda_view_from_cpu_tensor: stable-ABI variant unimplemented on NGC 26.03 (use the _C op)\");\n"
+    "  return cpu_tensor;\n"
+    "}\n"
+)
+new, n = re.subn(
+    r"torch::stable::Tensor get_cuda_view_from_cpu_tensor\(.*?\n\}\n?",
+    stub, src, count=1, flags=re.DOTALL)
+if n != 1:
+    sys.stderr.write("PYPATCH_CUDA_VIEW_STABLE: ERROR anchor not found; vLLM source changed\n")
+    raise SystemExit(1)
+open(f, "w").write(new)
+print("PYPATCH_CUDA_VIEW_STABLE: stubbed get_cuda_view_from_cpu_tensor")
+PYPATCH_CUDA_VIEW_STABLE
+fi
+
+# -----------------------------------------------------------------------------
 # Graft requested upstream vLLM PRs (patch-during-build)
 # -----------------------------------------------------------------------------
 # VLLM_PATCHES (space-separated PR numbers, passed via --env) lists upstream vLLM

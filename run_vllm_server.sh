@@ -811,7 +811,15 @@ VLLM_ARGS=(
 # CUDAGraph knob. NONE → disable all compilation (mode=NONE). Anything else →
 # keep compilation enabled and only override cudagraph_mode. Unset → no flag,
 # vLLM auto-selects.
-if [[ "${CUDAGRAPH_MODE}" == "NONE" ]]; then
+if [[ "${CAPTURE_EXPERIMENT:-0}" == "1" ]]; then
+    # Capture experiment: assemble the full --compilation-config HERE from scalar
+    # knobs (forwarding raw JSON through olivia.sh brace-expands the {} and ,).
+    # Emits PIECEWISE capture with the NGC inductor combo-kernel autotuning
+    # DISABLED — peels the `autotune_to_one_config` IMA. Pair DISABLE_CUSTOM_ALL_REDUCE=1.
+    _cap_mode="${CAPTURE_CUDAGRAPH_MODE:-PIECEWISE}"
+    _cap_size="${CAPTURE_MAX_SIZE:-64}"
+    VLLM_ARGS+=("--compilation-config" "{\"cudagraph_mode\":\"${_cap_mode}\",\"max_cudagraph_capture_size\":${_cap_size},\"inductor_compile_config\":{\"enable_auto_functionalized_v2\":false,\"combo_kernels\":false,\"benchmark_combo_kernel\":false}}")
+elif [[ "${CUDAGRAPH_MODE}" == "NONE" ]]; then
     VLLM_ARGS+=("--compilation-config" '{"mode": "NONE"}')
 elif [[ -n "${CUDAGRAPH_MODE}" ]]; then
     VLLM_ARGS+=("--compilation-config" "{\"cudagraph_mode\": \"${CUDAGRAPH_MODE}\"}")
@@ -1169,6 +1177,14 @@ SING_CMD=(
 # vLLM's default warmup behaviour (empty value would read as "disabled").
 if [[ -n "${VLLM_DEEP_GEMM_WARMUP:-}" ]]; then
     SING_CMD+=(--env "VLLM_DEEP_GEMM_WARMUP=${VLLM_DEEP_GEMM_WARMUP}")
+fi
+
+# Diagnostic: CUDA_LAUNCH_BLOCKING=1 makes CUDA errors report synchronously at
+# the faulting kernel launch — an IMA is otherwise async, so the Python
+# traceback can't name the crashing kernel. Injected into EVERY container exec
+# (incl. the Ray worker processes that host the vLLM worker actors) when set.
+if [[ -n "${CUDA_LAUNCH_BLOCKING:-}" ]]; then
+    SING_CMD+=(--env "CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING}")
 fi
 
 # Manual pipeline-parallel layer partition (comma-separated per-stage layer

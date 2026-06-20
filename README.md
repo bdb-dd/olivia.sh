@@ -315,7 +315,17 @@ Takeaway: Laguna's careful "edit only when confident → 5/5 precision" is a *st
 
 **Reference — Poolside's own published result.** Poolside reports Laguna M.1 at **72.5% on the full SWE-bench Verified** (500 instances), using the Laude Institute **Harbor framework with their production agent harness** (up to 500 steps, sandboxed), temperature 0.7, **mean pass@1 averaged over 4 runs**. **Our 42% is *not* directly comparable**: 12 django-only instances driven by a deliberately minimal read/write/grep/bash loop (no planning/retry/localization scaffold), temp 0, single run. The bulk of the gap (~72% production-agent vs ~42% bare-loop) is almost certainly the **agent harness, not the model** — which *corroborates* our finding above: Laguna's fixes are precise (5/5) and the binding constraint is the loop's ability to localize + drive it to an edit. A like-for-like number would need their harness on the full set; this slice measures *Laguna-under-our-minimal-agent*, which is the honest thing the in-house stack can produce.
 
-> Eval tools: `evals/runner.py {protocol,micro,swe}` (L0/L1/L2, in-repo); `evals/swe_real/run_on_cluster.sh` (L2-real, SLURM on `small`). Offline self-tests: `evals/{protocol,micro}/selftest.py`; harness self-test: `--gold`. Re-run per preset after any proxy/serving change; results in `evals/results/` (L0–L2) and `/cluster/work/.../swe/` (L2-real).
+**Swapping the agent — mini-swe-agent (the hypothesis test) · 2026-06-20.** We re-ran the *same 12 instances* with [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) (SWE-agent's real open agent — ~74% on Verified with frontier models, and the agent class Laguna was explicitly trained on) in place of our minimal loop — same model, same gold-validated verify, litellm → vLLM's OpenAI endpoint directly (`evals/swe_real/mini_runner.py`, `LocalEnvironment` inside the apptainer, no proxy since it uses bash-in-markdown not tool-calls).
+
+| harness (same Laguna · same 12 · same verify) | resolved |
+|---|---|
+| our minimal read/write/grep/bash loop | 5/12 (42%) |
+| **mini-swe-agent** (real open agent) | **7/12 (58%)** |
+| *(ref)* Poolside production agent — full 500, 4-run avg | 72.5% |
+
+Only the harness changed, and it **kept all 5 bare-loop wins and converted 2 prior failures** (15863, 16901). More importantly it **dissolved the failure mode**: the bare loop's 7/7 failures all made *no edit* (`patch=0`); mini-swe-agent makes real edits on all but 2 (most remaining failures now hit the step cap mid-fix, so a higher cap likely recovers 1–2 more). The ladder **42% → 58% → 72.5%, same model throughout**, confirms the gap is mostly **agent harness, not model**, and reconciles the earlier results: a *well-designed* agent raises edit-rate without sacrificing correctness, whereas crudely *forcing* edits (the scaffolding experiment) hurt. (Server note: the first attempt was truncated when Laguna hit its 8h SLURM wallclock mid-run; restarted and re-ran the affected instances — final numbers are contamination-free.)
+
+> Eval tools: `evals/runner.py {protocol,micro,swe}` (L0/L1/L2, in-repo); `evals/swe_real/run_on_cluster.sh` (L2-real, our loop) and `evals/swe_real/run_mini_on_cluster.sh` (L2-real, mini-swe-agent) — SLURM on `small`. Offline self-tests: `evals/{protocol,micro}/selftest.py`; L2-real harness self-test: `--gold`. Re-run per preset after any proxy/serving change; results in `evals/results/` (L0–L2) and `/cluster/work/.../swe/` (L2-real).
 
 ## Direct Script Usage
 

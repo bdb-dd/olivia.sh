@@ -34,11 +34,12 @@ REMOTE_PORT=8000
 # together (8001 vllm_proxy batcher, 8002 anthropic_proxy, 8003 tunnel).
 # Override with LOCAL_PORT=<n>. REMOTE_PORT (cluster-side vLLM) stays 8000.
 LOCAL_PORT="${LOCAL_PORT:-8003}"
-# Match the SLURM job name that run_vllm_server.sh's #SBATCH --job-name sets.
-# Using the full `vllm-server` here (not just `vllm`) keeps us from picking up
-# in-flight build jobs, whose name is `build-vllm-gh200` and also contains
-# "vllm" — matching them would make `server logs` tail non-existent files and,
-# worse, make `server cancel` kill a running build.
+# SLURM job name used to RESOLVE this branch's server (tunnel/logs/cancel).
+# Specialized to vllm-<DEPLOY_KEY> just below, once DEPLOY_KEY is known, so two
+# agents' concurrently-running servers are distinguishable. Resolution is an
+# EXACT first-field match (awk $1==name), which also avoids picking up in-flight
+# build jobs (build-vllm-gh200) — matching those would make `server cancel` kill
+# a running build. This base value is only a fallback; the per-branch name wins.
 JOB_NAME_PATTERN="vllm-server"
 
 # Remote paths
@@ -79,6 +80,17 @@ LOCAL_VLLM_PROXY_SCRIPT="${SCRIPT_DIR}/vllm_proxy.py"
 DEPLOY_KEY="${DEPLOY_KEY:-$(git -C "${SCRIPT_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null | tr '/' '-' | tr -cd 'A-Za-z0-9._-')}"
 DEPLOY_KEY="${DEPLOY_KEY:-default}"
 DEPLOY_DIR="${REMOTE_CONTAINER_DIR}/deploys/${DEPLOY_KEY}"
+
+# Per-branch SLURM job name — mirrors the per-branch deploy isolation above, but
+# for the RUNTIME job. Without it every server is named "vllm-server", so
+# squeue-based resolution can't tell two agents' jobs apart: status/watch/tunnel
+# could target — and `server cancel` could KILL — the other agent's server. Name
+# each branch's server vllm-<DEPLOY_KEY> and resolve on an EXACT name match.
+# Override with SERVER_JOB_NAME=<name> (e.g. to deliberately share across
+# branches). Legacy "vllm-server" jobs started before this change must be
+# restarted to adopt the per-branch name.
+SERVER_JOB_NAME="${SERVER_JOB_NAME:-vllm-${DEPLOY_KEY}}"
+JOB_NAME_PATTERN="${SERVER_JOB_NAME}"
 
 # SSH control socket
 SSH_CONTROL_DIR="${HOME}/.ssh/controls"
@@ -301,7 +313,7 @@ find_vllm_node() {
     fi
 
     local job_line
-    job_line=$(echo "$squeue_output" | grep -i "${JOB_NAME_PATTERN}" | grep "RUNNING" | head -n1) || true
+    job_line=$(echo "$squeue_output" | awk -v n="${JOB_NAME_PATTERN}" '$1==n && $NF=="RUNNING"' | head -n1) || true
 
     if [[ -z "$job_line" ]]; then
         return 1
@@ -388,7 +400,7 @@ find_job_id() {
     fi
 
     local job_line
-    job_line=$(echo "$squeue_output" | grep -i "${pattern}" | grep "RUNNING" | head -n1) || true
+    job_line=$(echo "$squeue_output" | awk -v n="${pattern}" '$1==n && $NF=="RUNNING"' | head -n1) || true
 
     if [[ -z "$job_line" ]]; then
         return 1
@@ -888,6 +900,11 @@ cmd_build() {
     [[ -n "$vllm_version" ]] && env_vars="${env_vars} VLLM_VERSION=${vllm_version}"
     [[ -n "$create_sif" ]] && env_vars="${env_vars} CREATE_SIF=${create_sif}"
     [[ -n "$force_overwrite" ]] && env_vars="${env_vars} OVERWRITE=${force_overwrite}"
+    # Forward NGC base-image tag override (e.g. NGC_PYTORCH_TAG=26.03-py3) so a
+    # build can target a different torch/inductor than the preset's pin — used to
+    # build glm52 on 26.03's inductor (which, unlike 26.05, may not miscompile
+    # DSA CUDAGraph capture). build_vllm_gh200.sh resolves env > preset > default.
+    [[ -n "${NGC_PYTORCH_TAG:-}" ]] && env_vars="${env_vars} NGC_PYTORCH_TAG=${NGC_PYTORCH_TAG}"
 
     info "Submitting build job for '${model_id}'..."
     echo "    Environment: ${env_vars}" >&2
@@ -1107,6 +1124,8 @@ start_server_job() {
     # experiments can pin the NCCL all-reduce fallback explicitly.
     for forward_var in VERBOSE VLLM_LOGGING_LEVEL RAY_BACKEND_LOG_LEVEL \
                        RAY_DEDUP_LOGS NCCL_DEBUG CUDAGRAPH_MODE \
+                       CAPTURE_EXPERIMENT CAPTURE_CUDAGRAPH_MODE CAPTURE_MAX_SIZE \
+                       CUDA_LAUNCH_BLOCKING \
                        ENABLE_AUTO_TOOL_CHOICE GLM_TOOL_PARSER \
                        GLM_REASONING_PARSER SERVED_MODEL_NAME \
                        MTP_SPECULATIVE_TOKENS ENABLE_SPECULATIVE ALLOW_MTP_PP \
@@ -1138,6 +1157,11 @@ start_server_job() {
         # launches vllm directly, no srun/Ray for single-node).
         sbatch_opts="--nodes=1 --ntasks=1 --gpus-per-node=${gpus_per_node} --cpus-per-task=$((gpus_per_node * 8))"
     fi
+
+    # Per-branch job name so two agents' concurrent servers are distinguishable
+    # to squeue resolution (see SERVER_JOB_NAME). The sbatch CLI --job-name
+    # overrides the static `#SBATCH --job-name=vllm-server` in run_vllm_server.sh.
+    sbatch_opts+=" --job-name=${SERVER_JOB_NAME}"
 
     # Optional walltime override (TIME_LIMIT, e.g. "3:00:00" or "180"). Overrides
     # the #SBATCH --time in run_vllm_server.sh. Useful to cap a large multi-node
@@ -2412,8 +2436,11 @@ printf '  %-9s %-18s %-10s %-13s %s\n' JOBID NAME STATE TIME/LIMIT NODES
 echo "$jobs" | while IFS='|' read -r jid name state etime tlimit nodes; do
   printf '  %-9s %-18s %-10s %-13s %s\n' "$jid" "$name" "$state" "$etime/$tlimit" "$nodes"
   [ "$state" = RUNNING ] || continue
+  # Enrich any vLLM SERVER job (vllm-<branch>, all agents) but not build jobs
+  # (build-vllm-gh200). Display is intentionally broad; action resolution
+  # (find_job_id/find_vllm_node) is exact-per-branch.
   case "$name" in
-    *vllm-server*)
+    vllm-*)
       head=$(scontrol show hostnames "$nodes" 2>/dev/null | head -1)
       hl="$CDIR/logs/vllm_server_${jid}_head.log"; wl="$CDIR/logs/vllm_server_${jid}.log"
       model=$(grep -oE 'Model: +[^[:space:]]+' "$wl" 2>/dev/null | head -1 | awk '{print $NF}')
@@ -2562,8 +2589,9 @@ else
     squeue -u "$USER" -h -o '%i|%j|%T|%M|%l|%R' | while IFS='|' read -r jid name state etime tlimit nodes; do
         printf "  ${BLD}%-8s${RST} %-16s %-9s %-13s %s\n" "$jid" "$name" "$state" "$etime/$tlimit" "$nodes"
         [ "$state" = RUNNING ] || continue
+        # Enrich any vLLM SERVER job (vllm-<branch>, all agents), not build jobs.
         case "$name" in
-          (*vllm-server*)
+          (vllm-*)
             head=$(scontrol show hostnames "$nodes" 2>/dev/null | head -1)
             hl="$CDIR/logs/vllm_server_${jid}_head.log"; wl="$CDIR/logs/vllm_server_${jid}.log"
             model=$(grep -oE 'Model: +[^[:space:]]+' "$wl" 2>/dev/null | head -1 | awk '{print $NF}')

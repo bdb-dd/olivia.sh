@@ -15,7 +15,7 @@ PROMPT = ("Explain in depth how a B-tree database index works, including node "
           "splits, rebalancing on insert and delete, and why fan-out matters.")
 
 
-def one_request(url, model, prompt, max_tokens, idx, out, ctk=None):
+def one_request(url, model, prompt, max_tokens, idx, out, ctk=None, timeout=900):
     body = {
         "model": model,
         "messages": [{"role": "user", "content": f"{prompt} (variant {idx})"}],
@@ -31,7 +31,7 @@ def one_request(url, model, prompt, max_tokens, idx, out, ctk=None):
                                  headers={"Content-Type": "application/json"})
     t0 = time.perf_counter(); ttft = None; toks = 0
     try:
-        with urllib.request.urlopen(req, timeout=900) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             for raw in resp:
                 s = raw.decode("utf-8", "ignore").strip()
                 if not s.startswith("data:"):
@@ -56,10 +56,10 @@ def one_request(url, model, prompt, max_tokens, idx, out, ctk=None):
         out[idx] = {"ok": False, "err": str(e), "total": time.perf_counter() - t0}
 
 
-def run_level(url, model, prompt, max_tokens, concurrency, ctk=None):
+def run_level(url, model, prompt, max_tokens, concurrency, ctk=None, timeout=900):
     out = {}
     threads = [threading.Thread(target=one_request,
-                                args=(url, model, prompt, max_tokens, i, out, ctk))
+                                args=(url, model, prompt, max_tokens, i, out, ctk, timeout))
                for i in range(concurrency)]
     t0 = time.perf_counter()
     for t in threads: t.start()
@@ -93,9 +93,12 @@ if __name__ == "__main__":
     ap.add_argument("--chat-template-kwargs", default=None,
                     help='JSON dict passed as chat_template_kwargs, e.g. '
                          '\'{"enable_thinking": false}\' to disable reasoning')
+    ap.add_argument("--timeout", type=int, default=900,
+                    help="per-request timeout (s); lower it for wedge-prone "
+                         "presets (e.g. glm51) so a hung level fails fast")
     a = ap.parse_args()
     ctk = json.loads(a.chat_template_kwargs) if a.chat_template_kwargs else None
     print("concurrency,agg_tok_s,median_per_stream_tok_s,median_ttft_s,p95_ttft_s,failures,total_tokens,wall_s",
           flush=True)
     for lvl in [int(x) for x in a.levels.split(",")]:
-        run_level(a.url, a.model, a.prompt, a.max_tokens, lvl, ctk)
+        run_level(a.url, a.model, a.prompt, a.max_tokens, lvl, ctk, a.timeout)

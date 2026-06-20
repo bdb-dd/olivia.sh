@@ -14,6 +14,9 @@
 # 1 node (SLURM reasons: "1 task needs only 1 node"). Setting #SBATCH --gpus=4
 # conflicts with --gpus-per-node (SLURM: "4 GPUs fits on 1 node"). If you sbatch
 # this script directly (not via olivia.sh), remember to pass --gpus=N yourself.
+# Job name: olivia.sh overrides the static --job-name=vllm-server above with a
+# per-branch --job-name=vllm-<DEPLOY_KEY>, so concurrent agents' servers don't
+# collide in squeue-based resolution. Direct sbatch keeps the plain vllm-server.
 
 # =============================================================================
 # Run vLLM Server on GH200
@@ -332,6 +335,18 @@ fi
 # glm51 keeps its own capture experiment (see its CUDAGraph TODO).
 if [[ "${IS_GLM52}" == "1" && -z "${CUDAGRAPH_MODE}" ]]; then
     CUDAGRAPH_MODE="NONE"
+fi
+
+# GLM-5.1: default to PIECEWISE CUDAGraph capture (not auto-select's
+# FULL_AND_PIECEWISE). VALIDATED 2026-06-20 on the NGC-26.03 rebuild: PIECEWISE
+# captures cleanly (51/51, no IMA); with the custom all-reduce auto-disabled
+# (DISABLE_CUSTOM_ALL_REDUCE=auto fires since mode!=NONE → graph-safe NCCL) this
+# config ELIMINATES the multi-node PP decode wedge (0 fail 1→64) AND gives
+# ~22 tok/s/stream vs ~5 eager. (The de-wedge is the NCCL all-reduce; capture is
+# the ~4.5× throughput.) See README "## Performance" + the wedge known-issue.
+# Override CUDAGRAPH_MODE=NONE for eager (still de-wedged via NCCL, just slower).
+if [[ "${IS_GLM51}" == "1" && -z "${CUDAGRAPH_MODE}" ]]; then
+    CUDAGRAPH_MODE="PIECEWISE"
 fi
 
 # Any GLM MoE model that uses the glm47/glm45 parser family
@@ -808,7 +823,15 @@ VLLM_ARGS=(
 # CUDAGraph knob. NONE → disable all compilation (mode=NONE). Anything else →
 # keep compilation enabled and only override cudagraph_mode. Unset → no flag,
 # vLLM auto-selects.
-if [[ "${CUDAGRAPH_MODE}" == "NONE" ]]; then
+if [[ "${CAPTURE_EXPERIMENT:-0}" == "1" ]]; then
+    # Capture experiment: assemble the full --compilation-config HERE from scalar
+    # knobs (forwarding raw JSON through olivia.sh brace-expands the {} and ,).
+    # Emits PIECEWISE capture with the NGC inductor combo-kernel autotuning
+    # DISABLED — peels the `autotune_to_one_config` IMA. Pair DISABLE_CUSTOM_ALL_REDUCE=1.
+    _cap_mode="${CAPTURE_CUDAGRAPH_MODE:-PIECEWISE}"
+    _cap_size="${CAPTURE_MAX_SIZE:-64}"
+    VLLM_ARGS+=("--compilation-config" "{\"cudagraph_mode\":\"${_cap_mode}\",\"max_cudagraph_capture_size\":${_cap_size},\"inductor_compile_config\":{\"enable_auto_functionalized_v2\":false,\"combo_kernels\":false,\"benchmark_combo_kernel\":false}}")
+elif [[ "${CUDAGRAPH_MODE}" == "NONE" ]]; then
     VLLM_ARGS+=("--compilation-config" '{"mode": "NONE"}')
 elif [[ -n "${CUDAGRAPH_MODE}" ]]; then
     VLLM_ARGS+=("--compilation-config" "{\"cudagraph_mode\": \"${CUDAGRAPH_MODE}\"}")
@@ -1166,6 +1189,14 @@ SING_CMD=(
 # vLLM's default warmup behaviour (empty value would read as "disabled").
 if [[ -n "${VLLM_DEEP_GEMM_WARMUP:-}" ]]; then
     SING_CMD+=(--env "VLLM_DEEP_GEMM_WARMUP=${VLLM_DEEP_GEMM_WARMUP}")
+fi
+
+# Diagnostic: CUDA_LAUNCH_BLOCKING=1 makes CUDA errors report synchronously at
+# the faulting kernel launch — an IMA is otherwise async, so the Python
+# traceback can't name the crashing kernel. Injected into EVERY container exec
+# (incl. the Ray worker processes that host the vLLM worker actors) when set.
+if [[ -n "${CUDA_LAUNCH_BLOCKING:-}" ]]; then
+    SING_CMD+=(--env "CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING}")
 fi
 
 # Manual pipeline-parallel layer partition (comma-separated per-stage layer

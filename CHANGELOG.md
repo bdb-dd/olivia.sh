@@ -65,10 +65,23 @@ eager/MLA path the GLM-5.x and Kimi MoEs need.
 - **Docs**: Laguna M.1 section + preset/build tables in `CLAUDE.md`, preset
   table + feature list in `README.md`.
 
-> To verify on first build/serve (sourced from the model card + vLLM PR, not yet
-> run on Olivia): the `poolside_v1` parser names, the
-> `--default-chat-template-kwargs` flag, and that v0.21.0 compiles on NGC 26.03
-> (fallback `NGC_PYTORCH_TAG=26.05-py3`, the glm52 base).
+#### Fixed
+
+- **`fastapi<0.137` build pin** (`build_vllm_gh200.sh`): fastapi 0.137's
+  `_IncludedRouter` route type breaks `prometheus-fastapi-instrumentator` 8.0.0
+  (`route.path` → AttributeError), 500-ing every request incl. `/health` so the
+  server never reaches ready. Global pin (shared HTTP layer); hit on the first
+  Laguna build, matches the working kimi 0.21 container.
+- **Single-node SLURM allocation** (`olivia.sh` `start_server_job`): pin
+  `--nodes=1 --ntasks=1 --gpus-per-node=N` for single-node presets. The old
+  `--gpus=N` (total count) let SLURM scatter the N GPUs across >1 node on a
+  fragmented cluster (observed: a `laguna` start on 2 nodes/8 GPUs), breaking
+  single-node TP=N. Affects all single-node presets; multi-node unchanged.
+
+> Validated end-to-end on Olivia 2026-06-20: built (vLLM v0.21.0 on NGC 26.03),
+> served, and benchmarked (single-stream ~63 tok/s with CUDAGraph capture, ~2050
+> tok/s at 64-way). `poolside_v1` parsers + `--default-chat-template-kwargs`
+> confirmed; reasoning surfaces in the `reasoning` field (not `reasoning_content`).
 
 ### 2026-04-21 — GLM-5.1-AWQ-4bit serving end-to-end on 2 × 4 GH200s
 

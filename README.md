@@ -292,9 +292,21 @@ Per task (turns): write-file 3 · fix-failing-test 7 · implement-fn 6 · find/r
 | median turns to solve | 5 |
 | premature-stop / runaway / errors / invalid-tool-turns | 0 / 0 / 0 / 0 |
 
-Per task (turns): calc-operator-precedence (wrote a recursive-descent precedence parser) 16 · interval-merge-adjacency 4 · lru-cache-recency 5 · topo-sort-cycle-detection 6 · csv-quoted-field-parsing 4 — all solved against the hidden grader. This slice did **not** find Laguna's ceiling (it's a strong coding agent on well-defined bugs); the real SWE-bench Verified dataset (per-instance Docker) is the documented next step.
+Per task (turns): calc-operator-precedence (wrote a recursive-descent precedence parser) 16 · interval-merge-adjacency 4 · lru-cache-recency 5 · topo-sort-cycle-detection 6 · csv-quoted-field-parsing 4 — all solved against the hidden grader. This slice did **not** find Laguna's ceiling (it's a strong coding agent on well-defined bugs); the real SWE-bench Verified dataset is L2-real below.
 
-> Eval tools: `evals/runner.py {protocol,micro,swe}` (L0/L1/L2). Offline self-tests: `evals/{protocol,micro}/selftest.py`. Re-run per preset after any proxy/serving change; results land in `evals/results/`.
+**L2-real — SWE-bench Verified** (`evals/swe_real/`): *real* django instances from SWE-bench Verified. Runs as a SLURM job on Olivia's **`small` CPU partition** inside a `python:3.11` apptainer (x86 + internet + reaches the vLLM node over the cluster network → within Sigma2 usage policy; no login-node compute, no GPU waste, no tunnel). Per instance: reset django to the base commit, drive the model through the agent loop to fix the real bug, then apply the gold `test_patch` (the hidden FAIL_TO_PASS/PASS_TO_PASS suite) and run the affected modules. Harness validated by a gold-patch self-test (`--gold`): **12/12** resolve, confirming setup+verify independent of the model.
+
+12-instance django 4.2/5.0 slice · 2026-06-20 (Laguna, `max_turns=40`, ~23 min for all 12):
+
+| metric | value |
+|---|---|
+| **resolved** | **5/12 (42%)** |
+| precision when it edits | **5/5** — every non-empty patch passed the hidden suite |
+| dominant failure mode | **7/7 unresolved made no edit** (patch=0, hit the 40-turn cap exploring) |
+
+Resolved: 15851, 16255, 16485, 16527, 16801. The signal L1/L2 (both 100%) couldn't give: Laguna's **fixes are reliable** (5/5 correct), but it frequently **fails to commit an edit within budget** — so the lever is turn-budget / prompting to act sooner, not fix quality. A legitimate real-benchmark number (SWE-bench Verified is hard). Slice is django-only (the tractable subset on this cluster — no per-instance Docker needed); broadening repos/instances and adding glm52/kimi27 is next.
+
+> Eval tools: `evals/runner.py {protocol,micro,swe}` (L0/L1/L2, in-repo); `evals/swe_real/run_on_cluster.sh` (L2-real, SLURM on `small`). Offline self-tests: `evals/{protocol,micro}/selftest.py`; harness self-test: `--gold`. Re-run per preset after any proxy/serving change; results in `evals/results/` (L0–L2) and `/cluster/work/.../swe/` (L2-real).
 
 ## Direct Script Usage
 

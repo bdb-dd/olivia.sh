@@ -1058,6 +1058,11 @@ cmd_build() {
     [[ -n "$vllm_version" ]] && env_vars="${env_vars} VLLM_VERSION=${vllm_version}"
     [[ -n "$create_sif" ]] && env_vars="${env_vars} CREATE_SIF=${create_sif}"
     [[ -n "$force_overwrite" ]] && env_vars="${env_vars} OVERWRITE=${force_overwrite}"
+    # Forward NGC base-image tag override (e.g. NGC_PYTORCH_TAG=26.03-py3) so a
+    # build can target a different torch/inductor than the preset's pin — used to
+    # build glm52 on 26.03's inductor (which, unlike 26.05, may not miscompile
+    # DSA CUDAGraph capture). build_vllm_gh200.sh resolves env > preset > default.
+    [[ -n "${NGC_PYTORCH_TAG:-}" ]] && env_vars="${env_vars} NGC_PYTORCH_TAG=${NGC_PYTORCH_TAG}"
 
     info "Submitting build job for '${model_id}'..."
     echo "    Environment: ${env_vars}" >&2
@@ -1389,6 +1394,8 @@ start_server_job() {
     # experiments can pin the NCCL all-reduce fallback explicitly.
     for forward_var in VERBOSE VLLM_LOGGING_LEVEL RAY_BACKEND_LOG_LEVEL \
                        RAY_DEDUP_LOGS NCCL_DEBUG CUDAGRAPH_MODE \
+                       CAPTURE_EXPERIMENT CAPTURE_CUDAGRAPH_MODE CAPTURE_MAX_SIZE \
+                       CUDA_LAUNCH_BLOCKING \
                        ENABLE_AUTO_TOOL_CHOICE GLM_TOOL_PARSER \
                        GLM_REASONING_PARSER SERVED_MODEL_NAME \
                        MTP_SPECULATIVE_TOKENS ENABLE_SPECULATIVE ALLOW_MTP_PP \

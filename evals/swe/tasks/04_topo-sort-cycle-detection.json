@@ -1,0 +1,26 @@
+{
+  "id": "topo-sort-cycle-detection",
+  "category": "algorithm",
+  "description": "Topological sort returns a bogus order on cyclic input instead of raising.",
+  "prompt": "topo_sort(graph) in graph.py orders the nodes of a dependency graph (dict mapping a node to the list of nodes it points to) so each node precedes the nodes it points to. It works for acyclic graphs but, on a graph that contains a cycle (including a self-loop like {'a': ['a']}), it silently returns a bogus order instead of raising. Fix topo_sort so it raises ValueError when the graph contains a cycle, while still returning a valid order for any acyclic graph. Keep the function name and the dict input format.",
+  "files": {
+    "graph.py": "def topo_sort(graph):\n    \"\"\"graph: dict node -> list of nodes it points to. Return an ordering where\n    every node precedes the nodes it points to. Raise ValueError on a cycle.\"\"\"\n    visited = set()\n    result = []\n\n    def visit(n):\n        if n in visited:\n            return\n        visited.add(n)\n        for m in graph.get(n, []):\n            visit(m)\n        result.append(n)\n\n    for n in list(graph):\n        visit(n)\n    return result[::-1]\n"
+  },
+  "tools": [
+    "read_file",
+    "write_file",
+    "list_dir",
+    "grep",
+    "run_bash"
+  ],
+  "oracle_files": {
+    "grade_test.py": "from graph import topo_sort\n\ndef nodes_of(g):\n    ns = set(g)\n    for u in g:\n        ns.update(g[u])\n    return ns\n\ndef check_order(g):\n    order = topo_sort(g)\n    assert sorted(order) == sorted(nodes_of(g)), (order, sorted(nodes_of(g)))\n    pos = {n: i for i, n in enumerate(order)}\n    for u in g:\n        for v in g[u]:\n            assert pos[u] < pos[v], \"%r must precede %r\" % (u, v)\n\ncheck_order({\"a\": [\"b\", \"c\"], \"b\": [\"d\"], \"c\": [\"d\"], \"d\": []})\ncheck_order({\"x\": [\"y\"], \"y\": [\"z\"], \"z\": []})\ncheck_order({\"a\": [], \"b\": [\"a\"], \"c\": [\"a\", \"b\"]})\n\nfor cyc in [{\"a\": [\"b\"], \"b\": [\"a\"]}, {\"a\": [\"a\"]},\n            {\"a\": [\"b\"], \"b\": [\"c\"], \"c\": [\"a\"]}]:\n    try:\n        topo_sort(cyc)\n        raise AssertionError(\"expected ValueError for cycle: %r\" % (cyc,))\n    except ValueError:\n        pass\nprint(\"PASS\")\n"
+  },
+  "oracle": [
+    {
+      "check": "bash_exit_zero",
+      "command": "python3 grade_test.py"
+    }
+  ],
+  "max_turns": 25
+}

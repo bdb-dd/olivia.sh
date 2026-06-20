@@ -19,7 +19,7 @@ import json
 import time
 
 from evals.protocol import client, conformance
-from evals.micro import oracle, tools
+from evals.micro import oracle, sandbox, tools
 
 DEFAULT_SYSTEM = (
     "You are an autonomous coding agent working inside a sandbox directory. "
@@ -112,6 +112,10 @@ def run_task(task: dict, sandbox_dir: str, *, base_url: str, model: str,
     else:
         out.terminated = "max_turns"
 
+    # L2: materialize hidden grading files only now — they are kept out of the
+    # agent's view during the loop (written after it ends), so the agent solves
+    # from the problem statement, not by reading the test (SWE-bench style).
+    sandbox.materialize(task.get("oracle_files", {}), sandbox_dir)
     out.oracle = oracle.evaluate(sandbox_dir, task.get("oracle", []), bash_timeout=max(bash_timeout, 60))
     out.success = oracle.succeeded(out.oracle)
     out.premature_stop = (out.terminated == "stopped" and not out.success)

@@ -1,0 +1,26 @@
+{
+  "id": "csv-quoted-field-parsing",
+  "category": "parser",
+  "description": "CSV line parser splits naively and breaks quoted fields.",
+  "prompt": "parse_line(line) in csvparse.py splits a single CSV record into a list of fields. It must support double-quoted fields that contain commas (\"a,b\" is the single field a,b) and doubled quotes inside a quoted field as an escaped quote (\"\" -> \"). The current version just calls line.split(','), which breaks any quoted field. Implement correct parsing. Surrounding quotes are stripped from quoted fields; unquoted fields are taken literally. Keep the signature parse_line(line: str) -> list[str].",
+  "files": {
+    "csvparse.py": "def parse_line(line):\n    \"\"\"Split one CSV record into fields. Must support double-quoted fields that\n    contain commas, and doubled quotes (\"\") as an escaped quote inside a quoted\n    field. Surrounding quotes are stripped from quoted fields.\"\"\"\n    return line.split(\",\")\n"
+  },
+  "tools": [
+    "read_file",
+    "write_file",
+    "list_dir",
+    "grep",
+    "run_bash"
+  ],
+  "oracle_files": {
+    "grade_test.py": "from csvparse import parse_line\n\nassert parse_line(\"a,b,c\") == [\"a\", \"b\", \"c\"]\nassert parse_line('a,\"b,c\",d') == [\"a\", \"b,c\", \"d\"]\nassert parse_line('\"hello, world\",x') == [\"hello, world\", \"x\"]\nassert parse_line('a,\"she said \"\"hi\"\"\",b') == [\"a\", 'she said \"hi\"', \"b\"]\nassert parse_line('\"\",x') == [\"\", \"x\"]\nassert parse_line(\"one\") == [\"one\"]\nassert parse_line(\"a,,b\") == [\"a\", \"\", \"b\"]\nassert parse_line('\"a,b\",\"c,d\"') == [\"a,b\", \"c,d\"]\nprint(\"PASS\")\n"
+  },
+  "oracle": [
+    {
+      "check": "bash_exit_zero",
+      "command": "python3 grade_test.py"
+    }
+  ],
+  "max_turns": 25
+}

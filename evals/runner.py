@@ -39,6 +39,7 @@ SERIALIZE_PRESETS = {"glm51"}
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_FIXTURES = os.path.join(_HERE, "protocol", "fixtures")
 DEFAULT_TASKS = os.path.join(_HERE, "micro", "tasks")
+DEFAULT_SWE_TASKS = os.path.join(_HERE, "swe", "tasks")
 DEFAULT_RESULTS_DIR = os.path.join(_HERE, "results")
 
 
@@ -85,7 +86,7 @@ def _load_tasks(tasks_dir: str) -> list:
     return tasks
 
 
-def cmd_micro(args: argparse.Namespace) -> int:
+def _run_tasks(args: argparse.Namespace, label: str) -> int:
     tasks = _load_tasks(args.tasks)
     if not tasks:
         print(f"error: no tasks found in {args.tasks}", file=sys.stderr)
@@ -93,7 +94,7 @@ def cmd_micro(args: argparse.Namespace) -> int:
     if args.only:
         wanted = {s.strip() for s in args.only.split(",")}
         tasks = [t for t in tasks if t.get("id") in wanted]
-    out_path = args.out or os.path.join(DEFAULT_RESULTS_DIR, f"micro-{args.preset}.json")
+    out_path = args.out or os.path.join(DEFAULT_RESULTS_DIR, f"{label}-{args.preset}.json")
     cfg = micro_runner.RunConfig(
         base_url=args.base_url,
         model=args.model or PRESET_MODELS.get(args.preset, "local-eval"),
@@ -107,6 +108,14 @@ def cmd_micro(args: argparse.Namespace) -> int:
     summary = micro_runner.run(cfg, tasks, out_path=out_path)
     # "Soft" gate: non-zero if nothing succeeded (likely a wiring/endpoint problem).
     return 0 if summary["n_success"] > 0 else 1
+
+
+def cmd_micro(args: argparse.Namespace) -> int:
+    return _run_tasks(args, "micro")
+
+
+def cmd_swe(args: argparse.Namespace) -> int:
+    return _run_tasks(args, "swe")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -163,6 +172,26 @@ def build_parser() -> argparse.ArgumentParser:
     mp.add_argument("--out", default=None,
                     help="results JSON (default evals/results/micro-<preset>.json)")
     mp.set_defaults(func=cmd_micro)
+
+    sp = sub.add_parser("swe", help="L2 agentic coding (harder, multi-file, hidden-test tasks)")
+    sp.add_argument("--preset", default="generic",
+                    help="model preset label (glm52, kimi27, laguna, glm47, glm51)")
+    sp.add_argument("--base-url",
+                    default=os.environ.get("OLIVIA_PROXY_URL", "http://localhost:8002"),
+                    help="anthropic_proxy.py base URL (default $OLIVIA_PROXY_URL or :8002)")
+    sp.add_argument("--model", default=None, help="override the model string sent")
+    sp.add_argument("--max-turns", type=int, default=25, help="per-task turn cap")
+    sp.add_argument("--repeat", type=int, default=1, help="runs per task")
+    sp.add_argument("--bash-timeout", type=float, default=30.0,
+                    help="per run_bash command timeout in seconds")
+    sp.add_argument("--no-bash", action="store_true", help="drop run_bash")
+    sp.add_argument("--keep-sandbox", action="store_true",
+                    help="do not delete sandboxes (debug a failure)")
+    sp.add_argument("--only", default=None, help="comma list of task ids to run")
+    sp.add_argument("--tasks", default=DEFAULT_SWE_TASKS, help="tasks directory")
+    sp.add_argument("--out", default=None,
+                    help="results JSON (default evals/results/swe-<preset>.json)")
+    sp.set_defaults(func=cmd_swe)
     return p
 
 

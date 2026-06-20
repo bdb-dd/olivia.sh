@@ -8,6 +8,36 @@ the date the work landed.
 
 ## [Unreleased]
 
+### 2026-06-20 — Per-branch deploy isolation (fix concurrent-agent script clobber)
+
+Multiple agents developing different presets on different branches were
+clobbering each other's deployed cluster scripts. `olivia.sh` deployed
+`run_vllm_server.sh` / `build_vllm_gh200.sh` (+ chat template, `patches/`) to a
+**single shared path** under `CONTAINER_DIR` and submitted with `sbatch
+run_vllm_server.sh`. SLURM snapshots the batch script at submit, so the
+corruption window is deploy→submit: agent A deploys, agent B deploys a divergent
+version (different `IS_<preset>` detection), A's `sbatch` then copies B's file →
+A's job runs the wrong preset's config (seen: a `laguna` serve silently running
+generic 32K-context with no reasoning parser, because an agent on `main`
+re-deployed over the shared script).
+
+#### Fixed
+
+- **Per-branch deploy directory** (`olivia.sh`): deploy + submit now use
+  `${CONTAINER_DIR}/deploys/<DEPLOY_KEY>/`, where `DEPLOY_KEY` defaults to the
+  local git branch (override via env). `deploy_server_script` /
+  `deploy_build_script` `mkdir -p` and upload there; serve/build submit
+  `sbatch ${DEPLOY_DIR}/<script>` and pass `CHAT_TEMPLATE_FILE` / `PATCHES_DIR`
+  from `DEPLOY_DIR`. Divergent branch scripts can no longer collide; an agent on
+  this scheme neither clobbers nor is clobbered by the legacy shared path.
+  Sandboxes, `logs/`, and the `$PWD/cache` compile cache stay shared (submit cwd
+  is still `CONTAINER_DIR`).
+
+> Verified on Olivia 2026-06-20: deploy lands in `deploys/<branch>/` (md5 ==
+> local, shared path mtime unchanged); a simulated competing agent's divergent
+> deploy left the dir untouched; a submitted job's `scontrol Command` is the
+> per-branch script with `WorkDir=CONTAINER_DIR` (shared cache/logs preserved).
+
 ### 2026-04-21 — GLM-5.1-AWQ-4bit serving end-to-end on 2 × 4 GH200s
 
 First working end-to-end run of `cyankiwi/GLM-5.1-AWQ-4bit` on Olivia. The

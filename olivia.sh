@@ -48,6 +48,23 @@ LOCAL_PATCHES_DIR="${SCRIPT_DIR}/patches"
 LOCAL_GLM51_CHAT_TEMPLATE="${SCRIPT_DIR}/templates/glm51_chat_template.jinja"
 CHAT_SCRIPT="${SCRIPT_DIR}/chat_devstral.py"
 
+# --- Per-branch deploy isolation -------------------------------------------
+# The deployed cluster scripts (run_vllm_server.sh, build_vllm_gh200.sh) + aux
+# files (GLM-5.1 chat template, patches/) used to live at ONE shared path under
+# REMOTE_CONTAINER_DIR. Concurrent agents on different preset branches deploy
+# DIVERGENT versions (each adds its own IS_<preset> detection), so they clobbered
+# each other in the deploy→sbatch window — SLURM snapshots the batch script at
+# submit, so whoever deployed last before your submit wins, and your job runs the
+# wrong preset's config. Fix: each branch deploys to deploys/<DEPLOY_KEY>/ and
+# submits from there, so divergent versions never collide. Sandboxes, logs, and
+# the $PWD/cache compile cache stay SHARED (submit cwd is still
+# REMOTE_CONTAINER_DIR); only the small scripts/aux become per-branch. DEPLOY_KEY
+# defaults to the local git branch; override to share (e.g. DEPLOY_KEY=main) or
+# split deploy dirs explicitly.
+DEPLOY_KEY="${DEPLOY_KEY:-$(git -C "${SCRIPT_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null | tr '/' '-' | tr -cd 'A-Za-z0-9._-')}"
+DEPLOY_KEY="${DEPLOY_KEY:-default}"
+DEPLOY_DIR="${REMOTE_CONTAINER_DIR}/deploys/${DEPLOY_KEY}"
+
 # SSH control socket
 SSH_CONTROL_DIR="${HOME}/.ssh/controls"
 SSH_CONTROL_SOCKET="${SSH_CONTROL_DIR}/olivia-${REMOTE_USER}@${REMOTE_HOST}"
@@ -675,10 +692,15 @@ deploy_build_script() {
         return 1
     fi
 
-    info "Uploading build_vllm_gh200.sh to ${REMOTE_HOST}:${REMOTE_CONTAINER_DIR}/"
+    info "Uploading build_vllm_gh200.sh to ${REMOTE_HOST}:${DEPLOY_DIR}/"
+
+    if ! ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "mkdir -p ${DEPLOY_DIR}"; then
+        error "Failed to create deploy dir ${DEPLOY_DIR}"
+        return 1
+    fi
 
     if ! scp_run "${LOCAL_BUILD_SCRIPT}" \
-        "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_CONTAINER_DIR}/build_vllm_gh200.sh"; then
+        "${REMOTE_USER}@${REMOTE_HOST}:${DEPLOY_DIR}/build_vllm_gh200.sh"; then
         error "Failed to upload build script"
         return 1
     fi
@@ -690,7 +712,7 @@ deploy_build_script() {
     if [[ -d "${LOCAL_PATCHES_DIR}" ]]; then
         info "Uploading patches/ (PR-graft snapshots)"
         if ! scp_run -r "${LOCAL_PATCHES_DIR}" \
-            "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_CONTAINER_DIR}/"; then
+            "${REMOTE_USER}@${REMOTE_HOST}:${DEPLOY_DIR}/"; then
             warn "Failed to upload patches/ — build will fetch PR diffs live"
         fi
     fi
@@ -1006,7 +1028,9 @@ cmd_build() {
     # Build environment variables.
     # CONTAINER_DIR must be exported to the SLURM job — `cd` alone doesn't
     # propagate it as an env var (build_vllm_gh200.sh requires it explicitly).
-    local env_vars="CONTAINER_DIR=${REMOTE_CONTAINER_DIR} MODEL_ID=${model_id}"
+    # CONTAINER_DIR stays the shared sandbox dir; PATCHES_DIR points at this
+    # branch's deploy dir so concurrent builds use their own PR snapshots.
+    local env_vars="CONTAINER_DIR=${REMOTE_CONTAINER_DIR} PATCHES_DIR=${DEPLOY_DIR}/patches MODEL_ID=${model_id}"
     [[ -n "$build_index" ]] && env_vars="${env_vars} BUILD_INDEX=${build_index}"
     [[ -n "$vllm_version" ]] && env_vars="${env_vars} VLLM_VERSION=${vllm_version}"
     [[ -n "$create_sif" ]] && env_vars="${env_vars} CREATE_SIF=${create_sif}"
@@ -1017,7 +1041,7 @@ cmd_build() {
 
     local submit_output
     if ! submit_output=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
-        "cd ${REMOTE_CONTAINER_DIR} && ${env_vars} sbatch build_vllm_gh200.sh" 2>&1); then
+        "cd ${REMOTE_CONTAINER_DIR} && ${env_vars} sbatch ${DEPLOY_DIR}/build_vllm_gh200.sh" 2>&1); then
         error "Failed to submit build job"
         echo "$submit_output" >&2
         return 1
@@ -1238,10 +1262,15 @@ deploy_server_script() {
         return 1
     fi
 
-    info "Uploading run_vllm_server.sh to ${REMOTE_HOST}:${REMOTE_CONTAINER_DIR}/"
+    info "Uploading run_vllm_server.sh to ${REMOTE_HOST}:${DEPLOY_DIR}/"
+
+    if ! ssh_run "${REMOTE_USER}@${REMOTE_HOST}" "mkdir -p ${DEPLOY_DIR}"; then
+        error "Failed to create deploy dir ${DEPLOY_DIR}"
+        return 1
+    fi
 
     if ! scp_run "${LOCAL_SERVER_SCRIPT}" \
-        "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_CONTAINER_DIR}/run_vllm_server.sh"; then
+        "${REMOTE_USER}@${REMOTE_HOST}:${DEPLOY_DIR}/run_vllm_server.sh"; then
         error "Failed to upload server script"
         return 1
     fi
@@ -1251,7 +1280,7 @@ deploy_server_script() {
     if [[ -f "${LOCAL_GLM51_CHAT_TEMPLATE}" ]]; then
         info "Uploading glm51_chat_template.jinja"
         if ! scp_run "${LOCAL_GLM51_CHAT_TEMPLATE}" \
-            "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_CONTAINER_DIR}/glm51_chat_template.jinja"; then
+            "${REMOTE_USER}@${REMOTE_HOST}:${DEPLOY_DIR}/glm51_chat_template.jinja"; then
             error "Failed to upload GLM-5.1 chat template"
             return 1
         fi
@@ -1307,6 +1336,11 @@ start_server_job() {
         return 1
     fi
     env_vars+=" HF_HOME=${HF_HOME}"
+
+    # Point the GLM-5.1 chat-template override at this branch's deploy dir (the
+    # default inside run_vllm_server.sh is ${CONTAINER_DIR}/glm51_chat_template.jinja,
+    # which is the shared, clobber-prone path). Harmless for non-GLM-5.1 presets.
+    env_vars+=" CHAT_TEMPLATE_FILE=${DEPLOY_DIR}/glm51_chat_template.jinja"
 
     # Forward selected debug/tuning env vars if the caller set them. Useful for
     # diagnosing startup hangs: `VERBOSE=1 ./olivia.sh server start glm51`
@@ -1366,7 +1400,7 @@ start_server_job() {
     # node). Instead it is piped over stdin; the remote shell reads it into its
     # environment and sbatch's default --export=ALL carries it into the job.
     local submit_output remote_submit
-    remote_submit="cd ${REMOTE_CONTAINER_DIR} && ${env_vars} sbatch ${sbatch_opts} run_vllm_server.sh"
+    remote_submit="cd ${REMOTE_CONTAINER_DIR} && ${env_vars} sbatch ${sbatch_opts} ${DEPLOY_DIR}/run_vllm_server.sh"
     if [[ -n "${HF_TOKEN:-}" ]]; then
         submit_output=$(ssh_run "${REMOTE_USER}@${REMOTE_HOST}" \
             "IFS= read -r HF_TOKEN && export HF_TOKEN && ${remote_submit}" <<<"${HF_TOKEN}" 2>&1) \

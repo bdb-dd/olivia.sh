@@ -190,15 +190,17 @@ Concurrency sweep (`bench_sweep.py`, `max_tokens=256`, thinking on):
 
 Stable 1→64 (0 failures, no decode wedge — RayExecutorV2). Single-stream is slow (~5.6 tok/s, eager) with high TTFT (~14 s, PP=3 prefill); strong batched throughput (~75× from 1→64). CUDAGraph capture IMAs on this NGC stack, so eager only.
 
-### Kimi K2.7 / K2.6 — 2 nodes × 4 GH200, eager, native int4 · 2026-06-15
+### Kimi K2.7 / K2.6 — 2 nodes × 4 GH200, eager, native int4 · 2026-06-20
 Concurrency sweep (256 output tokens, distinct prompts):
 
 | Concurrency | 1 | 2 | 4 | 8 | 16 | 32 |
 |---|---|---|---|---|---|---|
-| Aggregate tok/s | 16.9 | 37.0 | 78.0 | 134.6 | 267.3 | 602.6 |
-| Per-stream tok/s | 16.9 | 18.6 | 19.5 | 16.8 | 16.7 | 18.8 |
+| Aggregate tok/s | 17.2 | 37.3 | 77.8 | 133.6 | 264.3 | 590.9 |
+| Per-stream tok/s | 17.2 | 18.6 | 19.5 | 16.8 | 16.5 | 18.5 |
 
-Per-stream flat ~17–19 tok/s; TTFT ~1.8 s single-stream; 0 failures. Production K2.6 sustains ~830 tok/s at 48 concurrent. Eager (CUDAGraph capture unrecoverable on this stack).
+Per-stream flat ~17–19 tok/s; TTFT ~1.0 s single-stream; 0 failures (re-confirmed 2026-06-20, unchanged vs 2026-06-15 within noise). Production K2.6 sustains ~830 tok/s at 48 concurrent. Eager (CUDAGraph capture unrecoverable on this stack).
+
+> **Cold-start ≈ 40 min** (measured 2026-06-20): the ~640 GB int4 checkpoint loads at ~38 s/shard × 64 shards off Lustre (~270 MB/s), during which the server sits at "weights reserved, 0 % util, `/health` 000" — that is loading, **not** a hang. `./olivia.sh server watch` and any health-wait must allow ~40+ min before the server answers. Cross-node NCCL runs over TCP (`NET/Socket`, no CXI/RDMA plugin), but loading — not NCCL — dominates cold-start.
 
 ### GLM-5.1 / GLM-4.7
 - **GLM-5.1** (2 nodes, AWQ): wedges under concurrent decode (`Running ≥ 2`) — serve behind `anthropic_proxy.py` request serialization; effectively single-stream for CLI use.

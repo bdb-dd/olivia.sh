@@ -12,6 +12,8 @@ Runs equally as a script (``python evals/runner.py ...``) or a module
 ``sys.path`` for the script case.
 """
 import argparse
+import glob
+import json
 import os
 import sys
 
@@ -20,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from evals.protocol import loader  # noqa: E402
 from evals.protocol import runner as protocol_runner  # noqa: E402
+from evals.micro import runner as micro_runner  # noqa: E402
 
 # Served-model label per preset (the proxy maps every model name to its single
 # configured upstream, so this is for labelling/defaults only). glm51 must run
@@ -35,6 +38,7 @@ SERIALIZE_PRESETS = {"glm51"}
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_FIXTURES = os.path.join(_HERE, "protocol", "fixtures")
+DEFAULT_TASKS = os.path.join(_HERE, "micro", "tasks")
 DEFAULT_RESULTS_DIR = os.path.join(_HERE, "results")
 
 
@@ -73,6 +77,38 @@ def cmd_protocol(args: argparse.Namespace) -> int:
     return 0 if summary["invariants_clean"] else 1
 
 
+def _load_tasks(tasks_dir: str) -> list:
+    tasks = []
+    for path in sorted(glob.glob(os.path.join(tasks_dir, "*.json"))):
+        with open(path, "r", encoding="utf-8") as f:
+            tasks.append(json.load(f))
+    return tasks
+
+
+def cmd_micro(args: argparse.Namespace) -> int:
+    tasks = _load_tasks(args.tasks)
+    if not tasks:
+        print(f"error: no tasks found in {args.tasks}", file=sys.stderr)
+        return 2
+    if args.only:
+        wanted = {s.strip() for s in args.only.split(",")}
+        tasks = [t for t in tasks if t.get("id") in wanted]
+    out_path = args.out or os.path.join(DEFAULT_RESULTS_DIR, f"micro-{args.preset}.json")
+    cfg = micro_runner.RunConfig(
+        base_url=args.base_url,
+        model=args.model or PRESET_MODELS.get(args.preset, "local-eval"),
+        preset=args.preset,
+        max_turns=args.max_turns,
+        repeat=args.repeat,
+        bash_timeout=args.bash_timeout,
+        no_bash=args.no_bash,
+        keep_sandbox=args.keep_sandbox,
+    )
+    summary = micro_runner.run(cfg, tasks, out_path=out_path)
+    # "Soft" gate: non-zero if nothing succeeded (likely a wiring/endpoint problem).
+    return 0 if summary["n_success"] > 0 else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="evals/runner.py",
                                 description="Olivia agentic-eval runner")
@@ -106,6 +142,27 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--out", default=None,
                     help="results JSON path (default evals/results/protocol-<preset>.json)")
     pp.set_defaults(func=cmd_protocol)
+
+    mp = sub.add_parser("micro", help="L1 micro-agent tasks (multi-turn, sandboxed)")
+    mp.add_argument("--preset", default="generic",
+                    help="model preset label (glm52, kimi27, laguna, glm47, glm51)")
+    mp.add_argument("--base-url",
+                    default=os.environ.get("OLIVIA_PROXY_URL", "http://localhost:8002"),
+                    help="anthropic_proxy.py base URL (default $OLIVIA_PROXY_URL or :8002)")
+    mp.add_argument("--model", default=None, help="override the model string sent")
+    mp.add_argument("--max-turns", type=int, default=12, help="per-task turn cap")
+    mp.add_argument("--repeat", type=int, default=1, help="runs per task")
+    mp.add_argument("--bash-timeout", type=float, default=30.0,
+                    help="per run_bash command timeout in seconds")
+    mp.add_argument("--no-bash", action="store_true",
+                    help="drop run_bash; skips tasks whose oracle needs it")
+    mp.add_argument("--keep-sandbox", action="store_true",
+                    help="do not delete sandboxes (debug a failure)")
+    mp.add_argument("--only", default=None, help="comma list of task ids to run")
+    mp.add_argument("--tasks", default=DEFAULT_TASKS, help="tasks directory")
+    mp.add_argument("--out", default=None,
+                    help="results JSON (default evals/results/micro-<preset>.json)")
+    mp.set_defaults(func=cmd_micro)
     return p
 
 

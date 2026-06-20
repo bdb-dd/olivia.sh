@@ -1,0 +1,18 @@
+{
+  "id": "rename-symbol",
+  "category": "refactor",
+  "description": "Multi-file rename that must keep a caller working; verified by a test script and absence of the old name.",
+  "prompt": "Rename the function `old_total` to `new_total` everywhere in this project (in lib.py and any files that call it) so that `python3 test_rename.py` prints PASS and exits 0. Do not edit test_rename.py.",
+  "files": {
+    "lib.py": "def old_total(xs):\n    return sum(xs)\n",
+    "main.py": "from lib import old_total\n\n\ndef report(xs):\n    return f\"total={old_total(xs)}\"\n",
+    "test_rename.py": "from lib import new_total\nfrom main import report\n\nassert new_total([1, 2, 3]) == 6\nassert report([4, 5]) == \"total=9\"\nprint(\"PASS\")\n"
+  },
+  "tools": ["read_file", "write_file", "list_dir", "grep", "run_bash"],
+  "max_turns": 14,
+  "oracle": [
+    {"check": "bash_exit_zero", "command": "python3 test_rename.py"},
+    {"check": "file_not_contains", "path": "lib.py", "text": "old_total"},
+    {"check": "file_not_contains", "path": "main.py", "text": "old_total"}
+  ]
+}

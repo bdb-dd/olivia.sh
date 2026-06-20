@@ -1,0 +1,15 @@
+{
+  "id": "find-and-report",
+  "category": "search",
+  "description": "Locate code by behaviour (grep/read) and report a fact — no code change.",
+  "prompt": "Exactly one function in validators.py raises a ValueError. Write only that function's name (just the identifier, nothing else) to a file named answer.txt.",
+  "files": {
+    "validators.py": "def normalize(s):\n    return s.strip().lower()\n\n\ndef validate_age(age):\n    if age < 0:\n        raise ValueError(\"age must be non-negative\")\n    return age\n\n\ndef format_name(first, last):\n    return f\"{first} {last}\"\n"
+  },
+  "tools": ["read_file", "grep", "list_dir", "write_file"],
+  "max_turns": 8,
+  "oracle": [
+    {"check": "file_contains", "path": "answer.txt", "text": "validate_age"},
+    {"check": "file_not_contains", "path": "answer.txt", "text": "normalize"}
+  ]
+}

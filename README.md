@@ -181,6 +181,18 @@ Unified CLI for all operations. Uses SSH ControlMaster for single 2FA authentica
 
 Latest measured throughput / latency. **Update this section after every sweep** (with the date + config).
 
+### Laguna M.1 (`laguna`) — 1 node × 4 GH200, FP8, CUDAGraph · 2026-06-20
+Concurrency sweep (`bench_sweep.py`, `max_tokens=512`), reasoning on (`enable_thinking=true`) vs off:
+
+| Concurrency | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| Agg tok/s — reasoning on  | 62.7 | 118.6 | 229.7 | 346.6 | 616.3 | 1182.3 | 2055.7 |
+| Per-stream tok/s — on     | 62.7 | 59.4 | 57.5 | 43.3 | 38.5 | 37.0 | 32.2 |
+| Agg tok/s — reasoning off | 63.3 | 118.9 | 229.9 | 411.8 | 717.6 | 1147.6 | 2002.3 |
+| Per-stream tok/s — off    | 63.3 | 59.5 | 57.6 | 51.5 | 44.9 | 35.9 | 31.5 |
+
+Single node, TP=4 — no multi-node PP, so none of the glm51/glm52 decode wedge. **First preset to run with CUDAGraph capture** (Laguna's ordinary dense attention captures cleanly, unlike the eager Kimi/glm52): single-stream **~63 tok/s** (~3.7× the eager Kimi's ~17), aggregate near-linear to **~2050 tok/s at 64-way**, 0 failures 1→64, sub-second TTFT (one transient ~2 s blip at 8–16 reasoning-on). Reasoning on vs off is the same decode rate — thinking just emits more tokens per request (~300 reasoning tokens on a 400-token answer), so it's longer per request, not slower per token. vLLM v0.21.0, transformers 5.12, fastapi 0.136.3.
+
 ### GLM-5.2 (`glm52`) — 3 nodes × 4 GH200, eager, FP8 · 2026-06-18
 Concurrency sweep (`bench_sweep.py`, `max_tokens=256`, thinking on):
 

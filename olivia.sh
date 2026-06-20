@@ -1398,9 +1398,15 @@ start_server_job() {
     if [[ "${num_nodes}" -gt 1 ]]; then
         sbatch_opts="--nodes=${num_nodes} --ntasks=${num_nodes} --ntasks-per-node=1 --gpus-per-node=${gpus_per_node} --cpus-per-task=$((gpus_per_node * 8))"
     else
-        # Single-node: keep backward-compatible behavior but still pass --gpus and
-        # --cpus-per-task so per-preset overrides work.
-        sbatch_opts="--gpus=${gpus_per_node} --cpus-per-task=$((gpus_per_node * 8))"
+        # Single-node: pin the job to exactly ONE node with N GPUs. Passing
+        # --gpus=N (a TOTAL count) alone lets SLURM scatter those N GPUs across
+        # >1 node on a fragmented cluster — observed landing a laguna start on
+        # 2 nodes — which breaks single-node TP=N (vLLM needs all N GPUs
+        # co-located on one node). --nodes=1 --gpus-per-node=N makes it
+        # unambiguous: the job waits for a full free node instead of accepting a
+        # split allocation. --ntasks=1 keeps it a single task (run_vllm_server.sh
+        # launches vllm directly, no srun/Ray for single-node).
+        sbatch_opts="--nodes=1 --ntasks=1 --gpus-per-node=${gpus_per_node} --cpus-per-task=$((gpus_per_node * 8))"
     fi
 
     # Optional walltime override (TIME_LIMIT, e.g. "3:00:00" or "180"). Overrides

@@ -302,9 +302,11 @@ Per task (turns): calc-operator-precedence (wrote a recursive-descent precedence
 |---|---|
 | **resolved** | **5/12 (42%)** |
 | precision when it edits | **5/5** — every non-empty patch passed the hidden suite |
-| dominant failure mode | **7/7 unresolved made no edit** (patch=0, hit the 40-turn cap exploring) |
+| dominant failure mode | **7/7 unresolved made no edit** (patch=0) |
 
-Resolved: 15851, 16255, 16485, 16527, 16801. The signal L1/L2 (both 100%) couldn't give: Laguna's **fixes are reliable** (5/5 correct), but it frequently **fails to commit an edit within budget** — so the lever is turn-budget / prompting to act sooner, not fix quality. A legitimate real-benchmark number (SWE-bench Verified is hard). Slice is django-only (the tractable subset on this cluster — no per-instance Docker needed); broadening repos/instances and adding glm52/kimi27 is next.
+Resolved: 15851, 16255, 16485, 16527, 16801. The signal L1/L2 (both 100%) couldn't give: Laguna's **fixes are reliable** (5/5 correct), but **7/7 failures made no edit at all**.
+
+**Turn-budget experiment (single variable, `max_turns` 40→80 on those 7):** came back **0/7, still `patch=0`** — 6 ran the full 80 turns without editing, one *stopped* at 30 turns declaring done without writing a fix. So it is **not a turn-budget problem**: doubling the budget changed nothing. The failure mode is failing to translate exploration into an *edit* (reads/runs but never commits a `write_file`, or stops prematurely). The lever is **agent scaffolding that forces a patch** (e.g. require a diff before stopping), not more turns or fix quality. A legitimate real-benchmark number (SWE-bench Verified is hard). Slice is django-only (the tractable subset on this cluster — no per-instance Docker); broadening repos/instances and adding glm52/kimi27 is next.
 
 > Eval tools: `evals/runner.py {protocol,micro,swe}` (L0/L1/L2, in-repo); `evals/swe_real/run_on_cluster.sh` (L2-real, SLURM on `small`). Offline self-tests: `evals/{protocol,micro}/selftest.py`; harness self-test: `--gold`. Re-run per preset after any proxy/serving change; results in `evals/results/` (L0–L2) and `/cluster/work/.../swe/` (L2-real).
 

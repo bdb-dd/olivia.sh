@@ -2,9 +2,15 @@
 # L2-real SWE-bench runner — submit to Olivia's `small` CPU partition (x86 +
 # internet + reaches the vLLM node), entirely within Sigma2 usage policy.
 #
-# Inside a python:3.11 apptainer it starts anthropic_proxy (-> the GPU node's
-# vLLM) and runs evals/swe_real/runner.py against the cached django slice.
+# Inside a python:3.11 apptainer it starts anthropic_proxy (-> the durable router
+# on the `small` partition, or a single GPU node directly) and runs
+# evals/swe_real/runner.py against the cached django slice.
 #
+#   # via the durable multi-model router (recommended — one stable host that
+#   # routes by model name, so the same job can sweep presets):
+#   ROUTER_NODE=c1-5 MODEL=poolside/Laguna-M.1-FP8 PRESET=laguna \
+#     sbatch evals/swe_real/run_on_cluster.sh
+#   # or straight to a single vLLM node (no router):
 #   GPU_NODE=gpu-1-16 MODEL=poolside/Laguna-M.1-FP8 PRESET=laguna \
 #     sbatch evals/swe_real/run_on_cluster.sh
 #   # optional: ONLY=django__django-16950,django__django-16502  MAXTURNS=40
@@ -21,29 +27,41 @@ set -euo pipefail
 WORK=/cluster/work/projects/nn10104k/swe
 REPO="$WORK/agentic-evals"
 SIF="$WORK/python311.sif"
-GPU_NODE="${GPU_NODE:?set GPU_NODE to the vLLM node, e.g. gpu-1-16}"
+ROUTER_NODE="${ROUTER_NODE:-}"
+GPU_NODE="${GPU_NODE:-}"
 MODEL="${MODEL:-poolside/Laguna-M.1-FP8}"
 PRESET="${PRESET:-laguna}"
 ONLY="${ONLY:-}"
 MAXTURNS="${MAXTURNS:-40}"
 GOLD="${GOLD:-}"   # set GOLD=1 to apply gold patches instead of the model (harness self-test)
 
-echo "[$(date +%T)] swe-eval: node=$(hostname) gpu=$GPU_NODE model=$MODEL preset=$PRESET only=${ONLY:-all}"
+# Endpoint: prefer the durable router (port 8080; resolves $MODEL — preset name,
+# alias, or served repo id — to the live backend), else a direct vLLM node (:8000).
+if [ -n "$ROUTER_NODE" ]; then
+    ENDPOINT_HOST="$ROUTER_NODE"; ENDPOINT_PORT=8080; ENDPOINT_KIND=router
+elif [ -n "$GPU_NODE" ]; then
+    ENDPOINT_HOST="$GPU_NODE"; ENDPOINT_PORT=8000; ENDPOINT_KIND="vLLM-direct"
+else
+    echo "set ROUTER_NODE (durable router on small, recommended) or GPU_NODE (direct vLLM node)" >&2
+    exit 1
+fi
+
+echo "[$(date +%T)] swe-eval: node=$(hostname) endpoint=$ENDPOINT_HOST:$ENDPOINT_PORT ($ENDPOINT_KIND) model=$MODEL preset=$PRESET only=${ONLY:-all}"
 
 apptainer exec --cleanenv --bind /cluster/work "$SIF" bash -c "
 set -e
 cd '$REPO'
 # Compute nodes inherit http_proxy=http://uan03:3128 (squid for internet). urllib
-# would route localhost:8002 and the GPU node through it (-> 503). Bypass the
-# proxy for local + the vLLM node; keep it for git/pip (github/pypi).
-export no_proxy='localhost,127.0.0.1,$GPU_NODE'
+# would route localhost:8002 and the endpoint host through it (-> 503). Bypass the
+# proxy for local + the endpoint (router or vLLM node); keep it for git/pip.
+export no_proxy='localhost,127.0.0.1,$ENDPOINT_HOST'
 export NO_PROXY=\"\$no_proxy\"
 # proxy venv (aiohttp); the runner itself is stdlib-only
 [ -d '$WORK/proxyvenv' ] || python -m venv '$WORK/proxyvenv'
 '$WORK/proxyvenv/bin/pip' install -q aiohttp
-# start the Anthropic proxy pointed straight at the vLLM node (no tunnel needed)
+# start the Anthropic proxy pointed at the endpoint ($ENDPOINT_KIND; no tunnel needed)
 '$WORK/proxyvenv/bin/python' anthropic_proxy.py --model '$MODEL' \
-    --upstream 'http://$GPU_NODE:8000' --listen-port 8002 > '$WORK/proxy-$PRESET.log' 2>&1 &
+    --upstream 'http://$ENDPOINT_HOST:$ENDPOINT_PORT' --listen-port 8002 > '$WORK/proxy-$PRESET.log' 2>&1 &
 PROXY=\$!
 # wait for the proxy to accept connections
 python - <<'PY'

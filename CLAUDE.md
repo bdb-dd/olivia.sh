@@ -146,7 +146,7 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 ./olivia.sh prefetch <model> --no-follow        # start, don't tail progress
 ```
 
-Downloads model weights into the persistent HuggingFace cache (`HF_HOME`) **from a login
+Downloads model weights into the HuggingFace cache **from a login
 node** — never a GPU/SLURM job, so the multi-hundred-GB transfer doesn't burn allocation. The
 download is **detached** (`setsid`, survives closing the CLI) and **resumable** (skips
 already-complete blobs). Run it once before `server start` so the server job serves
@@ -156,8 +156,17 @@ Mechanism notes:
 - The Olivia login node is **amd64** while the GH200 compute nodes are **arm64**, so the
   containers can't exec on the login node. Prefetch instead builds a one-time throwaway
   `python3.12` venv (under `<HF_HOME parent>/.prefetch/venv`) with `huggingface_hub` + `hf_xet`.
-- `HF_HOME` is pinned explicitly from your local environment (see "Persistent model cache"
-  under Container/Cache Structure); `HF_TOKEN` is forwarded over stdin for gated repos.
+- **The cache tier is per-preset.** `prefetch`/`server start` resolve `HF_HOME` from the
+  preset's `storage` field in `presets.json`: `projects` (persistent, the default) or `work`
+  (the at-risk `/cluster/work` mirror, for models that don't fit the 1 TiB project quota —
+  kimi/kimi27/glm51/glm52). You never hand-pass the override; both commands land on the same
+  tier the server reads from, so weights aren't re-downloaded to the wrong place. An explicit
+  repo id resolves through the same registry, and an explicit `HF_HOME=…` on the command line
+  still overrides. See [[project_hf_storage_split]].
+- `HF_HOME` (the persistent/projects root) is pinned explicitly from your local environment (see
+  "Persistent model cache" under Container/Cache Structure); the `work` root is derived from it
+  by swapping the `/cluster/projects/<proj>` prefix for `/cluster/work/projects/<proj>`.
+  `HF_TOKEN` is forwarded over stdin for gated repos.
 
 #### Tunnel Module
 ```bash
@@ -336,11 +345,16 @@ Custom MODEL_ID values are also supported - they will use generic defaults.
 
 To add a new preset, edit the `apply_preset()` function in `build_vllm_gh200.sh`
 (build-time vLLM/transformers versions) **and** add the entry to **`presets.json`**
-(runtime model/aliases/container/shape). `presets.json` is the single source of
+(runtime model/aliases/container/shape/`storage`). `presets.json` is the single source of
 truth for the runtime preset table: `olivia.sh` (via `presets.py`) and the
 durable router (`model_router.py`) both read it, so the CLI and the router stay in
 sync. The old `preset_field`/`normalize_preset` case statements in `olivia.sh`
 were extracted into `presets.json` — don't re-add per-preset data to the bash.
+Set `"storage": "work"` for a model that lives on the `/cluster/work` mirror
+(doesn't fit the 1 TiB project quota); it defaults to `projects` (persistent).
+`olivia.sh` resolves `HF_HOME` from this for `prefetch`/`server start`, so the
+right cache is picked without a hand-passed override — keep it in sync with the
+[[project_hf_storage_split]] note when weights are relocated.
 
 ### Server Script (`run_vllm_server.sh`)
 Runs vLLM server with GH200-optimized settings:
@@ -367,7 +381,7 @@ Runs vLLM server with GH200-optimized settings:
 - `TP_SIZE`: Tensor parallel size (default: 4)
 - `GPU_MEM_UTIL`: GPU memory utilization (default: 0.90)
 - `MAX_MODEL_LEN`: Maximum context length (default: `131072` for GLM-5.1 — native 205K context with ~260 GB KV cache headroom on 8×GH200 AWQ; `32768` elsewhere)
-- `HF_HOME`: Persistent HuggingFace cache directory for model weights (**required**). Must live on persistent project storage (e.g. `/cluster/projects/<proj>/huggingface`), **not** `/cluster/work` (auto-purged after 21–42 days — see "Persistent model cache" under Container/Cache Structure). `olivia.sh` forwards it from your local environment (`mise.local.toml`); `run_vllm_server.sh` errors if it is unset and warns if it resolves under `/cluster/work`. `HF_CACHE` is a back-compat alias.
+- `HF_HOME`: HuggingFace cache directory for model weights (**required**). The value in `mise.local.toml` is the **persistent/projects root** (e.g. `/cluster/projects/<proj>/huggingface`). `olivia.sh` forwards it from your local environment, but for a **work-tier preset** (`"storage": "work"` in `presets.json`) it first rewrites the root to the `/cluster/work` mirror — so `prefetch`/`server start` land a kimi/glm51/glm52 model on `/cluster/work` automatically, while laguna/glm47/etc. stay on the persistent root. `run_vllm_server.sh` errors if it is unset and (correctly, by design now) warns when it resolves under `/cluster/work` (auto-purged after 21–42 days — see "Persistent model cache" under Container/Cache Structure). An explicit `HF_HOME=…` on the command line overrides the per-preset resolution. `HF_CACHE` is a back-compat alias.
 - `HF_TOKEN`: HuggingFace token for gated models. `olivia.sh` forwards it over stdin (kept off argv and out of logs), so it lives only in local config — not the cluster shell.
 - `VLLM_ATTENTION_BACKEND`: Attention backend (default: `FLASH_ATTN`)
 - `VERBOSE`: Set to `1` for detailed logging including weight loading progress (default: `0`)
@@ -569,16 +583,19 @@ GLM-5.2 is the successor to GLM-5.1: same `GlmMoeDsaForCausalLM` MoE+DSA archite
 
 **`reasoning_tokens` on `/v1/chat/completions` usage (build patch):** upstream vLLM only surfaces `reasoning_tokens` on `/v1/responses` — chat/completions has no `completion_tokens_details` at all, and the glm45 reasoning parser (`DeepSeekV3ReasoningWithThinkingParser`) never counts reasoning tokens (the base `count_reasoning_tokens()` returns 0, the V3 wrapper doesn't forward it, and GLM emits `</think>` but omits the `<think>` start token so the inner R1 parser's start/end depth counter is 0 too). `build_vllm_gh200.sh` (`PYPATCH_REASONING_TOKENS`, applied in Phase 3 after the PR graft) fixes all three: it adds `count_reasoning_tokens` to **both** the glm45 (`DeepSeekV3ReasoningParser`) and `kimi_k2` parsers (count tokens before the first reasoning-end marker), adds `CompletionTokenUsageInfo` + `UsageInfo.completion_tokens_details` to `engine/protocol.py`, and populates it in the non-streaming and streaming usage paths of `chat_completion/serving.py` — tolerant of both vLLM 0.21 (`reasoning_parser` / `all_previous_token_ids`) and vLLM main (`parser`/`parsers` + its own `previous_token_ids` accumulator) serving layouts (0.21-specific anchors tried first under a guard, so the main-only `parser` var is never injected into 0.21). The patch is idempotent and defensive (a missing anchor logs + no-ops, so a future vLLM refactor never half-patches or fails the build) and the runtime guards leave non-reasoning models unaffected, so it runs on every build — **any reasoning model (glm47/glm51/glm52 and Kimi K2.x) gets it from this one block.** **Takes effect on the next container rebuild.**
 
-**Weights storage:** prefetched to the at-risk-but-spacious work cache, not the quota-bound project area — the 703.7 GiB FP8 does not fit the ~462 GiB free on `/cluster/projects/nn10104k` (1 TiB quota). Override `HF_HOME` to `/cluster/work/projects/nn10104k/huggingface` for both prefetch and serving (see [[project_hf_storage_split]]):
+**Weights storage:** lives on the at-risk-but-spacious work cache, not the quota-bound project area — the 703.7 GiB FP8 does not fit the ~462 GiB free on `/cluster/projects/nn10104k` (1 TiB quota). This is now **automatic**: the `glm52` preset is tagged `"storage": "work"` in `presets.json`, so `olivia.sh prefetch`/`server start` resolve `HF_HOME` to `/cluster/work/projects/nn10104k/huggingface` on their own — no hand-passed override (see [[project_hf_storage_split]]). The tier hint is portable (a `work`/`projects` flag, not an absolute path); the actual roots stay in `mise.local.toml`. To force a different cache, an explicit `HF_HOME=… ` on the command line still wins.
 ```bash
-HF_HOME=/cluster/work/projects/nn10104k/huggingface ./olivia.sh prefetch RedHatAI/GLM-5.2-FP8
+./olivia.sh prefetch glm52      # -> /cluster/work/... automatically (preset is work-tier)
 ```
 
 ### GLM-5.2 Usage
 
 ```bash
-# 1. Prefetch FP8 weights to the work cache (HF_HOME override; detached, resumable)
-HF_HOME=/cluster/work/projects/nn10104k/huggingface ./olivia.sh prefetch RedHatAI/GLM-5.2-FP8
+# 1. Prefetch FP8 weights to the work cache (detached, resumable). The glm52
+#    preset is work-tier, so HF_HOME auto-resolves to /cluster/work/... — no
+#    override needed (an explicit repo id like RedHatAI/GLM-5.2-FP8 also routes
+#    there via the preset registry).
+./olivia.sh prefetch glm52
 
 # 2. Build the container. The glm52 preset builds vLLM main and auto-grafts
 #    PR#45895 (VLLM_PATCHES=45895) for GLM-5.2's skip-topk indexer — no need to
@@ -586,8 +603,9 @@ HF_HOME=/cluster/work/projects/nn10104k/huggingface ./olivia.sh prefetch RedHatA
 #    PR has since merged into main.
 ./olivia.sh build glm52
 
-# 3. Start the server (preset auto-allocates 3 nodes × 4 GPUs, TP=4 + PP=3)
-HF_HOME=/cluster/work/projects/nn10104k/huggingface ./olivia.sh server start glm52
+# 3. Start the server (preset auto-allocates 3 nodes × 4 GPUs, TP=4 + PP=3;
+#    HF_HOME auto-resolves to the work-tier cache).
+./olivia.sh server start glm52
 
 # Check whether a 3-node shape can schedule right now
 ./olivia.sh cluster

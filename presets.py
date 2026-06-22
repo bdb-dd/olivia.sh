@@ -27,7 +27,7 @@ Semantics intentionally mirror the old olivia.sh accessors:
 CLI::
 
     presets.py normalize <name>            # canonical name (or lower-cased input)
-    presets.py field <name> <field>        # model|served_name|nodes|gpus|pp|resources|prefix|index|port|description
+    presets.py field <name> <field>        # model|served_name|nodes|gpus|pp|resources|prefix|index|port|storage|description
     presets.py shellvars <name>            # PRESET_*=... lines for `eval` in bash
     presets.py container <name> [index]    # vllm-<prefix>-<index>-sandbox
     presets.py list [--aliases]            # canonical preset names
@@ -61,6 +61,7 @@ class Preset:
     container_prefix: str = ""
     index: int = 1
     port: int = 8000
+    storage: str = "projects"  # HF-cache tier: "projects" (persistent) or "work" (at-risk)
     description: str = ""
     known: bool = True  # False for synthesised custom presets
 
@@ -101,6 +102,7 @@ class Registry:
                 container_prefix=spec.get("container_prefix", canonical),
                 index=int(spec.get("index", self.defaults.get("index", 1))),
                 port=int(spec.get("port", self.defaults.get("port", 8000))),
+                storage=spec.get("storage", self.defaults.get("storage", "projects")),
                 description=spec.get("description", ""),
             )
         # Lower-cased alias/canonical -> canonical, for normalize().
@@ -129,6 +131,7 @@ class Registry:
             pp=int(d.get("pp", 1)),
             index=int(d.get("index", 1)),
             port=int(d.get("port", 8000)),
+            storage=d.get("storage", "projects"),
             known=False,
         )
 
@@ -189,6 +192,7 @@ def _field_value(p: Preset, fname: str) -> str:
         "prefix": p.container_prefix,
         "index": p.index,
         "port": p.port,
+        "storage": p.storage,
         "description": p.description,
         "canonical": p.canonical,
         "container": p.container_name(),
@@ -269,6 +273,7 @@ def main(argv: list) -> int:
                 "nodes": p.nodes, "gpus": p.gpus, "pp": p.pp,
                 "container": p.container_name(),
                 "port": p.port,
+                "storage": p.storage,
                 "description": p.description,
             }
             for p in reg.all()

@@ -766,14 +766,14 @@ cmd_build() {
                 echo "             Same arch as K2.6 — reuses kimi container (index 4,"
                 echo "             eager vLLM 0.21), no rebuild. native int4 ~560GB,"
                 echo "             8 GPUs (2×4-GPU nodes, TP=4 + PP=2). Thinking-mode only."
-                echo "             Weights on /cluster/work scratch — serve with"
-                echo "             HF_HOME=/cluster/work/projects/nn10104k/huggingface"
+                echo "             Work-tier preset: HF_HOME auto-resolves to"
+                echo "             /cluster/work/projects/nn10104k/huggingface (no override)."
                 echo ""
                 echo "  laguna     Laguna M.1 (Poolside, 225B/23B active) MoE coding model"
                 echo "             vLLM: v0.21.0 (native Laguna), transformers>=5.7.0"
                 echo "             FP8 ~225GB, single node (4×GH200, TP=4); poolside_v1 parsers."
-                echo "             Weights too big for project quota — prefetch+serve with"
-                echo "             HF_HOME=/cluster/work/projects/nn10104k/huggingface"
+                echo "             Projects-tier preset: weights on persistent"
+                echo "             /cluster/projects (default HF_HOME, no override)."
                 echo ""
                 echo "  devstral   Devstral/Mistral models"
                 echo "             vLLM: main, transformers>=4.45.0"
@@ -1018,6 +1018,43 @@ resolve_container_prefix() { preset_field "$1" prefix; }
 get_preset_default_index() { preset_field "$1" index; }
 get_preset_port()          { preset_field "$1" port; }
 
+# Storage tier ("projects"|"work") for a preset name, alias, OR model repo id.
+# `match` resolves a repo id / served name to its canonical preset (so an
+# explicit `prefetch RedHatAI/GLM-5.2-FP8` still gets the work tier); fall back
+# to the raw key for true non-presets, which `field` reports as the default
+# "projects". Empty arg (explicit --container path, no preset) → "projects".
+resolve_preset_storage() {
+    local key="$1" canonical=""
+    [[ -z "$key" ]] && { echo "projects"; return; }
+    canonical=$(preset_query match "$key" 2>/dev/null)
+    [[ -z "$canonical" ]] && canonical="$key"
+    preset_field "$canonical" storage
+}
+
+# Derive the effective HF cache root for a preset from the persistent HF_HOME.
+# `work`-tier presets live on the at-risk /cluster/work mirror; we swap the
+# /cluster/projects/<proj> prefix for /cluster/work/projects/<proj> rather than
+# bake an absolute path into presets.json (which stays portable). Anything else
+# (incl. an empty preset, or HF_HOME not under /cluster/projects) uses HF_HOME
+# unchanged. The actual roots come from mise.local.toml — this is the single
+# place that maps the presets.json tier hint onto them.
+resolve_preset_hf_home() {
+    local storage base="${HF_HOME:-}"
+    storage=$(resolve_preset_storage "$1")
+    if [[ "$storage" == "work" ]]; then
+        if [[ "$base" == /cluster/projects/* ]]; then
+            echo "/cluster/work${base#/cluster}"
+        elif [[ "$base" == /cluster/work/* ]]; then
+            echo "$base"   # already on the work tier
+        else
+            warn "preset '$1' wants work-tier storage but HF_HOME ('$base') is not under /cluster/projects — using it as-is" >&2
+            echo "$base"
+        fi
+    else
+        echo "$base"
+    fi
+}
+
 # Resolve preset + index to a container sandbox name.
 resolve_container_name() {
     local prefix
@@ -1073,6 +1110,7 @@ start_server_job() {
     local num_nodes="${3:-1}"
     local gpus_per_node="${4:-4}"
     local pp_size="${5:-1}"
+    local preset="${6:-}"   # for per-preset HF-cache tier; empty for --container path
 
     info "Starting vLLM server..."
     echo "    Container: ${container}" >&2
@@ -1104,7 +1142,16 @@ start_server_job() {
         echo "    e.g. export HF_HOME=/cluster/projects/<proj>/huggingface" >&2
         return 1
     fi
-    env_vars+=" HF_HOME=${HF_HOME}"
+    # Resolve the cache root for this preset's storage tier (presets.json). A
+    # `work`-tier preset (kimi/glm51/glm52/...) is served from the /cluster/work
+    # mirror automatically, so the operator no longer hand-passes HF_HOME=… —
+    # serving with the wrong root would silently re-download hundreds of GB.
+    local hf_home_eff
+    hf_home_eff=$(resolve_preset_hf_home "$preset")
+    if [[ "$hf_home_eff" != "$HF_HOME" ]]; then
+        echo "    HF cache: ${hf_home_eff}  (preset '${preset}' is work-tier)" >&2
+    fi
+    env_vars+=" HF_HOME=${hf_home_eff}"
 
     # Point the GLM-5.1 chat-template override at this branch's deploy dir (the
     # default inside run_vllm_server.sh is ${CONTAINER_DIR}/glm51_chat_template.jinja,
@@ -1728,7 +1775,7 @@ cmd_server() {
 
             # Start server
             local job_id
-            if ! job_id=$(start_server_job "$container" "$model" "$num_nodes" "$gpus_per_node" "$pp_size"); then
+            if ! job_id=$(start_server_job "$container" "$model" "$num_nodes" "$gpus_per_node" "$pp_size" "$preset"); then
                 exit 1
             fi
 
@@ -1800,7 +1847,7 @@ cmd_server() {
 
             # Start server
             local job_id
-            if ! job_id=$(start_server_job "$container" "$model" "$num_nodes" "$gpus_per_node" "$pp_size"); then
+            if ! job_id=$(start_server_job "$container" "$model" "$num_nodes" "$gpus_per_node" "$pp_size" "$preset"); then
                 exit 1
             fi
 
@@ -3180,14 +3227,21 @@ cmd_prefetch() {
     local repo; repo=$(get_default_model "$target")
     [[ -z "$repo" ]] && repo="$target"
 
+    # Prefetch into the SAME cache tier the server will read from, so a
+    # `work`-tier model (kimi/glm51/glm52/...) lands on /cluster/work — not the
+    # persistent default — without a hand-passed HF_HOME. Resolve from $target
+    # so both a preset name and an explicit repo id route correctly.
+    local hf_home_eff
+    hf_home_eff=$(resolve_preset_hf_home "$target")
+
     local state venv slug log
-    state="$(dirname "${HF_HOME}")/.prefetch"
+    state="$(dirname "${hf_home_eff}")/.prefetch"
     venv="${state}/venv"
     slug=$(printf '%s' "$repo" | tr '/:' '__')
     log="${state}/${slug}.log"
 
     info "Prefetching ${repo}"
-    echo "    -> ${HF_HOME}  (login node, detached, resumable)" >&2
+    echo "    -> ${hf_home_eff}  (login node, detached, resumable)" >&2
 
     # HF_TOKEN (secret, needed for gated repos) is forwarded over stdin so it
     # stays off argv and out of logs; the exported value is inherited by the
@@ -3198,7 +3252,7 @@ cmd_prefetch() {
     # All ${...} below are host-interpolated; \$ / \" are evaluated remotely.
     local remote_cmd="${token_read}
         set -e
-        HF='${HF_HOME}'; STATE='${state}'; VENV='${venv}'; LOG='${log}'; REPO='${repo}'
+        HF='${hf_home_eff}'; STATE='${state}'; VENV='${venv}'; LOG='${log}'; REPO='${repo}'
         mkdir -p \"\$HF\" \"\$STATE\"
         if [ ! -x \"\$VENV/bin/hf\" ]; then
             echo 'Creating prefetch venv (python3.12)…'

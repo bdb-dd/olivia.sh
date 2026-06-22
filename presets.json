@@ -13,6 +13,14 @@
     "  nodes / gpus / pp  - SLURM/vLLM shape: NUM_NODES, GPUs-per-node (intra-node TP), pipeline-parallel size",
     "  container_prefix   - sandbox name is vllm-<container_prefix>-<index>-sandbox",
     "  index              - default container index for the preset",
+    "  storage            - HF-cache tier: 'projects' (persistent, the default) or 'work'",
+    "                       (at-risk /cluster/work, NRIS auto-purges after 21-42 days). olivia.sh",
+    "                       derives HF_HOME from this per preset for `server start`/`prefetch` so you",
+    "                       never hand-pass the override; 'work' swaps the /cluster/projects/<proj>",
+    "                       HF_HOME prefix for /cluster/work/projects/<proj>. A NEUTRAL TIER HINT, not",
+    "                       an absolute path: the actual roots stay in mise.local.toml so this file is",
+    "                       portable. Placement is quota-driven and changes — keep it in sync with the",
+    "                       hf-weights-storage-split note.",
     "  port               - vLLM serve port. Defaults to 8000 for every preset because each server job owns",
     "                       its GPU node(s) exclusively, so two models never collide on a node — the router",
     "                       tells them apart by the per-preset SLURM job name (vllm-server-<preset>), not the",
@@ -25,7 +33,8 @@
     "gpus": 4,
     "pp": 1,
     "index": 1,
-    "port": 8000
+    "port": 8000,
+    "storage": "projects"
   },
   "presets": {
     "glm51_v19": {
@@ -33,6 +42,7 @@
       "model": "cyankiwi/GLM-5.1-AWQ-4bit",
       "nodes": 2, "gpus": 4, "pp": 2,
       "container_prefix": "glm51", "index": 1,
+      "storage": "work",
       "description": "GLM-5.1 744B MoE+DSA, AWQ-4bit, vLLM v0.19.0 (recipe default)"
     },
     "glm51_v20": {
@@ -40,6 +50,7 @@
       "model": "cyankiwi/GLM-5.1-AWQ-4bit",
       "nodes": 2, "gpus": 4, "pp": 2,
       "container_prefix": "glm51", "index": 2,
+      "storage": "work",
       "description": "GLM-5.1 on vLLM v0.20.0 + RayExecutorV2 (quarantined; same wedge)"
     },
     "glm52": {
@@ -47,6 +58,7 @@
       "model": "RedHatAI/GLM-5.2-FP8",
       "nodes": 3, "gpus": 4, "pp": 3,
       "container_prefix": "glm52", "index": 1,
+      "storage": "work",
       "description": "GLM-5.2 744B MoE+DSA, block-FP8, 3-node TP=4+PP=3"
     },
     "glm47": {
@@ -61,6 +73,7 @@
       "model": "moonshotai/Kimi-K2.6",
       "nodes": 2, "gpus": 4, "pp": 2,
       "container_prefix": "kimi", "index": 4,
+      "storage": "work",
       "description": "Kimi K2.6 1T MoE (32B active), native int4, MLA, multimodal"
     },
     "kimi27": {
@@ -68,6 +81,7 @@
       "model": "moonshotai/Kimi-K2.7-Code",
       "nodes": 2, "gpus": 4, "pp": 2,
       "container_prefix": "kimi", "index": 4,
+      "storage": "work",
       "description": "Kimi K2.7-Code 1T MoE (32B active), native int4 (reuses kimi container)"
     },
     "laguna": {
@@ -75,6 +89,7 @@
       "model": "poolside/Laguna-M.1-FP8",
       "nodes": 1, "gpus": 4, "pp": 1,
       "container_prefix": "laguna", "index": 1,
+      "storage": "projects",
       "description": "Laguna M.1 225B MoE (23B active), block-FP8, single-node TP=4, CUDAGraph on"
     },
     "devstral": {

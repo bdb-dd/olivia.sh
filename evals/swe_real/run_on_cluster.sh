@@ -34,6 +34,10 @@ PRESET="${PRESET:-laguna}"
 ONLY="${ONLY:-}"
 MAXTURNS="${MAXTURNS:-40}"
 GOLD="${GOLD:-}"   # set GOLD=1 to apply gold patches instead of the model (harness self-test)
+# Local listen port for the in-job anthropic_proxy. Override (e.g. 8012) when two
+# eval jobs may share a `small` node — they share the node's localhost, so a fixed
+# 8002 would collide. The router is the single shared endpoint; this is node-local.
+PROXY_PORT="${PROXY_PORT:-8002}"
 
 # Endpoint: prefer the durable router (port 8080; resolves $MODEL — preset name,
 # alias, or served repo id — to the live backend), else a direct vLLM node (:8000).
@@ -52,8 +56,8 @@ apptainer exec --cleanenv --bind /cluster/work "$SIF" bash -c "
 set -e
 cd '$REPO'
 # Compute nodes inherit http_proxy=http://uan03:3128 (squid for internet). urllib
-# would route localhost:8002 and the endpoint host through it (-> 503). Bypass the
-# proxy for local + the endpoint (router or vLLM node); keep it for git/pip.
+# would route localhost:$PROXY_PORT and the endpoint host through it (-> 503). Bypass
+# the proxy for local + the endpoint (router or vLLM node); keep it for git/pip.
 export no_proxy='localhost,127.0.0.1,$ENDPOINT_HOST'
 export NO_PROXY=\"\$no_proxy\"
 # proxy venv (aiohttp); the runner itself is stdlib-only
@@ -61,14 +65,14 @@ export NO_PROXY=\"\$no_proxy\"
 '$WORK/proxyvenv/bin/pip' install -q aiohttp
 # start the Anthropic proxy pointed at the endpoint ($ENDPOINT_KIND; no tunnel needed)
 '$WORK/proxyvenv/bin/python' anthropic_proxy.py --model '$MODEL' \
-    --upstream 'http://$ENDPOINT_HOST:$ENDPOINT_PORT' --listen-port 8002 > '$WORK/proxy-$PRESET.log' 2>&1 &
+    --upstream 'http://$ENDPOINT_HOST:$ENDPOINT_PORT' --listen-port $PROXY_PORT > '$WORK/proxy-$PRESET.log' 2>&1 &
 PROXY=\$!
 # wait for the proxy to accept connections
-python - <<'PY'
+python - <<PY
 import time, urllib.request
 for _ in range(60):
     try:
-        urllib.request.urlopen('http://localhost:8002/v1/models', timeout=3); print('proxy up'); break
+        urllib.request.urlopen('http://localhost:$PROXY_PORT/v1/models', timeout=3); print('proxy up'); break
     except Exception:
         time.sleep(1)
 else:
@@ -76,7 +80,7 @@ else:
 PY
 ONLY_ARG=''; [ -n '$ONLY' ] && ONLY_ARG='--only $ONLY'
 GOLD_ARG=''; [ -n '$GOLD' ] && GOLD_ARG='--gold'
-python evals/swe_real/runner.py --base-url http://localhost:8002 \
+python evals/swe_real/runner.py --base-url http://localhost:$PROXY_PORT \
     --model '$MODEL' --preset '$PRESET' --work '$WORK' --max-turns '$MAXTURNS' \$ONLY_ARG \$GOLD_ARG
 kill \$PROXY 2>/dev/null || true
 "

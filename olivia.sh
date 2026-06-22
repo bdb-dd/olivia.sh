@@ -2210,15 +2210,16 @@ Options:
 Examples:
     ./olivia.sh proxy start            # bring up the durable router
     ./olivia.sh proxy tunnel           # forward localhost:${LOCAL_PORT} to it
-    curl localhost:${LOCAL_PORT}/v1/models      # see which presets are live
+    curl localhost:${LOCAL_PORT}/v1/models      # see which models are live
     python anthropic_proxy.py --model glm51 --upstream http://localhost:${LOCAL_PORT}
 
 Notes:
-    - The router finds each model by its SLURM job name (vllm-server-<preset>),
-      set automatically by 'server start'. Start servers as usual; the router
-      picks them up within ~15s.
-    - The CPU job bills its small reservation while up. Stop it when idle:
-      ./olivia.sh proxy stop
+    - Start GPU servers as usual ('server start'); the router discovers them by
+      probing each running vLLM server's /v1/models, so it works regardless of
+      job naming and picks up new servers within ~15s.
+    - The CPU job bills its small reservation while up. It auto-stops after
+      ROUTER_EMPTY_TIMEOUT seconds (default 1800 = 30 min) with no servers up;
+      stop it sooner with: ./olivia.sh proxy stop
 EOF
 }
 

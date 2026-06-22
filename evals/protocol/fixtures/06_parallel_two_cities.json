@@ -1,0 +1,28 @@
+{
+  "id": "parallel-two-cities",
+  "category": "parallel-tools",
+  "description": "Two independent lookups requested at once with a single-location tool. A strong agent emits two tool_use blocks in one turn; we hard-require at least one valid call and treat the second as bonus (some models serialise across turns). Exercises the proxy's multi-tool_use-in-one-message path.",
+  "request": {
+    "system": "You are a helpful assistant with access to tools. When multiple independent lookups are needed, you may call the tool more than once in a single turn.",
+    "messages": [
+      {"role": "user", "content": "Compare the current weather in Paris and in Tokyo."}
+    ],
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather for a single location.",
+        "input_schema": {
+          "type": "object",
+          "properties": {"location": {"type": "string"}},
+          "required": ["location"]
+        }
+      }
+    ],
+    "max_tokens": 512
+  },
+  "expect": [
+    {"check": "calls_tool", "tool": "get_weather"},
+    {"check": "tool_args_valid", "tool": "get_weather"},
+    {"check": "tool_args_include", "tool": "get_weather", "keys": ["location"]}
+  ]
+}

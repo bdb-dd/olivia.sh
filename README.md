@@ -299,6 +299,87 @@ Recommended config: **capture + NCCL all-reduce** (de-wedged *and* fast). The ea
 
 > Sweep tools: `bench_sweep.py` (concurrency, streaming SSE) and `bench_serving.py` (TTFT + decode). Re-run after any serving-config change and refresh the tables above.
 
+### Agentic behaviour — Laguna M.1 (`laguna`) · 2026-06-20
+
+First live run of the agentic-eval harness (`evals/`, see `plans/proposed/agentic_evals.md`) — measures *behaviour*, not throughput. Driven through `anthropic_proxy.py` (`:8002`) exactly as Claude Code would, against laguna single-node, thinking on, CUDAGraph capture. Serving note: laguna needs `HF_HOME=/cluster/work/...` (project quota is full; the FP8 weights live on `/cluster/work`).
+
+**L0 — protocol / tool-call conformance** (`evals/runner.py protocol`, 8 fixtures × {nonstream, stream}):
+- **Invariant gate (proxy regression): 1562/1562 clean** — the `poolside_v1` tool/reasoning parser translates faithfully in both modes, and the streaming SSE block grammar holds. This is the headline proxy-health result.
+- **Behavioural: 100%** across tool-selection, arg-schema (incl. enum), multi-turn tool_result threading, parallel tools, no-tool-when-unneeded, hallucination guard, and thinking→tool_use ordering.
+
+**L1 — micro-agent tasks** (`evals/runner.py micro`, 8 sandboxed tasks, oracle-verified, `max_turns=14`):
+
+| metric | value |
+|---|---|
+| success (oracle-verified) | **8/8 (100%)** |
+| median turns to solve | 4.5 |
+| premature-stop / runaway / errors | 0 / 0 / 0 |
+| invalid-tool-turns (protocol break mid-loop) | 0 |
+| thrash (repeated identical calls) | 3 (across 2 tasks) |
+
+Per task (turns): write-file 3 · fix-failing-test 7 · implement-fn 6 · find/report 5 · rename-symbol (multi-file) 10 · count-files 4 · fix-syntax 4 · sum-csv 3 — all solved. Laguna drives the multi-turn loop reliably with clean tool-call validity throughout.
+
+**L2 — agentic coding** (`evals/runner.py swe`, 5 harder multi-file tasks, `max_turns=25`): a buggy mini-codebase + problem statement, graded by a **hidden** regression suite written only *after* the loop ends — the agent never sees the test (SWE-bench-style).
+
+| metric | value |
+|---|---|
+| success (oracle-verified) | **5/5 (100%)** |
+| median turns to solve | 5 |
+| premature-stop / runaway / errors / invalid-tool-turns | 0 / 0 / 0 / 0 |
+
+Per task (turns): calc-operator-precedence (wrote a recursive-descent precedence parser) 16 · interval-merge-adjacency 4 · lru-cache-recency 5 · topo-sort-cycle-detection 6 · csv-quoted-field-parsing 4 — all solved against the hidden grader. This slice did **not** find Laguna's ceiling (it's a strong coding agent on well-defined bugs); the real SWE-bench Verified dataset is L2-real below.
+
+**L2-real — SWE-bench Verified** (`evals/swe_real/`): *real* django instances from SWE-bench Verified. Runs as a SLURM job on Olivia's **`small` CPU partition** inside a `python:3.11` apptainer (x86 + internet + reaches the vLLM node over the cluster network → within Sigma2 usage policy; no login-node compute, no GPU waste, no tunnel). Per instance: reset django to the base commit, drive the model through the agent loop to fix the real bug, then apply the gold `test_patch` (the hidden FAIL_TO_PASS/PASS_TO_PASS suite) and run the affected modules. Harness validated by a gold-patch self-test (`--gold`): **12/12** resolve, confirming setup+verify independent of the model.
+
+12-instance django 4.2/5.0 slice · 2026-06-20 (Laguna, `max_turns=40`, ~23 min for all 12):
+
+| metric | value |
+|---|---|
+| **resolved** | **5/12 (42%)** |
+| precision when it edits | **5/5** — every non-empty patch passed the hidden suite |
+| dominant failure mode | **7/7 unresolved made no edit** (patch=0) |
+
+Resolved: 15851, 16255, 16485, 16527, 16801. The signal L1/L2 (both 100%) couldn't give: Laguna's **fixes are reliable** (5/5 correct), but **7/7 failures made no edit at all**.
+
+Two controlled follow-ups, both **refuting easy levers** (logged here because negative results are data):
+
+- **Turn budget** (`max_turns` 40→80 on the 7 no-edit instances): **0/7, still `patch=0`** — 6 ran the full 80 turns without editing, one *stopped* at 30 declaring done. Doubling the budget changed nothing → not a budget problem.
+- **Force-an-edit scaffolding** (stronger "you MUST edit" prompt + a guard refusing to stop on an empty diff): **3/12 — *worse* than baseline.** The guard never fired (`nudges=0`: the failure is exploring to the cap, not voluntarily stopping), and the stronger prompt **backfired** — it broke 2 instances that resolved at baseline (a correct 549-byte fix → a wrong 1271-byte one; a 772-byte fix → no edit at all), trading Laguna's precision for hasty wrong edits. **Reverted.**
+
+Takeaway: Laguna's careful "edit only when confident → 5/5 precision" is a *strength*, not a bug to scaffold away; the real bottleneck is bug **localization**, which neither more turns nor edit-forcing addresses. A legitimate real-benchmark number (SWE-bench Verified is hard). Slice is django-only (the tractable subset on this cluster — no per-instance Docker); broadening repos/instances and adding glm52/kimi27 is next.
+
+**Reference — Poolside's own published result.** Poolside reports Laguna M.1 at **72.5% on the full SWE-bench Verified** (500 instances), using the Laude Institute **Harbor framework with their production agent harness** (up to 500 steps, sandboxed), temperature 0.7, **mean pass@1 averaged over 4 runs**. **Our 42% is *not* directly comparable**: 12 django-only instances driven by a deliberately minimal read/write/grep/bash loop (no planning/retry/localization scaffold), temp 0, single run. The bulk of the gap (~72% production-agent vs ~42% bare-loop) is almost certainly the **agent harness, not the model** — which *corroborates* our finding above: Laguna's fixes are precise (5/5) and the binding constraint is the loop's ability to localize + drive it to an edit. A like-for-like number would need their harness on the full set; this slice measures *Laguna-under-our-minimal-agent*, which is the honest thing the in-house stack can produce.
+
+**Swapping the agent — mini-swe-agent (the hypothesis test) · 2026-06-20.** We re-ran the *same 12 instances* with [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) (SWE-agent's real open agent — ~74% on Verified with frontier models, and the agent class Laguna was explicitly trained on) in place of our minimal loop — same model, same gold-validated verify, litellm → vLLM's OpenAI endpoint directly (`evals/swe_real/mini_runner.py`, `LocalEnvironment` inside the apptainer, no proxy since it uses bash-in-markdown not tool-calls).
+
+| harness (same Laguna · same 12 · same verify) | resolved |
+|---|---|
+| our minimal read/write/grep/bash loop | 5/12 (42%) |
+| **mini-swe-agent** (real open agent) | **7/12 (58%)** |
+| *(ref)* Poolside production agent — full 500, 4-run avg | 72.5% |
+
+Only the harness changed, and it **kept all 5 bare-loop wins and converted 2 prior failures** (15863, 16901). More importantly it **dissolved the failure mode**: the bare loop's 7/7 failures all made *no edit* (`patch=0`); mini-swe-agent makes real edits on all but 2 (most remaining failures now hit the step cap mid-fix, so a higher cap likely recovers 1–2 more). The ladder **42% → 58% → 72.5%, same model throughout**, confirms the gap is mostly **agent harness, not model**, and reconciles the earlier results: a *well-designed* agent raises edit-rate without sacrificing correctness, whereas crudely *forcing* edits (the scaffolding experiment) hurt. (Server note: the first attempt was truncated when Laguna hit its 8h SLURM wallclock mid-run; restarted and re-ran the affected instances — final numbers are contamination-free.)
+
+**Cross-model sweep — bare loop, all via the router · 2026-06-22.** The first apples-to-apples cross-model comparison the router enables: same 12-instance django slice, same minimal read/write/grep/bash loop, temp 0, `max_turns=40`, each model driven through the durable router (`anthropic_proxy → model_router → backend`; one endpoint, change `MODEL`). glm52 + kimi27 were served **concurrently** and both eval jobs routed through the one `c1-4:8080` endpoint at once (distinct in-job proxy ports), zero routing errors.
+
+| model (bare loop · same 12 · temp 0 · max_turns=40) | resolved | terminate-on-edit (`stopped`) | wall |
+|---|---|---|---|
+| **glm52** — 744B MoE+DSA, FP8, 3-node eager | **7/12 (58%)** | 9/12 | 2h52m |
+| laguna — 225B MoE, FP8, 1-node (CUDAGraph) | 5/12 (42%) | — | ~23m |
+| kimi27 — 1T MoE (32B act), int4, 2-node eager | 3/12 (25%) | 3/12 | ~31m |
+
+- **glm52 leads, and behaves like a *decisive* agent** — it commits an edit and stops on 9/12 (only its failures explore to the cap), the mirror image of kimi27's 9/12 explore-to-`max_turns`. Same harness, same bottleneck (localization→edit), very different model behaviour against it.
+- Resolved sets: glm52 `{16255,16485,16527,16642,16801,16901,16950}` · laguna `{15851,16255,16485,16527,16801}` · kimi27 `{15851,16255,16485}`. All three land `16255`+`16485`; glm52 uniquely resolves `16642/16901/16950`.
+- **Wall-clock is dominated by eager multi-node decode driving a *single* request stream** — the sequential benchmark batches nothing (glm52 per-instance ranged 39 s … 28 min). **Fixed by `CONCURRENCY=K`** (`run_on_cluster.sh` → `runner.py --concurrency K`): runs K instances in parallel, each in its own clone/venv, through one auto-`--no-serialize` `anthropic_proxy` → router → so the vLLM host batches K request streams (~K× on a model that batches well; one stable endpoint, the router fans nothing extra). Orchestration validated offline (`evals/swe_real/test_concurrency.py`, 11/11: true N-way parallelism, isolated slots, resume-safe). **Validated live on laguna · 2026-06-22 — `CONCURRENCY=8`: the 12 ran in 6.3 min vs ~23 min sequential (~3.6× end-to-end; the *inference* went ~23 → ~3.3 min, ≈7×, the rest being one-time 8-slot setup that amortizes on bigger runs).** Slots stayed isolated (12 ran once, all valid, 0 errors). One honest caveat: results are **stochastic, not bit-reproducible** vs sequential — cc8 resolved 6/12 `{15851,15863,16255,16485,16527,16901}` vs the sequential 5/12 `{15851,16255,16485,16527,16801}` (4 shared), and every instance ran the full 40 turns rather than stopping early. That's **vLLM batching nondeterminism** (8 FP8-MoE streams reduce/route differently than one → different temp-0 trajectories), inherent to exploiting batching — not slot contamination. So treat `--concurrency K` as a *faster stochastic sample*, not a reproduction of the sequential run. On multi-node PP models raise K above ~4 only after confirming no concurrent-decode wedge (the glm51 `Running ≥ 2` deadlock). mini-swe-agent on the multi-node models was deferred separately — the bare loop's `anthropic_proxy` gives the serialization+keepalive that wedge-prone multi-node PP models want and the litellm→router path lacks.
+
+> **Serving gotcha surfaced here:** a recent move of laguna's HF weights left **7 of 45 shards missing**, so vLLM hung ~30 min at "Starting to load model" silently **re-downloading them on the GPUs**. Fix: cancel the GPU job, complete + size-verify the weights with the **login-node `prefetch`** (never download inside a GPU allocation), clear stale `*.incomplete` orphans, then re-serve. Always `prefetch` after moving weights between filesystems.
+
+**Routing via the durable router.** The L2-real cluster scripts are router-aware: set `ROUTER_NODE=<small-node>` to drive the model through the durable [multi-model router](#proxy-module-durable-multi-model-router) on `:8080` (it resolves `MODEL` — preset name, alias, or repo id — to the live backend), or keep `GPU_NODE=<head>` to hit a single vLLM node directly on `:8000`. The router turns the cross-model sweep into "serve N models, change `MODEL`" against one stable endpoint. `evals/router_smoke.py` validates the whole path **offline** (the real `anthropic_proxy` → real `model_router` → a stub vLLM: routing by preset name/alias, model rewrite to the served id, 404/503 contract, streaming): **16/16**.
+>
+> **Validated live on-cluster · 2026-06-22** (also the router's first real bring-up). The router came up on the `small` partition and **probe-discovered the laguna backend**, and the bare loop reproduced **2/2** (`django-16485`, `16527`) driving each through `anthropic_proxy → router(c1-4:8080) → laguna(gpu-1-5:8000) → edit → verify`. First bring-up also surfaced and fixed a router bug: the `small` nodes' system `python3` is **3.6** (too old for `model_router.py`'s `from __future__ import annotations`), so `run_proxy.sh` now autodetects a ≥3.9 interpreter (`python3.11`/`3.12` are present at `/usr/bin`).
+
+> Eval tools: `evals/runner.py {protocol,micro,swe}` (L0/L1/L2, in-repo); `evals/swe_real/run_on_cluster.sh` (L2-real, our loop) and `evals/swe_real/run_mini_on_cluster.sh` (L2-real, mini-swe-agent) — SLURM on `small`, each taking `ROUTER_NODE` (router) or `GPU_NODE` (direct). Offline self-tests: `evals/{protocol,micro}/selftest.py`, `evals/router_smoke.py`; L2-real harness self-test: `--gold`. Re-run per preset after any proxy/serving change; results in `evals/results/` (L0–L2) and `/cluster/work/.../swe/` (L2-real).
+
 ## Direct Script Usage
 
 The underlying scripts can be used directly on the cluster without the CLI:

@@ -2578,7 +2578,31 @@ PARTITION="accel"
 RED='\033[1;31m'; YEL='\033[1;33m'; GRN='\033[1;32m'; BLU='\033[1;34m'
 MAG='\033[1;35m'; CYA='\033[1;36m'; BLD='\033[1m'; RST='\033[0m'
 
-printf "\n${MAG}Olivia Cluster Utilization (partition=${PARTITION})${RST}\n\n"
+# --- GPU-hour allocation (NRIS `cost`) ---------------------------------------
+# The project's GPU-hour budget for the current allocation period, shown in the
+# title line so the burn rate is visible at a glance. `cost` (login-node tool)
+# reports "Quota (pri)" = the granted GPU hours (total) and "Available" =
+# Quota - Used - Running - Pending (remaining). Round to whole hours. Color by
+# remaining fraction (green >25%, yellow 10-25%, red <10%). If `cost` is absent
+# or unparseable, the suffix is simply omitted and the title is unchanged.
+gpu_hours_str=""; gpu_hours_color="$GRN"
+if command -v cost >/dev/null 2>&1; then
+    parsed=$(cost 2>/dev/null | awk '
+        /Quota \(pri\)/ { t = $NF }
+        $2 == "Available" { r = $NF }
+        END {
+            if (t == "" || r == "") exit
+            f = (t > 0) ? r / t : 1
+            sev = (f < 0.10) ? "red" : ((f < 0.25) ? "yel" : "grn")
+            printf "[GPU hours: %d remaining / %d total]|%s", r + 0.5, t + 0.5, sev
+        }')
+    if [ -n "$parsed" ]; then
+        gpu_hours_str=${parsed%|*}
+        case "${parsed##*|}" in (red) gpu_hours_color="$RED";; (yel) gpu_hours_color="$YEL";; esac
+    fi
+fi
+
+printf "\n${MAG}Olivia Cluster Utilization (partition=${PARTITION})${RST}${gpu_hours_str:+ ${gpu_hours_color}${gpu_hours_str}${RST}}\n\n"
 
 # --- 1. Your jobs ------------------------------------------------------------
 printf "${BLU}==>${RST} ${BLD}Your jobs${RST}\n"
@@ -3082,8 +3106,9 @@ cmd_cluster_help() {
     cat <<EOF
 Usage: ./olivia.sh cluster [--watch] [--interval SECS]
 
-Show a snapshot of Olivia's accel partition: your jobs, GPU availability,
-queue depth, top blockers, and active reservations.
+Show a snapshot of Olivia's accel partition: the project's remaining GPU-hour
+budget (title line), your jobs, GPU availability, queue depth, top blockers,
+and active reservations.
 
 Options:
     -w, --watch              Refresh continuously (Ctrl-C to stop)

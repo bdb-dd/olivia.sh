@@ -298,19 +298,31 @@ merge cleanly onto `main`.
 - `bash -n` clean on `olivia.sh` and `run_proxy.sh`; cross-module imports OK; all
   `LOGIN_PROXY` references removed.
 
-## 6. Remaining on-cluster validation
+## 6. On-cluster validation
 
-- [ ] `python3` + `venv` + `pip` work on a `small` node, and the NRIS HTTP proxy
-      reaches PyPI for the one-time `aiohttp` install (run_proxy.sh `[setup]`).
-- [ ] A `small` node's listening socket is reachable from the login node and from
-      `accel` nodes (expected: yes, internal fabric) — `proxy tunnel` then `curl
-      localhost:8003/v1/models`.
-- [ ] The router can reach `gpu-node:8000/v1/models` over the internal fabric
-      (probe), and `scontrol show hostnames` head-node expansion matches a real
-      2-/3-node job.
-- [ ] End-to-end: `proxy start` → `server start glm51` + `server start laguna` →
-      `proxy tunnel` → route both models through the one endpoint by name.
-- [ ] Auto-spindown fires after 30 min with no servers (and not while one is up).
+Validated live 2026-06-22 by the agentic-evals harness (cross-model SWE sweep
+routed through the router on `c1-4:8080`):
+
+- [x] `python3` + `venv` + `pip` work on a `small` node and the NRIS HTTP proxy
+      reaches PyPI — **after** the fix below. (First bring-up failed: the small
+      nodes' system `python3` is 3.6.15, too old for `model_router.py`; fixed by
+      `run_proxy.sh` autodetecting a ≥3.9 interpreter — commit `a3d4954`.)
+- [x] The router reaches `gpu-node:8000/v1/models` over the internal fabric
+      (probe discovery surfaced the laguna backend), and a `small` node's socket
+      is reachable from other compute nodes (the eval jobs ran on `small` nodes
+      and hit `c1-4:8080`).
+- [x] Multi-model routing, **concurrent**: glm52 + kimi27 served at once, both
+      eval jobs routed through the one endpoint by model name (glm52 7/12,
+      laguna 5/12, kimi27 3/12).
+
+Still to confirm:
+
+- [ ] Auto-spindown actually fires 30 min after the last server stops (and not
+      while one is up). The `no_proxy` hardening in `run_proxy.sh` lands first so
+      the next run exercises a clean router.
+- [ ] The laptop → login-node → `proxy tunnel` → router path (the 2026-06-22
+      sweep was entirely cluster-side, so this human/Claude-Code path is untested).
+- [ ] Token auth (`OLIVIA_PROXY_TOKEN`).
 - [ ] Ask NRIS (Option D): is a multi-day `small` proxy job acceptable use, and
       is there a supported persistent-service path?
 

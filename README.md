@@ -184,8 +184,43 @@ curl localhost:8003/v1/models  # See which presets are currently live
 
 > Compute nodes aren't internet-facing, so the laptop still tunnels in through
 > the login node — but the tunnel target (the `small` node) is now stable for the
-> job's lifetime instead of moving on every GPU job restart. On-cluster
-> validation is pending (see the plan doc's checklist).
+> job's lifetime instead of moving on every GPU job restart. Live-validated
+> 2026-06-22: a cross-model eval sweep routed glm52 + kimi27 concurrently through
+> one router endpoint (see the plan doc's checklist for what's left).
+
+#### Using the proxy (clients)
+
+The router is an **OpenAI-compatible** HTTP endpoint. Reach it at:
+
+- **In-cluster** (e.g. an eval/batch job on another node): `http://<router-node>:8080`
+  directly — no tunnel. Find the node with `./olivia.sh proxy status`.
+- **From a laptop**: `./olivia.sh proxy tunnel`, then `http://localhost:8003`.
+
+Pick the model with the request's **`model` field** — a preset name (`glm51`,
+`kimi27`, `laguna`, ...), an alias, or the served repo id. `GET /v1/models` lists
+what's live right now. Supported paths: `/v1/chat/completions`, `/v1/completions`,
+`/v1/models`.
+
+```bash
+# Discover what's live
+curl http://localhost:8003/v1/models
+
+# OpenAI-compatible client (Python)
+#   from openai import OpenAI
+#   c = OpenAI(base_url="http://localhost:8003/v1", api_key="x")   # api_key unused unless OLIVIA_PROXY_TOKEN set
+#   c.chat.completions.create(model="glm51", messages=[...])      # "glm51" -> live backend
+
+# Anthropic clients / Claude Code — front the router with anthropic_proxy.py:
+python anthropic_proxy.py --model glm51 --upstream http://localhost:8003
+export ANTHROPIC_BASE_URL=http://localhost:8002 ANTHROPIC_AUTH_TOKEN=x && claude
+```
+
+> **In-cluster clients:** compute nodes inherit an `http_proxy` (squid) for
+> internet egress — it will wrongly route `localhost` and the router/backend host
+> through squid (→ 503). Set `no_proxy=localhost,127.0.0.1,<router-node>` (or
+> unset `http_proxy`) in the client before calling the router. (The router job
+> itself already does this.) If `OLIVIA_PROXY_TOKEN` is set on the router, send it
+> as a `Bearer` token / `x-api-key`.
 
 ## Model Presets
 

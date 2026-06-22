@@ -105,6 +105,14 @@ fi
 "${VENV_PY}" -c "import aiohttp; print('[setup] aiohttp', aiohttp.__version__)"
 
 # -- launch the router --------------------------------------------------------
+# Drop the squid proxy env we set above for `pip`. The router only talks to vLLM
+# backends over the internal fabric (and localhost) — never the internet — so it
+# must NOT route through the compute-node HTTP proxy. aiohttp ignores *_proxy by
+# default (trust_env=False), so this is belt-and-suspenders today, but it keeps
+# the router correct if a future HTTP client honors *_proxy: such a client would
+# otherwise send gpu-node:8000 / localhost through squid and get 503s (this bit
+# the in-cluster eval clients, which had to set no_proxy for exactly this).
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 # exec so SLURM signals (scancel, walltime) reach the python process directly.
 cd "${ROUTER_DIR}"
 echo "[run] starting router on $(hostname):${ROUTER_PORT}"

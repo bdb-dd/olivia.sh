@@ -39,7 +39,21 @@ ROUTER_PORT="${ROUTER_PORT:-8080}"
 ROUTER_BACKEND_PORT="${ROUTER_BACKEND_PORT:-8000}"   # port each vLLM server listens on
 ROUTER_EMPTY_TIMEOUT="${ROUTER_EMPTY_TIMEOUT:-1800}" # auto-shutdown after Ns with no GPU servers (0 disables)
 ROUTER_VENV="${ROUTER_VENV:-$HOME/.olivia/router-venv}"
-PYTHON="${PYTHON:-python3}"
+
+# The router needs Python >= 3.9 (model_router.py uses `from __future__ import
+# annotations` + modern asyncio). On Olivia's `small` nodes the system `python3`
+# is 3.6 — too old — but `python3.11` / `python3.12` are present at /usr/bin.
+# Autodetect a new-enough interpreter (override with PYTHON=...).
+_py_ok() { "$1" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 9) else 1)' >/dev/null 2>&1; }
+if [[ -z "${PYTHON:-}" ]]; then
+    for _cand in python3.12 python3.11 python3.10 python3.9 python3; do
+        if command -v "${_cand}" >/dev/null 2>&1 && _py_ok "${_cand}"; then PYTHON="${_cand}"; break; fi
+    done
+fi
+if [[ -z "${PYTHON:-}" ]] || ! _py_ok "${PYTHON}"; then
+    echo "ERROR: no Python >= 3.9 found (system python3 is $(python3 --version 2>&1)). Set PYTHON=<path>." >&2
+    exit 1
+fi
 
 # Compute nodes reach the internet only via the NRIS HTTP proxy; needed for the
 # one-time `pip install aiohttp`. Pre-set values win (e.g. site changes the IP).
@@ -54,6 +68,7 @@ echo " Router dir:  ${ROUTER_DIR}"
 echo " Listen port: ${ROUTER_PORT}  (backends: vLLM :${ROUTER_BACKEND_PORT})"
 echo " Spindown:    $([ "${ROUTER_EMPTY_TIMEOUT}" -gt 0 ] 2>/dev/null && echo "after ${ROUTER_EMPTY_TIMEOUT}s with no GPU servers" || echo 'disabled')"
 echo " Venv:        ${ROUTER_VENV}"
+echo " Python:      $(${PYTHON} --version 2>&1) (${PYTHON})"
 echo " Auth:        $([ -n "${OLIVIA_PROXY_TOKEN:-}" ] && echo 'token required' || echo 'open (internal network)')"
 echo "================================================================"
 
@@ -66,10 +81,16 @@ fi
 # -- ensure an aiohttp venv (tiny; reused across restarts) --------------------
 # Mirrors the prefetch venv pattern: a throwaway stdlib venv with one dep. The
 # router code itself is stdlib + aiohttp only.
+# Recreate the venv if it's missing or was built from a too-old python (e.g. a
+# stale 3.6 venv from before this autodetect — its bin/python would still fail).
+if [[ -x "${ROUTER_VENV}/bin/python" ]] && ! _py_ok "${ROUTER_VENV}/bin/python"; then
+    echo "[setup] existing venv python is too old ($("${ROUTER_VENV}/bin/python" --version 2>&1)) — recreating"
+    rm -rf "${ROUTER_VENV}"
+fi
 if [[ ! -x "${ROUTER_VENV}/bin/python" ]]; then
-    echo "[setup] creating router venv at ${ROUTER_VENV}"
+    echo "[setup] creating router venv at ${ROUTER_VENV} (with ${PYTHON})"
     if ! "${PYTHON}" -m venv "${ROUTER_VENV}"; then
-        echo "ERROR: failed to create venv (is python3 + venv available on the node?)" >&2
+        echo "ERROR: failed to create venv (is ${PYTHON} + venv available on the node?)" >&2
         exit 1
     fi
 fi

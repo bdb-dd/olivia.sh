@@ -61,6 +61,14 @@
       "storage": "work",
       "description": "GLM-5.2 744B MoE+DSA, block-FP8, 3-node TP=4+PP=3"
     },
+    "glm52_awq": {
+      "aliases": ["glm-5.2-awq", "glm5.2-awq", "glm52awq", "glm52-awq"],
+      "model": "cyankiwi/GLM-5.2-AWQ-INT4",
+      "nodes": 2, "gpus": 4, "pp": 2,
+      "container_prefix": "glm52", "index": 1,
+      "storage": "projects",
+      "description": "GLM-5.2 744B MoE+DSA, AWQ-INT4 (~415 GiB), 2-node TP=4+PP=2 (reuses the glm52 container; persistent tier)"
+    },
     "glm47": {
       "aliases": ["glm-4.7"],
       "model": "QuantTrio/GLM-4.7-AWQ",

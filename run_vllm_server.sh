@@ -416,9 +416,12 @@ if [[ "${MODEL,,}" == *"-awq"* ]] || [[ "${MODEL,,}" == *"awq"* ]]; then
     IS_AWQ=1
 fi
 
-# GLM-5.1 AWQ: swap the MoE flashinfer kernel variant
-# (QuantTrio recipe uses MOE_FP16 for GLM-5-AWQ, not MOE_FP8 like GLM-4.7-AWQ)
-if [[ "${IS_GLM51}" == "1" && "${IS_AWQ}" == "1" ]]; then
+# GLM-5.x AWQ: swap the MoE flashinfer kernel variant. The QuantTrio/cyankiwi
+# GLM-5-AWQ recipe uses MOE_FP16 (not MOE_FP8 like GLM-4.7-AWQ). GLM-5.2-AWQ
+# (cyankiwi/GLM-5.2-AWQ-INT4) is the same GlmMoeDsa MoE family as GLM-5.1-AWQ,
+# so it inherits the same kernel choice — hence IS_GLM5 (both 5.1 and 5.2), not
+# IS_GLM51 alone. (UNVERIFIED on GLM-5.2-AWQ specifically — confirm on first serve.)
+if [[ "${IS_GLM5}" == "1" && "${IS_AWQ}" == "1" ]]; then
     export VLLM_USE_FLASHINFER_MOE_FP8=0
     export VLLM_USE_FLASHINFER_MOE_FP16=1
 fi
@@ -453,16 +456,26 @@ if [[ "${IS_GLM52}" == "1" && "${IS_AWQ}" == "0" ]]; then
     if [[ "${_RAYV2_EXPLICIT}" == "0" ]]; then
         VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1
     fi
-    # Custom PP layer partition (PP=3 only). GLM-5.2's DSA skip-topk layer at a
-    # pipeline-stage boundary trips `KeyError: model.layers.<N>.self_attn.attn`
-    # in get_attn_backends_for_group on the default even split (78/3 → boundary
-    # at layer 52, a skip-topk layer). 26/24/28 moves the boundaries to layers
-    # 0/26/50 — all FULL-indexer layers (full when max(L-2,0) % index_topk_freq
-    # == 0) — which gets init all the way to a live server. (Decode then still
-    # hits the multi-node PP wedge; see CLAUDE.md. Necessary, not sufficient.)
-    if [[ "${PP_SIZE}" == "3" ]]; then
-        VLLM_PP_LAYER_PARTITION="${VLLM_PP_LAYER_PARTITION:-26,24,28}"
-    fi
+fi
+
+# GLM-5.2 PP boundary alignment (BOTH the FP8 and AWQ variants). GLM-5.2's DSA
+# skip-topk indexer trips `KeyError: model.layers.<N>.self_attn.attn` in
+# get_attn_backends_for_group when a pipeline-stage boundary lands on a skip-topk
+# layer. This is ARCHITECTURAL (the indexer), independent of the weight quant, so
+# it applies to FP8 (PP=3) and AWQ (PP=2) alike. 78 layers total; layer L is a
+# FULL-indexer layer when max(L-2,0) % index_topk_freq(4) == 0, and every stage's
+# first layer must be full. Only set a default when the user hasn't pinned one.
+#   PP=3: 26,24,28 → stages start at 0/26/50 (all full) — VALIDATED on FP8 3-node.
+#         (The default even split 78/3 starts stage 2 at layer 52, a skip-topk
+#          layer, which is what originally tripped the KeyError.)
+#   PP=2: 38,40    → stages start at 0/38 (L=38 is full). The even split (39/39)
+#         starts stage 1 at layer 39, a skip-topk layer → KeyError. UNVERIFIED —
+#         confirm on the first AWQ 2-node serve; fall back to 42,36 if 38 misses.
+if [[ "${IS_GLM52}" == "1" && -z "${VLLM_PP_LAYER_PARTITION:-}" ]]; then
+    case "${PP_SIZE}" in
+        3) VLLM_PP_LAYER_PARTITION="26,24,28" ;;
+        2) VLLM_PP_LAYER_PARTITION="38,40"    ;;
+    esac
 fi
 
 # Resolve attention backend default. FLASH_ATTN is the right choice for

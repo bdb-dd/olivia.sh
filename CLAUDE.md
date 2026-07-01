@@ -129,6 +129,7 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 | `glm51_v19` (alias `glm51`) | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | TP=4 + PP=2, vLLM v0.19.0, container index 1. **Defaults to PIECEWISE CUDAGraph capture** (NGC-26.03 rebuild): de-wedged via NCCL all-reduce, ~22 tok/s/stream, 0-fail 1→64. The old serialization workaround is no longer needed. |
 | `glm51_v20` | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | Same as glm51_v19 but on vLLM v0.20.0 + RayExecutorV2, container index 2. **Quarantined** — same wedge as v0.19.0; kept for diagnostic work only. |
 | `glm52` | `RedHatAI/GLM-5.2-FP8` | 12 (3 nodes × 4) | TP=4 + PP=3. Block-FP8 (~755 GB) — does **not** fit 8 GPUs, hence 3 nodes. **Needs vLLM main `091386a` (pinned) + PR#45895** (new skip-topk DSA indexer); not in any release. Same multi-node PP wedge as glm51 → proxy serialization. fp8 KV cache + DeepGEMM (`VLLM_DEEP_GEMM_WARMUP=skip`). |
+| `glm52_awq` (aliases `glm-5.2-awq`, `glm52awq`) | `cyankiwi/GLM-5.2-AWQ-INT4` | 8 (2 nodes × 4) | TP=4 + PP=2. **AWQ-INT4 (~415 GiB)** — fits 8×GH200 (the preferred path over 3-node FP8), **persistent** (projects) tier. **Reuses the glm52 container** (same vLLM main + PR#45895 + DeepGEMM — the DSA indexer needs are architectural, not FP8-specific); build `glm52`, serve `glm52_awq`. Same GLM-5.2 sparse-MLA → **bf16 KV** (no fp8 KV on GH200), eager. **Untested on-cluster:** MoE-FP16 kernel + the PP=2 indexer-aligned layer partition (`38,40`) need first-serve verification; multi-node PP wedge applies → proxy serialization. |
 | `glm47` | `QuantTrio/GLM-4.7-AWQ` | 4 | TP=4, MTP speculative |
 | `kimi` | `moonshotai/Kimi-K2.6` | 8 (2 nodes × 4) | TP=4 + PP=2, native int4, MLA, multimodal, vLLM v0.19.1 |
 | `laguna` | `poolside/Laguna-M.1-FP8` | 4 | TP=4, single node. FP8 (~225 GB), dense full attention (FLASH_ATTN), CUDAGraph capture on. vLLM v0.21.0, `poolside_v1` parsers. |
@@ -570,12 +571,12 @@ GLM-5.2 is the successor to GLM-5.1: same `GlmMoeDsaForCausalLM` MoE+DSA archite
 
 **Patch-during-build (`VLLM_PATCHES`):** `build_vllm_gh200.sh` takes a space-separated list of vLLM PR numbers (`VLLM_PATCHES`, defaulting to the preset's `PRESET_VLLM_PATCHES`). In Phase 3, after cloning vLLM (at the pinned commit) and before the `pip install .` compile, it `git apply`s each PR's cumulative diff to `/opt/vllm` — from the committed `patches/` snapshot if present (preferred, reproducible), else fetched live from `github.com/vllm-project/vllm/pull/<N>.diff`. The step is **idempotent** (a reverse-apply check skips PRs already present — e.g. once one merges into main) and **fails the build loudly** if a diff no longer applies cleanly (rather than compiling a half-patched tree). PR#45895 is pure Python (9 files), so no kernel recompile is triggered. Validated 2026-06-17: the diff applies cleanly to the pinned base (main `091386a`, the commit the deployed glm52 container built from). A snapshot lives at `patches/vllm-pr45895-glm52-indexer.diff`; `olivia.sh build` deploys `patches/` alongside the build script and binds it read-only at `/opt/olivia-patches`, and the build **prefers the committed snapshot** (reproducible + offline), falling back to the **live** GitHub PR fetch only when no snapshot is bound in. **When PR#45895 merges:** drop `"45895"` from `PRESET_VLLM_PATCHES` (the idempotent apply tolerates it in the meantime), or build with `VLLM_PATCHES=""`.
 
-**Why 3 nodes (not 2 like glm51):** the only quant available today is block-FP8 (`zai-org/GLM-5.2-FP8`, or the byte-identical re-host `RedHatAI/GLM-5.2-FP8`), ~755 GB. At ~94 GB/GPU that does **not** fit 8×GH200 (96 GB cards). Spreading across **3 nodes × 4 GPUs (TP=4 + PP=3 = 12 GPUs)** drops weights to ~63 GB/GPU, leaving ~18 GB/GPU for KV. When a `GLM-5.2-AWQ-4bit` (~430 GB) is eventually published, the 8-GPU / 2-node path returns and is preferred — repoint the preset model and set `nodes=2 pp=2`.
+**Why 3 nodes (not 2 like glm51):** the only quant available today is block-FP8 (`zai-org/GLM-5.2-FP8`, or the byte-identical re-host `RedHatAI/GLM-5.2-FP8`), ~755 GB. At ~94 GB/GPU that does **not** fit 8×GH200 (96 GB cards). Spreading across **3 nodes × 4 GPUs (TP=4 + PP=3 = 12 GPUs)** drops weights to ~63 GB/GPU, leaving ~18 GB/GPU for KV. **Now published (2026-07):** `cyankiwi/GLM-5.2-AWQ-INT4` (~415 GiB) restores the **8-GPU / 2-node** path (TP=4 + PP=2) — the preferred shape — wired as the separate **`glm52_awq`** preset (persistent tier, reuses the glm52 container). See "GLM-5.2 AWQ" below.
 
 | Quantization | Model | Size | Olivia fit |
 |--------------|-------|------|------------|
 | block-FP8 (e4m3, [128,128]) | `zai-org/GLM-5.2-FP8` / `RedHatAI/GLM-5.2-FP8` | ~755 GB | **3 nodes × 4 GH200** (TP=4 + PP=3); 8 GPUs won't fit |
-| AWQ-4bit | — | ~430 GB | Does **not exist yet** (would be the preferred 2-node / 8-GPU path) |
+| AWQ-INT4 | `cyankiwi/GLM-5.2-AWQ-INT4` | ~415 GiB | **Yes — preset `glm52_awq`, 2 nodes × 4 GH200** (TP=4 + PP=2); the **preferred** path (fits 8 GPUs, persistent tier). Published by the same cyankiwi author as the GLM-5.1 AWQ; same `GlmMoeDsa` arch. |
 | NVFP4 | `Lorbus/GLM-5.2-NVFP4` etc. | — | **No** — needs Blackwell FP4 tensor cores |
 | BF16 | `zai-org/GLM-5.2` | ~1.5 TB | No — 16+ GPUs |
 
@@ -609,6 +610,54 @@ GLM-5.2 is the successor to GLM-5.1: same `GlmMoeDsaForCausalLM` MoE+DSA archite
 
 # Check whether a 3-node shape can schedule right now
 ./olivia.sh cluster
+```
+
+### GLM-5.2 AWQ (preset `glm52_awq`) — INT4, 2-node 8×GH200 (preferred)
+
+`cyankiwi/GLM-5.2-AWQ-INT4` (~415 GiB, 83 safetensors, MIT) is the AWQ-INT4
+re-host from the same author as `cyankiwi/GLM-5.1-AWQ-4bit`. Same
+`GlmMoeDsaForCausalLM` MoE+DSA arch as the FP8 variant (including the new
+skip-topk indexer), so it needs the **same container** as `glm52` — vLLM main
+`091386a` + PR#45895 + DeepGEMM `88965b0` — because those requirements are
+**architectural (the DSA indexer), not FP8-specific**. So there is **no separate
+build**: build `glm52`, serve `glm52_awq` (the kimi/kimi27 pattern). At ~415 GiB
+it **fits 8×GH200** (~52 GB/GPU weights, ~44 GB/GPU free for KV), restoring the
+**2-node TP=4 + PP=2** path — preferred over the 3-node FP8 — and it fits the
+persistent 1 TiB project quota, so `storage: projects` (not the FP8's `work`).
+
+| Quantization | Model | Size | Olivia fit |
+|--------------|-------|------|------------|
+| AWQ-INT4 | `cyankiwi/GLM-5.2-AWQ-INT4` | ~415 GiB | **2 nodes × 4 GH200** (TP=4 + PP=2) — preferred |
+| block-FP8 | `RedHatAI/GLM-5.2-FP8` | ~755 GB | 3 nodes × 4 (preset `glm52`) |
+
+**Runtime deltas from the FP8 path** (auto-applied via `IS_GLM52` + `IS_AWQ`):
+the FP8-only block (DeepGEMM, RayExecutorV2 engine-as-actor, PP=3 partition) is
+guarded `IS_AWQ==0` and correctly **skips** for AWQ. AWQ instead gets the GLM-5
+AWQ MoE-FP16 flashinfer kernel (`VLLM_USE_FLASHINFER_MOE_FP16=1`), expert
+parallel (auto for AWQ GLM MoE), and the **PP=2** indexer-aligned layer
+partition `VLLM_PP_LAYER_PARTITION=38,40` (a stage boundary must land on a
+full-indexer layer or init dies with `KeyError: model.layers.<N>.self_attn.attn`;
+the even 39/39 split lands on a skip-topk layer). It shares the FP8 path's
+**bf16 KV** (GH200 sparse-MLA `FLASHMLA_SPARSE` rejects fp8 KV) and **eager**
+default (capture IMAs on this NGC stack).
+
+> ⚠️ **Unverified on-cluster (first-serve checklist).** Nothing below has run yet
+> — the preset is wired from the GLM-5.1-AWQ recipe + the FP8 GLM-5.2 findings:
+> 1. **MoE-FP16 kernel** is the right choice for GLM-5.2 AWQ (inherited from 5.1).
+> 2. **PP=2 partition `38,40`** clears the skip-topk `KeyError` (fall back to `42,36`).
+> 3. **Multi-node PP decode wedge** — expect it (as glm51/glm52); mitigate with
+>    proxy serialization, or try glm51's fix (PIECEWISE capture + NCCL all-reduce)
+>    vs glm52-FP8's (RayExecutorV2 engine-as-actor). Which one applies is untested.
+> 4. Confirm the KV budget: `GPU KV cache size: N tokens` ≥ `max-model-len × concurrency`.
+
+```bash
+# 0. Weights already prefetched to the persistent tier (projects):
+./olivia.sh prefetch glm52_awq            # cyankiwi/GLM-5.2-AWQ-INT4 -> /cluster/projects/...
+# 1. Build once (the FP8 preset — same container):
+./olivia.sh build glm52
+# 2. Serve the AWQ variant (2 nodes × 4 GPUs, TP=4 + PP=2):
+./olivia.sh server start glm52_awq
+./olivia.sh server watch
 ```
 
 ### Kimi K2.6 Quantization Options

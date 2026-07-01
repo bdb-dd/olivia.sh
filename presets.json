@@ -69,6 +69,23 @@
       "storage": "projects",
       "description": "GLM-5.2 744B MoE+DSA, AWQ-INT4 (~415 GiB), 2-node TP=4+PP=2 (reuses the glm52 container; persistent tier)"
     },
+    "glm52_awq_1n": {
+      "aliases": ["glm52awq1n", "glm-5.2-awq-1n"],
+      "model": "cyankiwi/GLM-5.2-AWQ-INT4",
+      "nodes": 1, "gpus": 4, "pp": 1,
+      "container_prefix": "glm52", "index": 1,
+      "storage": "projects",
+      "description": "GLM-5.2 AWQ-INT4 SINGLE-node TP=4 via Grace weight offload (--cpu-offload-gb); no PP wedge, long-context experiment. Requires CPU_OFFLOAD_GB (auto-defaults 40)."
+    },
+    "glm52_awq_mtp": {
+      "aliases": ["glm52-awq-mtp", "glm52awqmtp"],
+      "model": "/cluster/projects/nn10104k/models/GLM-5.2-AWQ-INT4-MTP-FP8",
+      "served_model_name": "glm52-awq-mtp",
+      "nodes": 1, "gpus": 4, "pp": 1,
+      "container_prefix": "glm52", "index": 1,
+      "storage": "projects",
+      "description": "GLM-5.2 AWQ-INT4 body + grafted FP8 MTP layer-78 (dnhkng graft of GLM-5.2-FP8). LOCAL-PATH model. Single-node TP=4 + Grace offload + MTP spec-decode (auto-on via 'MTP' in path). Container vLLM MUST carry patches/vllm-awq-fp8-mtp-quant-config.patch (live-patch or rebuild)."
+    },
     "glm47": {
       "aliases": ["glm-4.7"],
       "model": "QuantTrio/GLM-4.7-AWQ",

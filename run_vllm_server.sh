@@ -65,6 +65,7 @@ TP_SIZE="${TP_SIZE:-4}"                    # Tensor parallel size (per-node for 
 PP_SIZE="${PP_SIZE:-1}"                    # Pipeline parallel size (1=single-node, 2=across nodes)
 NUM_NODES="${NUM_NODES:-1}"                # Number of nodes to use (1 or 2)
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"       # GPU memory utilization
+CPU_OFFLOAD_GB="${CPU_OFFLOAD_GB:-}"       # Per-GPU weight offload to CPU/Grace LPDDR5X (GiB); empty=none
 # Ray compiled-DAG step timeout (seconds). Ray v2's default of 300s is too
 # short for multi-node PP inference over Slingshot: a single engine step can
 # run longer than that during big generations, and the raylet hits an
@@ -426,6 +427,17 @@ if [[ "${IS_GLM5}" == "1" && "${IS_AWQ}" == "1" ]]; then
     export VLLM_USE_FLASHINFER_MOE_FP16=1
 fi
 
+# Single-node GLM-5.2 AWQ CANNOT load without weight offload: the ~415 GiB AWQ
+# checkpoint is ~104 GB/GPU across 4 GH200, over the 96 GB HBM before any KV. So
+# default a conservative per-GPU offload when running single-node AWQ GLM-5.2 and
+# the user hasn't pinned one — otherwise the job OOMs at load. The offload SWEEP
+# (plans/proposed/glm52_awq_1n_offload.md) refines this value; 40 is a safe start
+# (~64 GB/GPU resident weights, ~32 GB/GPU freed for bf16 KV).
+if [[ "${IS_GLM52}" == "1" && "${IS_AWQ}" == "1" && "${NUM_NODES}" -le 1 && -z "${CPU_OFFLOAD_GB:-}" ]]; then
+    CPU_OFFLOAD_GB=40
+    echo "[INFO] single-node GLM-5.2 AWQ: defaulting CPU_OFFLOAD_GB=${CPU_OFFLOAD_GB} (weights exceed HBM without offload)"
+fi
+
 # GLM-5.2 FP8: block-wise FP8 ([128,128], e4m3) is the DeepSeek-style quant, so
 # it runs through DeepGEMM on Hopper rather than the AWQ flashinfer-MoE path.
 # Enable DeepGEMM and keep the FP8 (not FP16) MoE kernel. DeepGEMM JIT warmup
@@ -529,10 +541,26 @@ USE_SPECULATIVE=0
 if [[ "${ENABLE_SPECULATIVE}" == "1" ]]; then
     USE_SPECULATIVE=1
 elif [[ "${ENABLE_SPECULATIVE}" == "auto" ]]; then
-    # Auto-enable MTP for GLM-4.7/GLM-5.1 (improves throughput significantly)
-    if [[ "${IS_GLM_MOE}" == "1" ]]; then
+    # Auto-enable MTP for GLM-4.7/GLM-5.1 (improves throughput significantly).
+    # EXCLUDE GLM-5.2: its MTP draft (DeepSeekMTPModel) is loaded as a SECOND full
+    # 83-shard checkpoint pass — doubling an already ~53-min cold load — and MTP on
+    # the new GLM-5.2 DSA arch is unproven here (2-node PP>1 disables it anyway; the
+    # PP=1 single-node offload path auto-enabled it unintentionally, observed
+    # 2026-07-01 job 1424649). Make it opt-in for GLM-5.2 via ENABLE_SPECULATIVE=1.
+    if [[ "${IS_GLM_MOE}" == "1" && "${IS_GLM52}" != "1" ]]; then
         USE_SPECULATIVE=1
         echo "[INFO] Auto-enabling MTP speculative decoding for GLM MoE model"
+    elif [[ "${IS_GLM52}" == "1" && "${MODEL}" == *MTP* ]]; then
+        # GLM-5.2 MTP-GRAFTED checkpoint (dnhkng graft: cyankiwi AWQ body + the FP8
+        # layer-78 MTP head from GLM-5.2-FP8). The plain cyankiwi AWQ checkpoint
+        # DROPPED layer-78 during quantization → MTP init dies (deepseek_mtp.py:480
+        # ValueError, observed job 1424649). Only enable MTP when the checkpoint
+        # path signals the graft ("MTP"), and note: the container's vLLM must carry
+        # the awq+fp8-mtp quant-config patch (patches/vllm-awq-fp8-mtp-quant-config.patch).
+        USE_SPECULATIVE=1
+        echo "[INFO] GLM-5.2 MTP-grafted checkpoint: auto-enabling MTP speculative decoding"
+    elif [[ "${IS_GLM52}" == "1" ]]; then
+        echo "[INFO] GLM-5.2 (non-MTP checkpoint): MTP not auto-enabled — cyankiwi AWQ lacks layer-78 weights. Use an MTP-grafted checkpoint (path contains 'MTP') to enable it."
     fi
 fi
 
@@ -832,6 +860,15 @@ VLLM_ARGS=(
     "--host" "${HOST}"
     "--port" "${PORT}"
 )
+
+# CPU/Grace weight offload (per GPU). On GH200 the offloaded weights live in the
+# Hopper GPU's coherent Grace LPDDR5X and stream back over C2C (~450 GB/s) each
+# forward. This is the lever that lets a model whose per-GPU shard exceeds the
+# 96 GB HBM (e.g. single-node GLM-5.2-AWQ, ~104 GB/GPU) fit — trading some decode
+# latency for HBM freed up for KV. Only emitted when set > 0.
+if [[ -n "${CPU_OFFLOAD_GB:-}" && "${CPU_OFFLOAD_GB}" != "0" ]]; then
+    VLLM_ARGS+=("--cpu-offload-gb" "${CPU_OFFLOAD_GB}")
+fi
 
 # CUDAGraph knob. NONE → disable all compilation (mode=NONE). Anything else →
 # keep compilation enabled and only override cudagraph_mode. Unset → no flag,

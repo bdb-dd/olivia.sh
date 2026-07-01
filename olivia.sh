@@ -1180,6 +1180,7 @@ start_server_job() {
                        VLLM_USE_RAY_V2_EXECUTOR_BACKEND DISABLE_CUSTOM_ALL_REDUCE \
                        VLLM_CACHE VLLM_CACHE_ROOT TRITON_CACHE_DIR \
                        DG_JIT_CACHE_DIR TORCHINDUCTOR_CACHE_DIR \
+                       CPU_OFFLOAD_GB ENABLE_EXPERT_PARALLEL KV_CACHE_DTYPE \
                        VLLM_PP_LAYER_PARTITION EXTRA_VLLM_ARGS; do
         if [[ -n "${!forward_var:-}" ]]; then
             env_vars+=" ${forward_var}=${!forward_var}"

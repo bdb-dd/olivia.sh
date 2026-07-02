@@ -1234,6 +1234,18 @@ SING_CMD=(
     --bind "${CONTAINER_DIR}:${CONTAINER_DIR}"
 )
 
+# If MODEL is a LOCAL directory (e.g. the grafted AWQ+FP8-MTP checkpoint at
+# /cluster/projects/<proj>/models/...), its path must be visible INSIDE the
+# container. The default binds cover HF_HOME + CONTAINER_DIR but not arbitrary
+# local model dirs, so without this the path doesn't exist in the job, transformers
+# treats it as a HF repo id, and config resolution dies with
+# "Repo id must be in the form 'repo_name' or 'namespace/repo_name'". Bind the model
+# dir (its internal symlinks resolve into HF_HOME, which is already bound).
+if [[ "${MODEL}" == /* && -d "${MODEL}" ]]; then
+    SING_CMD+=(--bind "${MODEL}:${MODEL}")
+    echo "  Local model bind: ${MODEL}"
+fi
+
 # GLM-5.2 block-FP8 sets VLLM_DEEP_GEMM_WARMUP=skip to avoid the multi-minute
 # DeepGEMM JIT warmup at startup. Only forward it when set so other models keep
 # vLLM's default warmup behaviour (empty value would read as "disabled").

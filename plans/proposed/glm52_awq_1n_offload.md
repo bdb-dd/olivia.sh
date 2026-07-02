@@ -49,6 +49,12 @@ indexer). Eager (IS_GLM52 default). Single stream unless noted. Record the
 1b. **fp8 KV probe (high value)** — same as (1) + `KV_CACHE_DTYPE=fp8_ds_mla`. Does
    the DSA/FLASHMLA_SPARSE path accept fp8 KV on GH200? If yes, KV ~halves for every
    GLM-5.2 config. Check the model still decodes coherently (fp8 KV can hurt quality).
+   **DE-RISKED 2026-07-02 (source read of our container):** `flashmla_sparse.py` lists
+   `fp8_ds_mla` (+ `"fp8"` alias) in `supported_kv_cache_dtypes`, has a full FP8
+   prefill/decode path, and `get_supported_head_sizes()==[576]` = GLM-5.2's MLA layout;
+   `config/cache.py` accepts `fp8_ds_mla` as a CLI value. So acceptance/serving is
+   high-confidence; open unknowns are only scale metadata (fp8_ds_mla is self-scaling,
+   likely no `--calculate-kv-scales` needed) and numerical coherence.
 2. **Push context** — `MAX_MODEL_LEN=512000`, sweep `CPU_OFFLOAD_GB ∈ {40, 55}`,
    util 0.95. Read KV tokens; confirm N ≥ max-model-len for ≥1 stream.
 3. **Offload→latency curve** — at a fixed 131072, sweep `CPU_OFFLOAD_GB ∈ {24,40,55}`,
@@ -69,6 +75,33 @@ CPU_OFFLOAD_GB=40 MAX_MODEL_LEN=131072 ENABLE_EXPERT_PARALLEL=0 \
 |---|---|---|---|---|---|---|---|---|
 | 1 | 40 | 131072 | off | bf16 | 0.90 | — | — | **FAILED @ engine init: MTP layer-78 weights absent from checkpoint** (deepseek_mtp.py:480) — MTP had auto-enabled. ~90 min burned (load + drafter). |
 | 2 | 40 | 131072 | off | bf16 | 0.90 | _tbd_ | _tbd_ | _CANCELED (job 1427786) — paused sweep overnight; pivoted to the MTP graft below_ |
+| 3 | 40 | 131072 | off | bf16 | 0.90 | **173,568** | **~6.8** | **SERVES ✅ (job 1456591, 2026-07-02).** Weights 65.68 GiB/GPU, KV 14.97 GiB/GPU. Single-node offload path validated end-to-end. |
+
+| 4 | 40 | 131072 | off | **fp8_ds_mla** | 0.90 | **284,032** | **~6.8** | **SERVES ✅ + COHERENT (job 1461175).** 1.64× KV vs bf16 (fp8_ds_mla ≈ 0.58 bytes/tok of bf16). Reasoning+answers correct. Decode SAME speed → KV isn't the bottleneck; benefit is capacity. → ~256K single-stream / 2× 131K. |
+
+### fp8_ds_mla validated (Run 4) — cross-cutting win
+`--kv-cache-dtype fp8_ds_mla` **works on GH200 for GLM-5.2** (FLASHMLA_SPARSE), serves + stays
+coherent, 1.64× KV. No `--calculate-kv-scales` needed. Benefit is **KV capacity, not decode
+speed** (eager+offload is the decode bottleneck, not KV bandwidth). **Also applies to the FP8
+3-node `glm52` and 2-node `glm52_awq` presets** → free context/concurrency headroom there too.
+
+| 5 | 55 | 393216 | off | fp8_ds_mla | 0.90 | **587,200** | **~6.3** | **SERVES ✅ — single-node ~500K CLEARED (job 1462694).** KV 29.5 GiB/GPU (2× offload-40), weights 52.65 GiB/GPU. 587K > 512K → one 500K stream fits (~15% headroom). Decode slightly slower (heavier offload). |
+
+### HEADLINE: single-node ~500K achieved
+`fp8_ds_mla` + `offload 55` → **587K-token KV pool > 500K**, so a single 500K-context stream serves
+on 1 node (4×GH200, no PP wedge). Ladder: bf16/off40=173K(~131K) → fp8/off40=284K(~256K) →
+fp8/off55=587K(~500K). **1M single-stream is impractical single-node** (would need offload ~75+ →
+heavy tax, resident weights ~29 GB/GPU) — better via 2-node or KV-tiering (LMCache). Decode is
+~6–7 tok/s eager across all configs (offload/eager bound, not KV) → **MTP is the speed lever (Run 6).**
+
+### Budget analysis from Run 3 (bf16 baseline)
+- **173.5K KV tokens** at offload-40/bf16/util-0.90 → fits ~131K single-stream comfortably, but
+  **cannot fit even one 500K stream** (needs ~3×) nor 256K (needs ~1.5×). Confirms the "bf16 →
+  ~1 short stream" prediction.
+- Rough model: resident weights/GPU ≈ 103.75 − offload_GB; KV/GPU ≈ 86·util_frac − resident − ~5.
+  Levers to reach 500K single-stream: **fp8_ds_mla** (~2× KV, Run 2/1b), **offload 55–60** (~2–2.5×),
+  **util 0.95** (marginal). 500K likely needs fp8_ds_mla **+** offload ~55–60 (compounding), at the
+  cost of a heavier C2C decode tax. Decode is already slow (~6.8 tok/s eager single-stream).
 
 ### Observations — job 1424649 (2026-07-01)
 - **Offload composes end-to-end.** `UVAOffloader`, `Total CPU offloaded parameters: 40.36`/GPU,
@@ -105,6 +138,23 @@ AWQ body, plus a vLLM patch so layer 78 loads as FP8 while the body stays AWQ.
 - **Preset `glm52_awq_mtp`** (local-path model, served `glm52-awq-mtp`, 1×4 TP=4). MTP auto-enables
   because the path contains "MTP".
 
+**LOCAL-PATH BIND GOTCHA (fixed 2026-07-02, job 1463473→1463561):** serving the local-dir
+checkpoint failed FAST at `create_engine_config`→`maybe_override_with_speculators`→
+`get_config_dict(path)` → `HFValidationError: Repo id must be in the form 'namespace/repo_name'`.
+Cause: the merged dir (`/cluster/projects/nn10104k/models/...`) is NOT in the container bind list
+(only HF_HOME + CONTAINER_DIR), so inside the job `os.path.isdir(model)` is false → transformers
+treats it as a HF repo id. FIX: run_vllm_server.sh now auto-binds a local-dir MODEL
+(`--bind $MODEL:$MODEL`; its symlinks resolve into the already-bound HF_HOME). Verified: job 1463561
+cleared config + loaded 86 shards (83 base + 3 FP8-MTP).
+
+**MTP loads & composes (job 1463561, 2026-07-02): the graft+patch+bind WORK end-to-end** — full
+2-pass load (main + drafter, ~80 min), no layer-78 error, `speculative-config {method:mtp,
+num_speculative_tokens:3}` accepted. It then failed only on a KV-budget check: the MTP drafter
+eats ~5 GiB HBM (KV 14.97→10.09 GiB at offload40), and bf16 KV @131072 needs 11.46 GiB → est. max
+115328. **Not fundamental** — fix by fp8_ds_mla (halves KV), or lower max_model_len, or util 0.95.
+Relaunched as **job 1464356 = MTP + fp8_ds_mla + offload40 + 131072** (the production-optimal
+combo; fp8 KV ~199K capacity at the MTP-reduced 10 GiB → 131K fits).
+
 **To serve (next GPU session):**
 ```bash
 # 1. live-patch the shared glm52 container (pure-Python; no rebuild; no-op for FP8/plain-AWQ)
@@ -116,6 +166,32 @@ cd $SB/usr/local/lib/python3.12/dist-packages && \
 CPU_OFFLOAD_GB=40 MAX_MODEL_LEN=131072 ./olivia.sh server start glm52_awq_mtp
 ```
 (For reproducibility, also fold the patch into the build via a local-patch hook — TODO.)
+
+### MTP THROUGHPUT — VALIDATED (job 1464356, 2026-07-02): MTP+fp8_ds_mla serves + speeds decode
+Config: `glm52_awq_mtp` (grafted checkpoint), offload 40, fp8_ds_mla, 131072, eager, MTP num_spec=3.
+KV pool 184,128 tok (fp8 gave the headroom bf16 lacked → 131K fits with the MTP drafter's ~5 GiB HBM;
+weights 68.91 GiB/GPU incl. drafter). ~79 min 2-pass load. `bench_sweep.py` (temp 1.0, max-tokens 128):
+
+Two `bench_sweep.py` runs (temp 1.0, max-tokens 128): first COLD (compile/DeepGEMM caches building,
+TTFT ~2.5s), second WARM to conc-64 (steady state, TTFT ~0.4s). Warm is the representative table:
+
+| concurrency | agg tok/s | per-stream tok/s | TTFT s | fail | (cold agg) |
+|---|---|---|---|---|---|
+| 1  | 14.8  | 14.8 | 0.39 | 0 | 11.9 |
+| 2  | 28.9  | 15.2 | 0.67 | 0 | 26.4 |
+| 4  | 46.5  | 12.0 | 0.81 | 0 | 43.1 |
+| 8  | 67.0  | 8.9  | 0.88 | 0 | 65.4 |
+| 16 | 96.8  | 6.4  | 1.11 | 0 | 84.0 |
+| 32 | 130.5 | 4.3  | 1.33 | 0 | 111.8 |
+| 64 | **201.8** | 3.4 | 3.60 | 0 | — |
+
+**HEADLINE: MTP single-stream 11.9 (cold) → 14.8 (warm) tok/s vs the ~6.8 tok/s MTP-off baseline =
+~1.75–2.2×.** The graft (dnhkng) + FP8-MTP quant patch + local-model bind all pay off. **Aggregate
+scales cleanly to ~202 tok/s @64-way and is STILL CLIMBING (no saturation), 0 failures at every level
+1→64** (single-node = no PP wedge — the multi-node presets can't do this). Per-stream degrades under
+load (14.8→3.4) and TTFT rises (0.4→3.6s; eager+offload saturating) — capture would lift this but IMAs
+on this stack. Served name defaulted to the local PATH (SERVED_MODEL_NAME not applied for local-path
+presets — minor: set it explicitly if routing by name matters).
 
 ## Option 1 investigation — FlashInfer-MLA on sm_90 — CLOSED (dead end)
 **Finding (2026-07-01):** `FLASHINFER_MLA_SPARSE` (the fp8-capable sparse-MLA backend)

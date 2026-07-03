@@ -223,8 +223,21 @@ export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-NVL}"        # Use NVLink for P2P
 export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-PHB}" # GPU Direct RDMA level
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"         # Enable InfiniBand if available
 
-# Memory optimizations
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+# Memory optimizations. Override-respecting so a KV-offload run can drop it (below).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+# KV-offload experiment (queue item (b), plans/proposed/glm52_kv_tiering.md). vLLM
+# HARD-REJECTS any KV connector (--kv-offloading-size / --kv-transfer-config) when
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True — its CUDA VMM allocator can remap
+# KV pages, invalidating pinned/registered KV memory (ValueError at config validation,
+# before load). Set KV_OFFLOAD_EXPERIMENT=1 to drop expandable_segments so the native
+# CPU KV-offload path can start. TRADE-OFF: expandable_segments is our anti-
+# fragmentation guard on the tight-HBM offload path — watch for fragmentation OOM; the
+# alternative (keep it + enable the cumem allocator) is heavier. Forwarded by olivia.sh.
+if [[ "${KV_OFFLOAD_EXPERIMENT:-0}" == "1" ]]; then
+    export PYTORCH_CUDA_ALLOC_CONF=""
+    echo "[INFO] KV_OFFLOAD_EXPERIMENT=1: dropped PYTORCH_CUDA_ALLOC_CONF=expandable_segments (required for KV connectors; watch for fragmentation OOM)"
+fi
 
 # Logging configuration
 # Set VERBOSE=1 for detailed vLLM + Ray + NCCL logging. Useful when debugging

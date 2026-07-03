@@ -1181,6 +1181,7 @@ start_server_job() {
                        VLLM_CACHE VLLM_CACHE_ROOT TRITON_CACHE_DIR \
                        DG_JIT_CACHE_DIR TORCHINDUCTOR_CACHE_DIR \
                        CPU_OFFLOAD_GB ENABLE_EXPERT_PARALLEL KV_CACHE_DTYPE \
+                       KV_OFFLOAD_EXPERIMENT \
                        LOAD_FORMAT CONTAINER_PYTHONPATH \
                        VLLM_PP_LAYER_PARTITION EXTRA_VLLM_ARGS; do
         if [[ -n "${!forward_var:-}" ]]; then

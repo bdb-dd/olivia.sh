@@ -118,13 +118,14 @@ Read the deployed source. Concrete findings:
   KV connector configured under that setting** unless the **cumem allocator** is on
   (CuMemAllocator disables expandable_segments around its pool). So the smoke test
   will crash at config-validation instantly unless we first either (i) unset
-  expandable_segments for the run, or (ii) enable the cumem allocator. **Line 227 is
-  an unconditional `export`, not override-respecting** — so step 1 needs a one-line
-  prep edit: `export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"`
-  then pass `PYTORCH_CUDA_ALLOC_CONF=` to disable. (Weigh: expandable_segments guards
-  against fragmentation OOM on the tight-HBM offload path — dropping it is a real risk;
-  the cumem route avoids that but adds sleep-mode machinery. Try unset first, watch for
-  frag OOM.)
+  expandable_segments for the run, or (ii) enable the cumem allocator. **PREP DONE
+  2026-07-03:** added a `KV_OFFLOAD_EXPERIMENT=1` knob to `run_vllm_server.sh` (drops
+  expandable_segments for the run; forwarded by `olivia.sh`). A bare
+  `PYTORCH_CUDA_ALLOC_CONF=` won't work — olivia.sh only forwards **non-empty** env
+  vars, so the empty value never reaches the cluster; hence the explicit knob. (Weigh:
+  expandable_segments guards against fragmentation OOM on the tight-HBM offload path —
+  dropping it is a real risk; the cumem route avoids that but adds sleep-mode
+  machinery. Try the knob first, watch for frag OOM.)
 
 ## Recommended experiment ladder (each is one GPU job; stop when the goal is met)
 1. **Native CPU offload smoke test (cheapest, answers gating question).** Confirm it
@@ -132,8 +133,7 @@ Read the deployed source. Concrete findings:
    blocks (offload metrics move), (c) still decodes coherently. One-shot form (note
    the expandable_segments prep from step 0):
    ```bash
-   # after making run_vllm_server.sh:227 override-respecting:
-   PYTORCH_CUDA_ALLOC_CONF= \
+   KV_OFFLOAD_EXPERIMENT=1 \
    EXTRA_VLLM_ARGS='--kv-offloading-size 120' \
    CPU_OFFLOAD_GB=40 KV_CACHE_DTYPE=fp8_ds_mla MAX_MODEL_LEN=131072 \
    ENABLE_EXPERT_PARALLEL=0 SERVER_JOB_NAME=vllm-glm52kv \
@@ -163,7 +163,9 @@ Read the deployed source. Concrete findings:
   the MLA full-attention blocks? (The novel bit vs the DeepSeek-V4 code it was built for.)
 
 ## Status
-Research + offline step 0 **DONE** (schema pinned, expandable_segments blocker found
-→ step 1 is now one-shot after a 1-line script edit). **No code changes, nothing
-built.** Next action (step 1) is GPU-gated — needs an allocation. See
-[[project_glm52_status]] for the broader ledger.
+Research + offline step 0 **DONE** (schema pinned, expandable_segments blocker found).
+**Prep edit DONE** — `KV_OFFLOAD_EXPERIMENT=1` knob added to `run_vllm_server.sh`
+(drops expandable_segments for the run) + forwarded by `olivia.sh`; both `bash -n`
+clean. **Nothing built / no GPU run.** The branch is now **step-1-ready**: the smoke
+command above should start one-shot (no config-validation crash). Next action (step 1)
+is GPU-gated — needs an allocation. See [[project_glm52_status]] for the broader ledger.

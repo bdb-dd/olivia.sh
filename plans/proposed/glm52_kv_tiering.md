@@ -32,6 +32,35 @@ Researched 2026-07-03 (no GPU — offline investigation of the deployed build + 
 
 ---
 
+## ✅ Step 1 RESULT — native KV-offload VALIDATED end-to-end on GLM-5.2 DSA (2026-07-03)
+Job 1473586 (`vllm-glm52kv`, gpu-1-107): `glm52_awq_1n`, **bf16 KV**, offload40, 131K,
+eager, `KV_OFFLOAD_EXPERIMENT=1 EXTRA_VLLM_ARGS='--kv-offloading-size=120'`. Full pass:
+- **Connector accepted the DSA KV layout.** `OffloadingConnector` + `CPUOffloadingSpec`
+  initialized on all 4 workers + EngineCore (the "experimental API" warning is normal).
+  No config-validation reject — the `KV_OFFLOAD_EXPERIMENT` knob correctly dropped
+  `expandable_segments`, and **no fragmentation OOM** resulted.
+- **Serves + coherent:** `Application startup complete`; decode returned
+  `"The capital of Norway is Oslo."`, `finish_reason=stop`. Load 567 s (runai default).
+- **Store WORKS:** `vllm:kv_offload_total_bytes_total{transfer_type="GPU_to_CPU"}`
+  climbed to **116.9 GB** offloaded to coherent Grace LPDDR over the probe traffic.
+- **Reload WORKS:** after distinct fillers evicted a target prompt from the 148,864-tok
+  HBM pool, re-sending it pulled **2.70 GB `CPU_to_GPU`** back from the tier instead of
+  recomputing prefill — the "bulk KV in LPDDR, reload on reuse" loop, proven.
+- **HBM cost of the connector:** GPU KV pool = **148,864 tok** with the connector vs
+  173,568 for the no-connector bf16 baseline → the connector reserves ~25K tok (~14%)
+  of HBM for staging. Factor this into the KV budget.
+
+**Caveats / gaps:** (1) `fp8_ds_mla` KV **not yet tried with offload** — this run was
+bf16 (stepwise: isolate the connector first); fp8+offload is the next variable. (2) The
+API doesn't populate `prompt_tokens_details.cached_tokens` on this build, so prefix-hit
+had to be confirmed via the `kv_offload` byte counters, not usage. (3) **TTFT benefit
+unmeasured** — proving blocks move ≠ measuring the latency/throughput win; that's step 2.
+
+**Verdict:** the native path is the right lever — no LMCache, no staging, works on DSA.
+Proceed to step 2 (quantitative benefit) next node window.
+
+---
+
 ## What's already in the container (verified in `vllm-glm52-1-sandbox`)
 - **CLI:** `--kv-offloading-size` / `--kv-offloading-backend` (arg_utils.py:1170/1173)
   and `--kv-transfer-config` (:1492). Example format: `--kv-transfer-config
@@ -163,9 +192,10 @@ Read the deployed source. Concrete findings:
   the MLA full-attention blocks? (The novel bit vs the DeepSeek-V4 code it was built for.)
 
 ## Status
-Research + offline step 0 **DONE** (schema pinned, expandable_segments blocker found).
-**Prep edit DONE** — `KV_OFFLOAD_EXPERIMENT=1` knob added to `run_vllm_server.sh`
-(drops expandable_segments for the run) + forwarded by `olivia.sh`; both `bash -n`
-clean. **Nothing built / no GPU run.** The branch is now **step-1-ready**: the smoke
-command above should start one-shot (no config-validation crash). Next action (step 1)
-is GPU-gated — needs an allocation. See [[project_glm52_status]] for the broader ledger.
+Steps 0 + 1 **DONE** (2026-07-03). Step 0: schema pinned, expandable_segments blocker
+found → `KV_OFFLOAD_EXPERIMENT` knob (committed `3557278`). **Step 1: native KV-offload
+VALIDATED end-to-end on GLM-5.2 DSA** (job 1473586 — see "Step 1 RESULT" above): connector
+inits on DSA, serves, coherent decode, store 116.9 GB + reload 2.70 GB proven, no OOM.
+Job canceled after validation. **Next: step 2** — quantitative benefit (TTFT-on-reuse vs
+cold prefill; concurrent-long-session capacity vs no-offload baseline; + fp8_ds_mla with
+offload; + the `KV_OFFLOAD_GB` knob). GPU-gated. See [[project_glm52_status]] for the ledger.

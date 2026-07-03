@@ -193,6 +193,27 @@ load (14.8→3.4) and TTFT rises (0.4→3.6s; eager+offload saturating) — capt
 on this stack. Served name defaulted to the local PATH (SERVED_MODEL_NAME not applied for local-path
 presets — minor: set it explicitly if routing by name matters).
 
+### CUDAGraph CAPTURE — WORKS on this path; CAPTURE+MTP is the peak config (2026-07-03)
+(Supersedes the "capture IMAs on this stack" note above — that was untested for the single-node AWQ+DSA
+path.) Eager is NOT forced here: `CAPTURE_EXPERIMENT=1` (PIECEWISE + `combo_kernels=false` + NCCL
+all-reduce) captures cleanly in ~40s, 0 IMA (jobs 1466375, 1469123, 1469631). But capture only amortizes
+kernel-launch overhead — the dominant single-node cost is the C2C weight-streaming (offload) tax — so
+it's ~2×, NOT the ~4.5× of glm51. Warm single-stream / aggregate@64 (fp8_ds_mla, offload40, 131K):
+
+| config | single-stream tok/s | agg@64 tok/s |
+|---|---|---|
+| eager (baseline) | 6.8 | — |
+| capture only | 15.1 (~2.2×) | 157.9 |
+| MTP only | 14.8 (~2.2×) | 201.8 |
+| **capture + MTP** | **21.8 (~3.2×)** | **241.3** |
+
+**Capture + MTP PARTIALLY STACK** (job 1469631): capture composes with MTP (captures in 36s with the
+drafter loaded, KV pool 175,936), and single-stream 21.8 beats either lever alone (~15) by ~1.45× —
+different overheads (launch vs forward-passes) partly add, the shared C2C ceiling caps it below a
+fully-additive 4×. c64 shows the combo still ahead (241 vs 202 vs 158), 0 fail 1→64. **Peak single-node
+config = capture + MTP: ~22 tok/s single-stream / ~241 @64.** Untested: Option B (low-offload, no-MTP)
+to attack the C2C tax that bounds all of these. Cost: MTP double-load ~84 min (main ~56 + drafter ~29).
+
 ## Option 1 investigation — FlashInfer-MLA on sm_90 — CLOSED (dead end)
 **Finding (2026-07-01):** `FLASHINFER_MLA_SPARSE` (the fp8-capable sparse-MLA backend)
 is Blackwell-only by a HARD kernel gap, not a liftable vLLM guard, so there is no

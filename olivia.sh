@@ -2492,25 +2492,31 @@ echo "$jobs" | while IFS='|' read -r jid name state etime tlimit nodes; do
     vllm-*)
       head=$(scontrol show hostnames "$nodes" 2>/dev/null | head -1)
       hl="$CDIR/logs/vllm_server_${jid}_head.log"; wl="$CDIR/logs/vllm_server_${jid}.log"
+      # Multi-node writes the rich log to _head.log; single-node uses the wrapper log.
+      # Fall back to the wrapper log so single-node jobs show real phase/progress.
+      L="$wl"; [ -f "$hl" ] && L="$hl"
       model=$(grep -oE 'Model: +[^[:space:]]+' "$wl" 2>/dev/null | head -1 | awk '{print $NF}')
       mode=$(grep -oE 'CUDAGraph Mode: +[^[:space:]]+' "$wl" 2>/dev/null | head -1 | awk '{print $NF}')
+      # capture-experiment sets --compilation-config directly, so the mode echo can read NONE
+      if { [ -z "$mode" ] || [ "$mode" = NONE ]; } && grep -q '"cudagraph_mode": *"PIECEWISE"' "$wl" 2>/dev/null; then mode="PIECEWISE(cap)"; fi
       tag="${model:-?} [cg=${mode:-?}]"
-      if [ -f "$hl" ] && grep -qE 'Application startup complete|Uvicorn running on' "$hl" 2>/dev/null; then
+      if [ -f "$L" ] && grep -qE 'Application startup complete|Uvicorn running on' "$L" 2>/dev/null; then
         code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://$head:${VPORT}/health" 2>/dev/null)
-        tp=$(grep -oE 'Avg generation throughput: [0-9.]+ tokens/s, Running: [0-9]+ reqs, Waiting: [0-9]+ reqs, GPU KV cache usage: [0-9.]+%' "$hl" 2>/dev/null | tail -1)
+        tp=$(grep -oE 'Avg generation throughput: [0-9.]+ tokens/s, Running: [0-9]+ reqs, Waiting: [0-9]+ reqs, GPU KV cache usage: [0-9.]+%' "$L" 2>/dev/null | tail -1)
         echo "             -> SERVING  $tag  http://$head:${VPORT} (health $code)"
         [ -n "$tp" ] && echo "                ${tp#Avg }"
-      elif [ -f "$hl" ] && grep -qE 'illegal memory access|Traceback \(most recent call last\)|EngineDeadError|Engine core initialization failed|Fatal Python error' "$hl" 2>/dev/null; then
-        echo "             -> ERROR  $tag  (engine failed; tail logs/vllm_server_${jid}_head.log)"
-      elif [ -f "$hl" ] && grep -qE 'Capturing cudagraph|Capturing CUDA graph' "$hl" 2>/dev/null; then
+      elif [ -f "$L" ] && grep -qE 'illegal memory access|Traceback \(most recent call last\)|EngineDeadError|Engine core initialization failed|Fatal Python error' "$L" 2>/dev/null; then
+        echo "             -> ERROR  $tag  (engine failed; tail logs/vllm_server_${jid}.log)"
+      elif [ -f "$L" ] && grep -qE 'Capturing cudagraph|Capturing CUDA graph' "$L" 2>/dev/null; then
         echo "             -> CAPTURING cudagraphs  $tag  (weights loaded)"
-      elif [ -f "$hl" ]; then
-        sh=$(grep -oE 'Loading safetensors checkpoint shards: +[0-9]+% Completed \| [0-9]+/[0-9]+' "$hl" 2>/dev/null | tail -1)
+      elif [ -f "$L" ]; then
+        grep -q 'Loading drafter model' "$L" 2>/dev/null && draft=' (drafter/MTP)' || draft=''
+        sh=$(grep -oE 'Loading safetensors checkpoint shards: +[0-9]+% Completed \| [0-9]+/[0-9]+' "$L" 2>/dev/null | tail -1)
         if [ -n "$sh" ]; then
           nn=$(echo "$sh" | grep -oE '[0-9]+/[0-9]+' | head -1); pct=$(echo "$sh" | grep -oE '[0-9]+%' | head -1)
-          echo "             -> LOADING weights ${nn} (${pct})  $tag"
-        else echo "             -> INIT / Ray bootstrap  $tag"; fi
-      else echo "             -> starting (no head log yet)  $tag"; fi
+          echo "             -> LOADING weights ${nn} (${pct})${draft}  $tag"
+        else echo "             -> INIT / warming up  $tag"; fi
+      else echo "             -> starting (log not ready yet)  $tag"; fi
       ;;
     *build-vllm*)
       bl="$CDIR/build_vllm_${jid}.log"
@@ -2667,25 +2673,29 @@ else
           (vllm-*)
             head=$(scontrol show hostnames "$nodes" 2>/dev/null | head -1)
             hl="$CDIR/logs/vllm_server_${jid}_head.log"; wl="$CDIR/logs/vllm_server_${jid}.log"
+            # Multi-node writes the rich log to _head.log; single-node uses the wrapper log.
+            L="$wl"; [ -f "$hl" ] && L="$hl"
             model=$(grep -oE 'Model: +[^[:space:]]+' "$wl" 2>/dev/null | head -1 | awk '{print $NF}')
             mode=$(grep -oE 'CUDAGraph Mode: +[^[:space:]]+' "$wl" 2>/dev/null | head -1 | awk '{print $NF}')
+            if { [ -z "$mode" ] || [ "$mode" = NONE ]; } && grep -q '"cudagraph_mode": *"PIECEWISE"' "$wl" 2>/dev/null; then mode="PIECEWISE(cap)"; fi
             tag="${model:-?} [cg=${mode:-?}]"
-            if [ -f "$hl" ] && grep -qE 'Application startup complete|Uvicorn running on' "$hl" 2>/dev/null; then
+            if [ -f "$L" ] && grep -qE 'Application startup complete|Uvicorn running on' "$L" 2>/dev/null; then
                 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://$head:${VPORT}/health" 2>/dev/null)
-                tp=$(grep -oE 'Avg generation throughput: [0-9.]+ tokens/s, Running: [0-9]+ reqs, Waiting: [0-9]+ reqs, GPU KV cache usage: [0-9.]+%' "$hl" 2>/dev/null | tail -1)
+                tp=$(grep -oE 'Avg generation throughput: [0-9.]+ tokens/s, Running: [0-9]+ reqs, Waiting: [0-9]+ reqs, GPU KV cache usage: [0-9.]+%' "$L" 2>/dev/null | tail -1)
                 printf "           ${GRN}SERVING${RST}  %s  http://%s:%s (health %s)\n" "$tag" "$head" "$VPORT" "$code"
                 [ -n "$tp" ] && printf "             %s\n" "${tp#Avg }"
-            elif [ -f "$hl" ] && grep -qE 'illegal memory access|Traceback \(most recent call last\)|EngineDeadError|Engine core initialization failed|Fatal Python error' "$hl" 2>/dev/null; then
-                printf "           ${RED}ERROR${RST}  %s  (engine failed; tail logs/vllm_server_%s_head.log)\n" "$tag" "$jid"
-            elif [ -f "$hl" ] && grep -qE 'Capturing cudagraph|Capturing CUDA graph' "$hl" 2>/dev/null; then
+            elif [ -f "$L" ] && grep -qE 'illegal memory access|Traceback \(most recent call last\)|EngineDeadError|Engine core initialization failed|Fatal Python error' "$L" 2>/dev/null; then
+                printf "           ${RED}ERROR${RST}  %s  (engine failed; tail logs/vllm_server_%s.log)\n" "$tag" "$jid"
+            elif [ -f "$L" ] && grep -qE 'Capturing cudagraph|Capturing CUDA graph' "$L" 2>/dev/null; then
                 printf "           ${YEL}CAPTURING${RST} cudagraphs  %s  (weights loaded)\n" "$tag"
-            elif [ -f "$hl" ]; then
-                shd=$(grep -oE 'Loading safetensors checkpoint shards: +[0-9]+% Completed \| [0-9]+/[0-9]+' "$hl" 2>/dev/null | tail -1)
+            elif [ -f "$L" ]; then
+                grep -q 'Loading drafter model' "$L" 2>/dev/null && draft=' (drafter/MTP)' || draft=''
+                shd=$(grep -oE 'Loading safetensors checkpoint shards: +[0-9]+% Completed \| [0-9]+/[0-9]+' "$L" 2>/dev/null | tail -1)
                 if [ -n "$shd" ]; then
                     nn=$(echo "$shd" | grep -oE '[0-9]+/[0-9]+' | head -1); pct=$(echo "$shd" | grep -oE '[0-9]+%' | head -1)
-                    printf "           ${YEL}LOADING${RST} weights %s (%s)  %s\n" "$nn" "$pct" "$tag"
-                else printf "           ${YEL}INIT${RST} / Ray bootstrap  %s\n" "$tag"; fi
-            else printf "           starting (no head log yet)  %s\n" "$tag"; fi
+                    printf "           ${YEL}LOADING${RST} weights %s (%s)%s  %s\n" "$nn" "$pct" "$draft" "$tag"
+                else printf "           ${YEL}INIT${RST} / warming up  %s\n" "$tag"; fi
+            else printf "           starting (log not ready yet)  %s\n" "$tag"; fi
             ;;
           (*build-vllm*)
             bl="$CDIR/build_vllm_${jid}.log"

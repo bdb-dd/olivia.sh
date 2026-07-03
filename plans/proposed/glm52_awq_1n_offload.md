@@ -6,6 +6,43 @@ coherent Grace LPDDR5X (`--cpu-offload-gb`), freeing HBM for KV → long context
 The prize: **no multi-node PP decode wedge** and a 1-node allocation that schedules
 easily. Preset: `glm52_awq_1n` (reuses the `glm52` container).
 
+## ⭐ PEAK single-node serve recipe (capture + MTP) — ~22 tok/s single-stream, ~241 @64
+The best-measured single-node interactive config (2026-07-03, job 1469631):
+**capture (PIECEWISE, combo_kernels off) + MTP + fp8_ds_mla + offload40 + 131K**.
+~3.2× the eager+offload baseline (~6.8 tok/s), 0 failures 1→64.
+
+```bash
+# Prerequisite (once per container, if not already patched): the vLLM MTP quant-config
+# patch must be live in the sandbox. It's pure-Python, so live-patch without a rebuild
+# (or rebuild glm52 to bake it). If MTP init dies with a layer-78 KeyError/ValueError,
+# the patch isn't applied — see "MTP RE-ENABLED via graft" in project_glm52_status memory.
+#   patch: patches/vllm-awq-fp8-mtp-quant-config.patch  (applies cleanly to 091386a)
+
+CPU_OFFLOAD_GB=40 \
+MAX_MODEL_LEN=131072 \
+KV_CACHE_DTYPE=fp8_ds_mla \
+ENABLE_EXPERT_PARALLEL=0 \
+CAPTURE_EXPERIMENT=1 \
+DISABLE_CUSTOM_ALL_REDUCE=1 \
+SERVER_JOB_NAME=vllm-glm52peak \
+./olivia.sh server start glm52_awq_mtp
+```
+
+Notes: `glm52_awq_mtp` is the grafted local-path checkpoint
+(`/cluster/projects/nn10104k/models/GLM-5.2-AWQ-INT4-MTP-FP8`), auto-binds, and MTP
+auto-enables because the path contains `MTP`. `CAPTURE_EXPERIMENT=1` assembles the
+PIECEWISE `--compilation-config` with the NGC combo-kernel autotuner off (peels the
+`autotune_to_one_config` IMA); `DISABLE_CUSTOM_ALL_REDUCE=1` is required for capture
+(the default `auto` also turns it on whenever capture is on, so it's belt-and-braces).
+Capture adds ~40s at startup; runai_streamer keeps the load fast. **Trade-off, not a
+stack at low offload:** MTP's drafter (~3 GiB HBM) competes with the HBM that lowering
+offload would free — so "all levers at low offload + 131K" is impossible; this recipe
+is the validated sweet spot. For a pure-throughput (no-latency-priority) run, plain
+`glm52_awq_1n` + `CAPTURE_EXPERIMENT=1` (no MTP) gives ~158 tok/s @64 at lower single-stream.
+
+For the fastest *load* on any GLM-5.2 serve, runai_streamer is now the default (see
+"Load-time" section below) — no extra flags needed.
+
 ## Why offload is mandatory here
 ~415 GiB AWQ ÷ 4 GPUs ≈ **~104 GB/GPU**, over the 96 GB HBM *before any KV*. So a
 single node cannot even load without `--cpu-offload-gb`. Rough per-GPU split

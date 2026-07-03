@@ -66,6 +66,7 @@ PP_SIZE="${PP_SIZE:-1}"                    # Pipeline parallel size (1=single-no
 NUM_NODES="${NUM_NODES:-1}"                # Number of nodes to use (1 or 2)
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"       # GPU memory utilization
 CPU_OFFLOAD_GB="${CPU_OFFLOAD_GB:-}"       # Per-GPU weight offload to CPU/Grace LPDDR5X (GiB); empty=none
+KV_OFFLOAD_GB="${KV_OFFLOAD_GB:-}"         # Native CPU KV-cache tier (GiB, total across TP ranks); empty=none. Auto-drops expandable_segments
 # Ray compiled-DAG step timeout (seconds). Ray v2's default of 300s is too
 # short for multi-node PP inference over Slingshot: a single engine step can
 # run longer than that during big generations, and the raylet hits an
@@ -234,9 +235,9 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 # CPU KV-offload path can start. TRADE-OFF: expandable_segments is our anti-
 # fragmentation guard on the tight-HBM offload path — watch for fragmentation OOM; the
 # alternative (keep it + enable the cumem allocator) is heavier. Forwarded by olivia.sh.
-if [[ "${KV_OFFLOAD_EXPERIMENT:-0}" == "1" ]]; then
+if [[ "${KV_OFFLOAD_EXPERIMENT:-0}" == "1" || -n "${KV_OFFLOAD_GB:-}" ]]; then
     export PYTORCH_CUDA_ALLOC_CONF=""
-    echo "[INFO] KV_OFFLOAD_EXPERIMENT=1: dropped PYTORCH_CUDA_ALLOC_CONF=expandable_segments (required for KV connectors; watch for fragmentation OOM)"
+    echo "[INFO] KV offload requested: dropped PYTORCH_CUDA_ALLOC_CONF=expandable_segments (required for KV connectors; watch for fragmentation OOM)"
 fi
 
 # Logging configuration
@@ -897,6 +898,19 @@ VLLM_ARGS=(
 # latency for HBM freed up for KV. Only emitted when set > 0.
 if [[ -n "${CPU_OFFLOAD_GB:-}" && "${CPU_OFFLOAD_GB}" != "0" ]]; then
     VLLM_ARGS+=("--cpu-offload-gb" "${CPU_OFFLOAD_GB}")
+fi
+
+# Native CPU KV-cache offload (queue item (b), plans/proposed/glm52_kv_tiering.md):
+# bulk KV blocks are tiered to coherent Grace LPDDR and reloaded on prefix reuse.
+# KV_OFFLOAD_GB is the TOTAL CPU tier size in GiB summed across TP ranks (vLLM's
+# --kv-offloading-size; backend defaults to 'native' → OffloadingConnector +
+# CPUOffloadingSpec). Requires expandable_segments off — handled above (setting
+# KV_OFFLOAD_GB drops it automatically). Distinct from CPU_OFFLOAD_GB (that offloads
+# *weights*); both can be set together. Validated 2026-07-03 (job 1473586: store +
+# reload proven on GLM-5.2 DSA). Note the connector reserves ~25K tok of HBM.
+if [[ -n "${KV_OFFLOAD_GB:-}" && "${KV_OFFLOAD_GB}" != "0" ]]; then
+    VLLM_ARGS+=("--kv-offloading-size" "${KV_OFFLOAD_GB}")
+    echo "[INFO] native KV offload: --kv-offloading-size ${KV_OFFLOAD_GB} GiB (CPU tier, total across TP ranks)"
 fi
 
 # Optional load-format override, e.g. LOAD_FORMAT=runai_streamer for a parallel

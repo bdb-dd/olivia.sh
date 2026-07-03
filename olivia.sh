@@ -1181,11 +1181,19 @@ start_server_job() {
                        VLLM_CACHE VLLM_CACHE_ROOT TRITON_CACHE_DIR \
                        DG_JIT_CACHE_DIR TORCHINDUCTOR_CACHE_DIR \
                        CPU_OFFLOAD_GB ENABLE_EXPERT_PARALLEL KV_CACHE_DTYPE \
-                       KV_OFFLOAD_EXPERIMENT \
+                       KV_OFFLOAD_EXPERIMENT KV_OFFLOAD_GB \
                        LOAD_FORMAT CONTAINER_PYTHONPATH \
                        VLLM_PP_LAYER_PARTITION EXTRA_VLLM_ARGS; do
         if [[ -n "${!forward_var:-}" ]]; then
-            env_vars+=" ${forward_var}=${!forward_var}"
+            # Single-quote the value so a value containing spaces (e.g.
+            # EXTRA_VLLM_ARGS="--kv-offloading-size 120") survives as ONE word in
+            # the remote shell command built below (`${env_vars} sbatch ...`).
+            # Without quoting the remote shell splits on the space and runs the
+            # second token as a command (`bash: 120: command not found`), so the
+            # submit fails. Embedded single quotes are escaped as '\'' .
+            local _q=${!forward_var}
+            _q=${_q//\'/\'\\\'\'}
+            env_vars+=" ${forward_var}='${_q}'"
         fi
     done
 

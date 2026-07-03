@@ -191,11 +191,54 @@ Read the deployed source. Concrete findings:
 - Does the scheduler hash/group **DSA's skip-topk indexer** state correctly, or only
   the MLA full-attention blocks? (The novel bit vs the DeepSeek-V4 code it was built for.)
 
+## Step 2 — benchmark plan (quantify the benefit + cost) — GPU-gated, teed up 2026-07-03
+
+**Central question (frame it right or the results mislead):** the native connector is
+**prefix-reuse tiering**, NOT active-sequence KV paging (that's the unbuilt RFC #33398).
+So it helps workloads that **reuse KV** — multi-turn agentic sessions with a shared
+system prompt / growing history, or many sessions sharing a long common prefix. It does
+**not** raise the count of *independent* full-131K sessions that fit at once (each still
+needs its resident KV in HBM). Step 2 measures the reuse benefit and its decode cost —
+NOT raw distinct-session concurrency (testing that would "disprove" a claim we never made).
+
+**Knob is wired (this commit):** `KV_OFFLOAD_GB=<GiB>` on `run_vllm_server.sh` emits
+`--kv-offloading-size` and auto-drops expandable_segments; forwarded by `olivia.sh`. So
+every run below is just `KV_OFFLOAD_GB=<N> … ./olivia.sh server start glm52_awq_1n` — no
+EXTRA_VLLM_ARGS, no KV_OFFLOAD_EXPERIMENT. (The env-forward space bug is also fixed, so a
+spaced EXTRA_VLLM_ARGS works too now.)
+
+**Tooling:** `/metrics` `vllm:kv_offload_total_bytes_total{transfer_type}` for store/reload
+bytes; `bench_serving.py` (TTFT + decode) for latency; `bench_sweep.py` (concurrency,
+streaming) for aggregate tok/s + failures. Use the cluster-side watcher
+(`/cluster/projects/nn10104k/.mtp-graft/watch_bench.sh`, setsid) so an SSH drop during a
+long bench doesn't lose it. `bench_*.py` are staged there too.
+
+**Experiment matrix** (run in this order — cheapest-first / most-unblocking-first):
+
+| # | Question | Config | Measure | Kills the idea if… |
+|---|---|---|---|---|
+| B3 | Does fp8_ds_mla KV compose with offload? (last untested variable) | `KV_OFFLOAD_GB=120 KV_CACHE_DTYPE=fp8_ds_mla CPU_OFFLOAD_GB=40 MAX_MODEL_LEN=131072 glm52_awq_1n` | store+reload counters move; coherent decode | connector rejects fp8_ds_mla block layout → offload is bf16-only (halves benefit) |
+| B1 | **TTFT payoff on reuse** (the headline) | serve `KV_OFFLOAD_GB=120`; send long prompt P (~50K tok), evict via fillers > HBM pool, re-send P | TTFT_cold vs TTFT_reload vs TTFT_hbm-hit (stream, time-to-first-token) | TTFT_reload ≈ TTFT_cold → the C2C reload isn't beating recompute (unexpected; ~2.7 GB @900 GB/s ≈ ms vs seconds of prefill) |
+| B4 | **Decode cost of offload** (the C2C-contention check) | same decode workload, `KV_OFFLOAD_GB=120` vs unset, single-stream + batched | Δ tok/s (does offload bookkeeping/traffic slow decode even w/o reuse?) | large decode regression → offload only worth it when reuse rate is high |
+| B2 | **Reuse-workload throughput** (the (b) goal, done right) | shared-prefix multi-turn load (long common system prompt, N concurrent sessions each doing several turns), offload on vs off; sweep `KV_OFFLOAD_GB` {120,240,360} | aggregate tok/s, TTFT p50/p95, failures, prefill-recompute avoided | no measurable win on a realistic reuse workload → native offload not worth wiring as default |
+| B5 | Grace LPDDR headroom / ceiling | sweep `KV_OFFLOAD_GB` up to ceiling | max before Grace OOM (≈480 GB LPDDR − ~160 GB offloaded weights ≈ ~320 GB free) | — (informational) |
+
+**Then, contingent on B4:** if single-node offload decode cost is high because KV pages
+contend with weight-streaming on the same C2C link, re-run B1/B2 on the **2-node
+no-weight-offload** shape (needs queue item (a)) where C2C is KV-only — the memo's
+prediction that (b) wants (a) first. Compare the reuse benefit there.
+
+**Deliverable of step 2:** a go/no-go on wiring `KV_OFFLOAD_GB` as a GLM-5.2 default (and
+at what size) for reuse-heavy agentic serving, with the TTFT-win and decode-cost numbers
+in the README `## Performance` ledger. Budget: B3+B1+B4 are ~1 job each (~15 min load +
+short bench); B2 is the big one (multi-config concurrency sweep).
+
 ## Status
 Steps 0 + 1 **DONE** (2026-07-03). Step 0: schema pinned, expandable_segments blocker
 found → `KV_OFFLOAD_EXPERIMENT` knob (committed `3557278`). **Step 1: native KV-offload
 VALIDATED end-to-end on GLM-5.2 DSA** (job 1473586 — see "Step 1 RESULT" above): connector
 inits on DSA, serves, coherent decode, store 116.9 GB + reload 2.70 GB proven, no OOM.
-Job canceled after validation. **Next: step 2** — quantitative benefit (TTFT-on-reuse vs
-cold prefill; concurrent-long-session capacity vs no-offload baseline; + fp8_ds_mla with
-offload; + the `KV_OFFLOAD_GB` knob). GPU-gated. See [[project_glm52_status]] for the ledger.
+Job canceled after validation. **Step 2 planned** (see "Step 2 — benchmark plan" above):
+`KV_OFFLOAD_GB` knob wired + env-forward space bug fixed (this commit), so the benchmark
+runs are one-shot. Execution is GPU-gated — start with B3 (fp8+offload) then B1 (TTFT
+payoff). See [[project_glm52_status]] for the ledger.

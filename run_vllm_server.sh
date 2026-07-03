@@ -438,6 +438,22 @@ if [[ "${IS_GLM52}" == "1" && "${IS_AWQ}" == "1" && "${NUM_NODES}" -le 1 && -z "
     echo "[INFO] single-node GLM-5.2 AWQ: defaulting CPU_OFFLOAD_GB=${CPU_OFFLOAD_GB} (weights exceed HBM without offload)"
 fi
 
+# GLM-5.2 cold load is vLLM-pipeline-bound, not I/O-bound: the default loader
+# takes ~56 min for the ~415 GiB AWQ checkpoint (and MTP double-loads to ~84 min).
+# The Run:ai Model Streamer parallelizes the safetensors read ~6x — VALIDATED at
+# ~9.5 min on glm52_awq_1n (loads, serves, decodes cleanly). It ships as a pip
+# package we can't install offline into the container, so it's staged under the
+# persistent (projects) HF_HOME and imported via PYTHONPATH (CONTAINER_PYTHONPATH).
+# Default it on for GLM-5.2 when that staged package is present next to HF_HOME;
+# no-op (fall back to the default loader) when it's absent — e.g. the FP8 preset
+# resolves HF_HOME to the work tier where the pkg isn't staged. Fully overridable
+# via LOAD_FORMAT / CONTAINER_PYTHONPATH.
+if [[ "${IS_GLM52}" == "1" && -z "${LOAD_FORMAT:-}" && -d "${HF_HOME:-}/runai-pkg" ]]; then
+    LOAD_FORMAT=runai_streamer
+    CONTAINER_PYTHONPATH="${CONTAINER_PYTHONPATH:-${HF_HOME}/runai-pkg}"
+    echo "[INFO] GLM-5.2: defaulting LOAD_FORMAT=runai_streamer (staged pkg at ${HF_HOME}/runai-pkg; ~6x faster cold load)"
+fi
+
 # GLM-5.2 FP8: block-wise FP8 ([128,128], e4m3) is the DeepSeek-style quant, so
 # it runs through DeepGEMM on Hopper rather than the AWQ flashinfer-MoE path.
 # Enable DeepGEMM and keep the FP8 (not FP16) MoE kernel. DeepGEMM JIT warmup
@@ -870,6 +886,12 @@ if [[ -n "${CPU_OFFLOAD_GB:-}" && "${CPU_OFFLOAD_GB}" != "0" ]]; then
     VLLM_ARGS+=("--cpu-offload-gb" "${CPU_OFFLOAD_GB}")
 fi
 
+# Optional load-format override, e.g. LOAD_FORMAT=runai_streamer for a parallel
+# streaming loader (needs runai_model_streamer importable — see CONTAINER_PYTHONPATH).
+if [[ -n "${LOAD_FORMAT:-}" ]]; then
+    VLLM_ARGS+=("--load-format" "${LOAD_FORMAT}")
+fi
+
 # CUDAGraph knob. NONE → disable all compilation (mode=NONE). Anything else →
 # keep compilation enabled and only override cudagraph_mode. Unset → no flag,
 # vLLM auto-selects.
@@ -1244,6 +1266,14 @@ SING_CMD=(
 if [[ "${MODEL}" == /* && -d "${MODEL}" ]]; then
     SING_CMD+=(--bind "${MODEL}:${MODEL}")
     echo "  Local model bind: ${MODEL}"
+fi
+
+# Optional: prepend a PYTHONPATH inside the container (e.g. a staged
+# runai_model_streamer package under HF_HOME) so a pip package we can't install
+# offline is still importable. The path must live under an already-bound dir.
+if [[ -n "${CONTAINER_PYTHONPATH:-}" ]]; then
+    SING_CMD+=(--env "PYTHONPATH=${CONTAINER_PYTHONPATH}")
+    echo "  Container PYTHONPATH: ${CONTAINER_PYTHONPATH}"
 fi
 
 # GLM-5.2 block-FP8 sets VLLM_DEEP_GEMM_WARMUP=skip to avoid the multi-minute

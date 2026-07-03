@@ -267,6 +267,11 @@ Concurrency sweep (`bench_sweep.py`, `max_tokens=256`, thinking on):
 
 Stable 1→64 (0 failures, no decode wedge — RayExecutorV2). Single-stream is slow (~5.6 tok/s, eager) with high TTFT (~14 s, PP=3 prefill); strong batched throughput (~75× from 1→64). CUDAGraph capture IMAs on this NGC stack, so eager only.
 
+### GLM-5.2 AWQ (`glm52_awq_1n`) — 1 node × 4 GH200, AWQ-INT4, offload40 · 2026-07-03
+Peak single-node config = **capture + MTP + fp8_ds_mla + offload40 + 131K**: ~22 tok/s single-stream (3.2× eager), ~241 tok/s @64-way, 0 failures. 3× the throughput of the 3-node FP8 path at 1/3 the GPU cost. Full sweep in `plans/proposed/glm52_awq_1n_offload.md`.
+
+> **Cold load ~6× faster with the Run:ai Model Streamer** (validated 2026-07-03): the default loader takes **~56 min** for the ~415 GiB AWQ checkpoint (~84 min with MTP's double-load) — but that is **vLLM-pipeline-bound, not I/O-bound** (raw Lustre read is ~1.3 GB/s; page-cache reuse was a dead end). `LOAD_FORMAT=runai_streamer` parallelizes the safetensors read → **`Model loading took … 569 s` (~9.5 min)**, serves + decodes cleanly. Now the **default for GLM-5.2** when the staged runai pkg is present under `HF_HOME` (`run_vllm_server.sh` auto-sets `LOAD_FORMAT`/`CONTAINER_PYTHONPATH`; override either to opt out). The pkg is staged durably at `$HF_HOME/runai-pkg` (projects tier).
+
 ### Kimi K2.7 / K2.6 — 2 nodes × 4 GH200, eager, native int4 · 2026-06-20
 Concurrency sweep (256 output tokens, distinct prompts):
 

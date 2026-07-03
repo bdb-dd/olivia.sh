@@ -239,3 +239,37 @@ cheap unlock on GH200:
 3. Others: 2-node `glm52_awq` already has ~350 GB aggregate KV WITHOUT offload (only cost
    = PP wedge + serialize) — may already serve 500K–1M multi-stream; A/B it vs 1-node.
    NVFP4 out (Blackwell). Check any INT8 KV the sparse backend accepts.
+
+## Load-time — Run:ai Model Streamer — DONE (2026-07-03), now the GLM-5.2 default
+The single-node offload path's worst UX cost was **cold load: ~56 min** for the
+~415 GiB AWQ checkpoint (MTP double-loads the drafter → ~84 min). Diagnosis: the
+load is **vLLM-pipeline-bound, not I/O-bound** — raw Lustre read is ~1.3 GB/s, and
+page-cache reuse was a dead end (the bottleneck is vLLM's serial per-shard
+processing, not the disk read).
+
+**Fix: `LOAD_FORMAT=runai_streamer`** (the Run:ai Model Streamer, a parallel
+safetensors loader). Job 1472308 (`vllm-glm52runai`, glm52_awq_1n + offload40 +
+fp8_ds_mla + 131K on gpu-1-108):
+- Loads at ~450–600 it/s → **`Model loading took 66.38 GiB and 569.2 s` (~9.5 min)** —
+  **~6× faster** than the default loader. Confirms the pipeline-bound diagnosis.
+- **Serves + decodes cleanly**: `Application startup complete`; two decode probes
+  returned coherent output (`"The capital of Norway is Oslo."`, `finish_reason=stop`)
+  with the reasoning-token patch reporting `reasoning_tokens` correctly. KV cache
+  264,128 tokens (2.02× @131K), eager (capture IMAs on this stack, as expected).
+
+**Packaging (durable):** runai ships as a pip package that can't be installed
+offline into the container. It's staged under the persistent HF_HOME and imported
+via PYTHONPATH — no container modification:
+- aarch64 wheel + `humanize` extracted to `/cluster/projects/nn10104k/huggingface/runai-pkg/`
+  (bound in the container because it's under HF_HOME; loaded via `CONTAINER_PYTHONPATH`).
+- Source wheels cached at `/cluster/projects/nn10104k/.mtp-graft/runai-wheels/`.
+- Re-stage from a login node: `pip download runai-model-streamer --no-deps
+  --only-binary=:all: --platform manylinux2014_aarch64 --python-version 3.12
+  --abi cp312 --implementation cp`, unzip under HF_HOME/runai-pkg.
+
+**Wired as default:** `run_vllm_server.sh` auto-sets `LOAD_FORMAT=runai_streamer`
++ `CONTAINER_PYTHONPATH=$HF_HOME/runai-pkg` for GLM-5.2 when that staged pkg
+exists (guarded `-d "$HF_HOME/runai-pkg"`, so it no-ops when absent — e.g. the
+work-tier FP8 `glm52` where the pkg isn't staged). Fully overridable. `olivia.sh`
+forwards both env vars. Applies to the AWQ projects-tier path today; to enable it
+for the FP8 `glm52` too, stage the pkg on the work tier as well.

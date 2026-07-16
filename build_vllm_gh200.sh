@@ -622,6 +622,7 @@ singularity exec ${SING_OPTS} ${PATCHES_BIND} \
     --env "VLLM_VERSION=${VLLM_VERSION}" \
     --env "VLLM_PATCHES=${VLLM_PATCHES}" \
     --env "DEEPGEMM_REF=${DEEPGEMM_REF}" \
+    --env "NGC_PYTORCH_TAG=${NGC_PYTORCH_TAG}" \
     --bind "${PIP_CACHE}:/root/.cache/pip" \
     "${SANDBOX_PATH}" /bin/bash << 'BUILDSCRIPT'
 

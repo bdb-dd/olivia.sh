@@ -79,7 +79,7 @@ show_presets() {
     echo ""
     echo "  ornith     - Ornith 1.0 MoE (Deep Reinforce, Qwen3.5) — one container, two sizes"
     echo "               vLLM: main (qwen3_5_moe arch + MTP), transformers>=5.8.1, NGC 26.05"
-    echo "               native MTP, 256K ctx, block-FP8. Serve either:"
+    echo "               hybrid attn + multimodal, 256K ctx, FP8 (W8A8). Serve either:"
     echo "                 preset 'ornith'       → 397B flagship, 2 nodes × 4 (TP=4 + PP=2)"
     echo "                 preset 'ornith_gh200' → 35B (~3B active), single GH200 card (TP=1)"
     echo ""
@@ -261,25 +261,28 @@ apply_preset() {
             # post-trained on Qwen 3.5. Both served sizes — the 35B MoE (~3B
             # active) and the 397B MoE flagship — are arch
             # Qwen3_5MoeForConditionalGeneration / model_type qwen3_5_moe, 256K
-            # context, each with a NATIVE MTP module (config:
-            # mtp_num_hidden_layers=1), so vLLM runs Multi-Token-Prediction
-            # speculative decode with no external draft model (note: MTP is
-            # PP-gated, so it is auto-off on the 2-node 397B unless ALLOW_MTP_PP=1
-            # — see run_vllm_server.sh). Default quants are the official block-FP8
-            # checkpoints (Ornith-1.0-397B-FP8 / Ornith-1.0-35B-FP8), auto-detected
-            # from quantization_config → no --quantization flag.
+            # context. GROUND TRUTH from the 35B FP8 checkpoint (inspected
+            # on-cluster 2026-07-16): it's the Qwen3-Next/3.5 lineage — HYBRID
+            # attention (Gated-DeltaNet linear_attn + full self_attn), a shared
+            # expert, and MULTIMODAL (vision tower). Quant is compressed-tensors
+            # channel/token FP8 (W8A8, NOT DeepSeek block-FP8), auto-detected from
+            # quantization_config → no --quantization flag, and DeepGEMM is NOT on
+            # its GEMM path. The config declares mtp_num_hidden_layers=1 but the
+            # FP8 export SHIPS NO MTP WEIGHTS, so MTP speculative decode is off by
+            # default (see run_vllm_server.sh IS_ORNITH).
             #
-            # vLLM version: qwen3_5_moe is a NEW architecture. Older releases
-            # reject it ("architectures ['Qwen3_5MoeForConditionalGeneration']
-            # are not supported", vllm#35344), and transformers 5.x renamed the
-            # config to Qwen3_5MoeTextConfig which pre-5.x-aware vLLM can't load
-            # (vllm#36236). Build from main (like glm47) to get the arch + MTP +
-            # the transformers-5.x fix. The model card claims vLLM >=0.19.1 but
-            # that predates the transformers-5.x rename fix, so main is safer.
-            # main needs the newer torch::stable ABI → NGC 26.05 (the glm52
-            # lesson: 26.03 fails the csrc/libtorch_stable CUDA compile), and a
-            # main-matching DeepGEMM for the block-FP8 GEMM path. transformers
-            # >=5.8.1 per the model card.
+            # vLLM version: qwen3_5_moe is a NEW architecture (hybrid + MoE +
+            # multimodal). Older releases reject it ("architectures
+            # ['Qwen3_5MoeForConditionalGeneration'] are not supported",
+            # vllm#35344), and transformers 5.x renamed the config to
+            # Qwen3_5MoeTextConfig which pre-5.x-aware vLLM can't load (vllm#36236).
+            # Build from main (like glm47) to get the arch (incl. the mamba/GDN
+            # kernels) + the transformers-5.x fix. The model card claims vLLM
+            # >=0.19.1 but that predates the transformers-5.x rename fix, so main
+            # is safer. main needs the newer torch::stable ABI → NGC 26.05 (the
+            # glm52 lesson: 26.03 fails the csrc/libtorch_stable CUDA compile).
+            # DeepGEMM is pinned to the main-matching ref for build compatibility
+            # only (unused by Ornith's channel/token FP8). transformers >=5.8.1.
             #
             # ⚠️ VERIFY on first build/serve, then PIN VLLM_VERSION to the
             # validated main commit for reproducibility (as glm52 does). If a
@@ -289,7 +292,7 @@ apply_preset() {
             PRESET_TRANSFORMERS=">=5.8.1"
             PRESET_NGC_TAG="26.05-py3"
             PRESET_DEEPGEMM_REF="88965b0781"
-            PRESET_NOTES="Ornith 1.0 (Qwen3.5 MoE) FP8: ornith=397B flagship 2-node TP=4+PP=2, ornith_gh200=35B single GH200 (TP=1). Native MTP, qwen3_xml/qwen3 parsers. vLLM main + transformers>=5.8.1 + NGC 26.05."
+            PRESET_NOTES="Ornith 1.0 (Qwen3.5 hybrid-attn MoE, multimodal) FP8 W8A8: ornith=397B flagship 2-node TP=4+PP=2, ornith_gh200=35B single GH200 (TP=1). qwen3_xml/qwen3 parsers, MTP off (FP8 has no MTP weights). vLLM main + transformers>=5.8.1 + NGC 26.05."
             ;;
         devstral|mistral|Devstral|Mistral)
             MODEL_ID="devstral"

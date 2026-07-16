@@ -233,8 +233,8 @@ export ANTHROPIC_BASE_URL=http://localhost:8002 ANTHROPIC_AUTH_TOKEN=x && claude
 | `kimi` | `moonshotai/Kimi-K2.6` | 8 (2 nodes × 4) | `vllm-kimi-4` | TP=4 + PP=2, native int4, MLA, multimodal, vLLM 0.21. Eager. reasoning_tokens on chat/completions |
 | `kimi27` | `moonshotai/Kimi-K2.7-Code` | 8 (2 nodes × 4) | `vllm-kimi-4` (shared) | Same arch + container as K2.6 (no rebuild); thinking-only |
 | `laguna` | `poolside/Laguna-M.1-FP8` | 4 | `vllm-laguna-1` | TP=4, single node. FP8 (~225 GB), dense attention (FLASH_ATTN), CUDAGraph on. vLLM v0.21.0, `poolside_v1` parsers |
-| `ornith` | `deepreinforce-ai/Ornith-1.0-397B-FP8` | 8 (2 nodes × 4) | `vllm-ornith-1` | **397B flagship.** TP=4 + PP=2, block-FP8 (~400 GB). Qwen3.5 MoE, **native MTP** (PP-gated; `ALLOW_MTP_PP=1`), 256K ctx, FLASH_ATTN + PIECEWISE capture, engine-as-actor Ray. Same multi-node PP wedge risk as glm51. vLLM main, transformers ≥5.8.1 |
-| `ornith_gh200` | `deepreinforce-ai/Ornith-1.0-35B-FP8` | 1 | `vllm-ornith-1` (shared) | **35B on a single GH200 card** (TP=1), ~3B active, MTP on, 256K ctx — max single-user throughput; shares the `ornith` container, `qwen3_xml`/`qwen3` parsers |
+| `ornith` | `deepreinforce-ai/Ornith-1.0-397B-FP8` | 8 (2 nodes × 4) | `vllm-ornith-1` | **397B flagship.** TP=4 + PP=2, FP8 W8A8 (~400 GB). Qwen3.5 hybrid-attn MoE, 256K ctx, PIECEWISE capture + engine-as-actor Ray. MTP off (no head in FP8). Same multi-node PP wedge risk as glm51. vLLM main, transformers ≥5.8.1 |
+| `ornith_gh200` | `deepreinforce-ai/Ornith-1.0-35B-FP8` | 1 | `vllm-ornith-1` (shared) | **35B on a single GH200 card** (TP=1), ~3B active, hybrid linear+full attn, multimodal, 256K ctx — max single-user throughput. MTP off (no head in FP8). Shares the `ornith` container, `qwen3_xml`/`qwen3` parsers |
 | `gemma4` | Gemma 4 (31B, multimodal) | 1–2 | `vllm-gemma4-1` | vLLM v0.19.0, AWQ |
 | `devstral` | `mistralai/Devstral-2-123B-Instruct-2512` | 4 | `vllm-devstral-1` | TP=4 |
 | `llama` | `meta-llama/Llama-3.3-70B-Instruct` | 4 | — | TP=4 |
@@ -247,13 +247,13 @@ export ANTHROPIC_BASE_URL=http://localhost:8002 ANTHROPIC_AUTH_TOKEN=x && claude
 
 Latest measured throughput / latency. **Update this section after every sweep** (with the date + config).
 
-### Ornith 1.0 (`ornith` / `ornith_gh200`) — Qwen3.5 MoE FP8, MTP · pending first on-cluster serve · added 2026-07-16
-Not yet built or served on Olivia — ledger placeholder for the config. Both are `qwen3_5_moe` block-FP8 with a **native MTP head** (`mtp_num_hidden_layers=1`), served from **one shared container**:
+### Ornith 1.0 (`ornith` / `ornith_gh200`) — Qwen3.5 hybrid-attn MoE FP8 · build in progress on-cluster · 2026-07-16
+Both are `qwen3_5_moe` FP8 W8A8, served from **one shared container**. **On-cluster inspection of the 35B FP8 checkpoint (2026-07-16) overturned the model card:** the arch is **hybrid attention** (Gated-DeltaNet `linear_attn` + full `self_attn`, the Qwen3-Next/3.5 lineage — *not* plain GQA), it's **multimodal** (vision tower), the FP8 is **compressed-tensors channel/token W8A8** (not block-FP8, so DeepGEMM is unused), and the config declares `mtp_num_hidden_layers=1` but the FP8 export **ships no MTP weights** → **MTP is off** (not available on these checkpoints).
 
-- **`ornith`** — **397B flagship**, 2 nodes × 4 GH200, TP=4 + PP=2, 256K context. ~400 GB weights across 8×GH200 leaves ~280 GB KV (~18 seqs @256K). Crosses a node boundary (PP over Slingshot) like glm51, so it uses PIECEWISE CUDAGraph + engine-as-actor Ray and carries the **same multi-node PP decode-wedge risk**. MTP is auto-off under PP (`ALLOW_MTP_PP=1` to try — the main lever for slow multi-node single-stream decode).
-- **`ornith_gh200`** — **35B** (~3B active) on **1× GH200 card**, TP=1, MTP on, 256K context, max single-user throughput (~35 GB weights + ~10 GB KV @256K fit one 96 GB card). Ordinary GQA attention → FLASH_ATTN + CUDAGraph capture, plus MTP for the single-stream speedup that is the point of this preset.
+- **`ornith`** — **397B flagship**, 2 nodes × 4 GH200, TP=4 + PP=2, 256K context. ~400 GB weights across 8×GH200 leaves ~280 GB KV (~18 seqs @256K). Crosses a node boundary (PP over Slingshot) like glm51 → PIECEWISE CUDAGraph + engine-as-actor Ray, **same multi-node PP decode-wedge risk**.
+- **`ornith_gh200`** — **35B** (~3B active) on **1× GH200 card**, TP=1, 256K context, max single-user throughput (~35 GB weights + ~10 GB KV @256K fit one 96 GB card). Auto-select backend (hybrid) + CUDAGraph capture.
 
-⚠️ **First-serve verification:** the vLLM-main `qwen3_5_moe` build on NGC 26.05; that the generic `mtp` method loads Ornith's native head; CUDAGraph capture stability (fall back `CUDAGRAPH_MODE=NONE` like Kimi/glm52 if it IMAs); the FP8/DeepGEMM path; and for the 2-node `ornith`, that engine-as-actor Ray + PIECEWISE de-wedges decode and whether `ALLOW_MTP_PP=1` works. Fill in the `bench_sweep.py` numbers after the first run.
+**Status:** 35B FP8 prefetched (projects tier); container build submitted (job 1592192, 1 GPU, ~2h). ⚠️ **First-serve verification pending:** that vLLM main builds+serves the hybrid multimodal `qwen3_5_moe` on NGC 26.05 (mamba/GDN kernels, vision tower, W8A8 FP8); CUDAGraph capture stability on the hybrid (fall back `CUDAGRAPH_MODE=NONE`); and for the 2-node `ornith`, engine-as-actor Ray + PIECEWISE de-wedge. Fill in the `bench_sweep.py` numbers after the first run.
 
 ### Laguna M.1 (`laguna`) — 1 node × 4 GH200, FP8, CUDAGraph · 2026-06-20
 Concurrency sweep (`bench_sweep.py`, `max_tokens=512`), reasoning on (`enable_thinking=true`) vs off:

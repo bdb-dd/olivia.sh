@@ -343,14 +343,21 @@ if [[ "${MODEL}" == *"Laguna"* ]] || [[ "${MODEL}" == *"laguna"* ]]; then
 fi
 
 # Detect Ornith 1.0 (Deep Reinforce). Agentic-coding MoE post-trained on Qwen 3.5
-# (arch Qwen3_5MoeForConditionalGeneration / model_type qwen3_5_moe). The 35B MoE
-# we serve is ~3B active with 256 experts, 256K context, and a NATIVE MTP module.
-# It uses ORDINARY GQA attention (NOT MLA like GLM-5.x/Kimi), so — like Laguna —
-# it keeps the FLASH_ATTN default and lets CUDAGraph capture run (no eager
-# override). The qwen3_xml/qwen3 parser family, not GLM/Kimi/Laguna, so it is
-# tracked separately. Both the single-node (TP=4, preset 'ornith') and the
-# single-GH200 (TP=1, 'ornith_gh200') deployments hit this block; it is
-# TP-agnostic — olivia.sh sets TP_SIZE from the preset's GPU count.
+# (arch Qwen3_5MoeForConditionalGeneration / model_type qwen3_5_moe).
+# GROUND TRUTH from the FP8 checkpoint (verified on-cluster 2026-07-16, NOT what
+# the model card implies):
+#   - HYBRID attention: each layer has BOTH a Gated-DeltaNet linear_attn mixer
+#     (conv1d + in_proj_a/b/qkv/z) AND a full self_attn — the Qwen3-Next/3.5
+#     lineage, NOT plain GQA. So we must let vLLM AUTO-SELECT the backend (the
+#     linear-attn layers need a mamba/GDN kernel + recurrent state, not FLASH_ATTN).
+#   - MULTIMODAL: ships a vision tower (model.visual.*, 333 tensors) + video
+#     preprocessor. We serve it for TEXT (coding); the vision encoder just loads.
+#   - MTP: config declares mtp_num_hidden_layers=1, but the FP8 export SHIPS NO
+#     MTP WEIGHTS (layers stop at 39, zero mtp/nextn tensors). So MTP speculative
+#     decode does NOT work on the published FP8 checkpoints — it is OFF by default
+#     (ENABLE_SPECULATIVE=1 only if you point at a checkpoint that has the head).
+# Uses the qwen3_xml/qwen3 parser family. Both `ornith` (2-node 397B) and
+# `ornith_gh200` (1× GH200 35B) hit this block; it is shape-agnostic.
 IS_ORNITH=0
 if [[ "${MODEL}" == *"Ornith"* ]] || [[ "${MODEL}" == *"ornith"* ]]; then
     IS_ORNITH=1
@@ -533,10 +540,13 @@ fi
 # from whatever is installed — if nothing works, the error will tell us what
 # to install.
 if [[ -z "${VLLM_ATTENTION_BACKEND}" ]]; then
-    if [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" ]]; then
-        # MLA models: FLASH_ATTN rejects MLA. GLM-5.x is sparse-MLA (DSA); Kimi
-        # K2.6 is standard MLA. Leave empty so vLLM auto-selects an MLA backend.
-        VLLM_ATTENTION_BACKEND=""   # auto-select (sparse MLA for GLM-5.x)
+    if [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_ORNITH}" == "1" ]]; then
+        # Don't force FLASH_ATTN — these need vLLM to auto-select a special backend:
+        #   GLM-5.x  sparse-MLA (DSA); Kimi K2.6 standard MLA — FLASH_ATTN rejects MLA.
+        #   Ornith   HYBRID (Gated-DeltaNet linear_attn + full self_attn) — the
+        #            linear-attn layers use a mamba/GDN kernel + recurrent state, not
+        #            FLASH_ATTN. vLLM's qwen3_5_moe wires the hybrid KV/state itself.
+        VLLM_ATTENTION_BACKEND=""   # auto-select
     else
         VLLM_ATTENTION_BACKEND="FLASH_ATTN"
     fi
@@ -579,11 +589,13 @@ elif [[ "${ENABLE_SPECULATIVE}" == "auto" ]]; then
     if [[ "${IS_GLM_MOE}" == "1" ]]; then
         USE_SPECULATIVE=1
         echo "[INFO] Auto-enabling MTP speculative decoding for GLM MoE model"
-    elif [[ "${IS_ORNITH}" == "1" ]]; then
-        # Ornith ships a native MTP head — MTP is the whole point of the preset
-        # (single-user decode speedup, exactly the ornith_gh200 goal). Auto-on.
-        USE_SPECULATIVE=1
-        echo "[INFO] Auto-enabling MTP speculative decoding for Ornith (native MTP module)"
+    fi
+    # Ornith is intentionally NOT auto-on: its config declares mtp_num_hidden_layers=1
+    # but the published FP8 checkpoints ship NO MTP weights (verified on-cluster),
+    # so --speculative-config mtp would fail to load a draft. Opt in with
+    # ENABLE_SPECULATIVE=1 only against a checkpoint that actually has the head.
+    if [[ "${IS_ORNITH}" == "1" && "${ENABLE_SPECULATIVE}" == "auto" ]]; then
+        echo "[INFO] Ornith: MTP speculative decode OFF (FP8 checkpoint ships no MTP weights). ENABLE_SPECULATIVE=1 to force."
     fi
 fi
 
@@ -669,7 +681,13 @@ if [[ "${IS_ORNITH}" == "1" ]]; then
     echo "  Tool Parser:      ${ORNITH_TOOL_PARSER:-<none>}"
     echo "  Reasoning Parser: ${ORNITH_REASONING_PARSER:-<none>}"
     echo "  Auto Tool Choice: ${ENABLE_AUTO_TOOL_CHOICE}"
-    echo "  MTP:              native (mtp_num_hidden_layers=1)"
+    echo "  Attention:        hybrid (Gated-DeltaNet linear + full self-attn), backend ${VLLM_ATTENTION_BACKEND:-<auto-select>}"
+    echo "  Multimodal:       vision tower present (served for text)"
+    if [[ "${USE_SPECULATIVE}" == "1" ]]; then
+        echo "  MTP:              ${ORNITH_MTP_SPECULATIVE_TOKENS} tokens (forced via ENABLE_SPECULATIVE=1)"
+    else
+        echo "  MTP:              off (FP8 checkpoint ships no MTP weights)"
+    fi
     if [[ "${TP_SIZE}" == "1" ]]; then
         echo "  Shape:            single GH200 card (TP=1) — max single-user throughput"
     elif [[ "${NUM_NODES}" -gt 1 ]]; then

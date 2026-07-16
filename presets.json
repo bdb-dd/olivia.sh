@@ -92,6 +92,22 @@
       "storage": "projects",
       "description": "Laguna M.1 225B MoE (23B active), block-FP8, single-node TP=4, CUDAGraph on"
     },
+    "ornith": {
+      "aliases": ["ornith-35b", "ornith-1.0-35b", "ornith35b", "ornith-1.0"],
+      "model": "deepreinforce-ai/Ornith-1.0-35B-FP8",
+      "nodes": 1, "gpus": 4, "pp": 1,
+      "container_prefix": "ornith", "index": 1,
+      "storage": "projects",
+      "description": "Ornith 1.0 35B MoE (Qwen3.5, ~3B active), block-FP8, single-node TP=4, MTP on, 256K ctx (tuned for concurrency ~16)"
+    },
+    "ornith_gh200": {
+      "aliases": ["ornith-gh200", "ornith-1gpu", "ornith-solo", "ornith-35b-gh200"],
+      "model": "deepreinforce-ai/Ornith-1.0-35B-FP8",
+      "nodes": 1, "gpus": 1, "pp": 1,
+      "container_prefix": "ornith", "index": 1,
+      "storage": "projects",
+      "description": "Ornith 1.0 35B MoE FP8 on a SINGLE GH200 card (TP=1), MTP on, 256K ctx — tuned for max single-user throughput (shares the ornith container)"
+    },
     "devstral": {
       "aliases": ["mistral"],
       "model": "mistralai/Devstral-2-123B-Instruct-2512",

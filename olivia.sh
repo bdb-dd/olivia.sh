@@ -734,7 +734,7 @@ cmd_build() {
                 info "To build a new container:"
                 echo "    ./olivia.sh build <preset>" >&2
                 echo "" >&2
-                echo "Available presets: glm51_v19 (alias: glm51), glm51_v20, glm52, glm47, kimi, kimi27, laguna, devstral, llama, qwen, generic" >&2
+                echo "Available presets: glm51_v19 (alias: glm51), glm51_v20, glm52, glm47, kimi, kimi27, laguna, ornith, ornith_gh200, devstral, llama, qwen, generic" >&2
                 exit 0
                 ;;
             --presets|-p)
@@ -774,6 +774,15 @@ cmd_build() {
                 echo "             FP8 ~225GB, single node (4×GH200, TP=4); poolside_v1 parsers."
                 echo "             Projects-tier preset: weights on persistent"
                 echo "             /cluster/projects (default HF_HOME, no override)."
+                echo ""
+                echo "  ornith     Ornith 1.0 35B MoE (Deep Reinforce, Qwen3.5, ~3B active)"
+                echo "             vLLM: main (qwen3_5_moe + MTP), transformers>=5.8.1, NGC 26.05"
+                echo "             FP8 ~35GB, native MTP, 256K ctx. Single node (4×GH200,"
+                echo "             TP=4), tuned for concurrency ~16. qwen3_xml/qwen3 parsers."
+                echo ""
+                echo "  ornith_gh200  Ornith 1.0 35B MoE FP8 on a SINGLE GH200 card (TP=1)"
+                echo "             Same container as 'ornith'; MTP on, 256K ctx. Tuned for"
+                echo "             max single-user throughput. Aliases: ornith-gh200, ornith-1gpu."
                 echo ""
                 echo "  devstral   Devstral/Mistral models"
                 echo "             vLLM: main, transformers>=4.45.0"
@@ -1923,6 +1932,8 @@ Presets (with default models):
     glm51               GLM-5.1-AWQ (cyankiwi/GLM-5.1-AWQ-4bit) — 2 nodes × 4 GPUs, TP=4 + PP=2
     glm52               GLM-5.2-FP8 (RedHatAI/GLM-5.2-FP8) — 3 nodes × 4 GPUs, TP=4 + PP=3 (needs vLLM main + PR#45895)
     glm47               GLM-4.7-AWQ (QuantTrio/GLM-4.7-AWQ)
+    ornith              Ornith 1.0 35B MoE FP8 (deepreinforce-ai/Ornith-1.0-35B-FP8) — single node × 4 GPUs, TP=4, MTP, 256K
+    ornith_gh200        Ornith 1.0 35B MoE FP8 — single GH200 card, TP=1, MTP (max single-user throughput)
     devstral            Devstral 123B (mistralai/Devstral-2-123B-Instruct-2512)
     llama               Llama 3.3 70B (meta-llama/Llama-3.3-70B-Instruct)
     qwen                Qwen 2.5 72B (Qwen/Qwen2.5-72B-Instruct)

@@ -119,6 +119,18 @@ KIMI_REASONING_PARSER="${KIMI_REASONING_PARSER:-kimi_k2}"
 LAGUNA_TOOL_PARSER="${LAGUNA_TOOL_PARSER:-poolside_v1}"
 LAGUNA_REASONING_PARSER="${LAGUNA_REASONING_PARSER:-poolside_v1}"
 LAGUNA_ENABLE_THINKING="${LAGUNA_ENABLE_THINKING:-1}"
+# Ornith 1.0 (Deep Reinforce) settings — used when MODEL contains "Ornith". The
+# model card's vLLM serve command uses the qwen3_xml tool-call parser + qwen3
+# reasoning parser (Ornith emits <think> reasoning). Set either to "" to omit.
+ORNITH_TOOL_PARSER="${ORNITH_TOOL_PARSER:-qwen3_xml}"
+ORNITH_REASONING_PARSER="${ORNITH_REASONING_PARSER:-qwen3}"
+# Ornith ships a NATIVE MTP module (config mtp_num_hidden_layers=1), so vLLM runs
+# Multi-Token-Prediction speculative decode from the model's own head — no
+# external draft model. Method name and draft depth are overridable: the method
+# is vLLM's generic "mtp" (the qwen3.5/3.6 recipe), draft depth 2 by default (the
+# single MTP layer is applied autoregressively). Tune 1-3 and watch accept rate.
+ORNITH_MTP_METHOD="${ORNITH_MTP_METHOD:-mtp}"
+ORNITH_MTP_SPECULATIVE_TOKENS="${ORNITH_MTP_SPECULATIVE_TOKENS:-2}"
 # ENABLE_AUTO_TOOL_CHOICE default is model-dependent and gets resolved after
 # GLM detection below: 1 for GLM MoE models (tool parser is always set),
 # 0 elsewhere. Users can still override explicitly.
@@ -213,9 +225,22 @@ fi
 
 mkdir -p "${HF_CACHE}" "${VLLM_CACHE}" "${VLLM_CACHE_ROOT}" "${TRITON_CACHE_DIR}" "${DG_JIT_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}"
 
-# GPU ordering: Put slowest GPU (usually GPU 0) last
-# This improves tensor parallel performance on GH200
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1,2,3,0}"
+# GPU ordering: on a full 4-GPU node, put the slowest GPU (usually GPU 0) last —
+# this improves tensor-parallel performance on GH200. Only do this when TP_SIZE=4
+# (a whole-node allocation). For a PARTIAL-node allocation — e.g. the single-GH200
+# `ornith_gh200` preset (TP=1) started with --gpus-per-node=1 — a hardcoded
+# "1,2,3,0" would name devices that don't exist and crash init.
+#   - If SLURM constrained the allocation it already exported CUDA_VISIBLE_DEVICES
+#     to just the granted GPU(s) — honour that (the `:-` default won't fire).
+#   - If SLURM handed over the whole node (var unset), default to a single card
+#     (GPU 0) so we truly drive ONE GH200, matching the preset's intent.
+# Either way CUDA_VISIBLE_DEVICES ends up defined and non-empty, so the later
+# `set -u` reference and the container --env forward never trip / hide all GPUs.
+if [[ "${TP_SIZE}" == "4" ]]; then
+    export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1,2,3,0}"
+else
+    export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+fi
 
 # NCCL optimizations for GH200 NVLink
 export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-NVL}"        # Use NVLink for P2P
@@ -317,6 +342,20 @@ if [[ "${MODEL}" == *"Laguna"* ]] || [[ "${MODEL}" == *"laguna"* ]]; then
     IS_LAGUNA=1
 fi
 
+# Detect Ornith 1.0 (Deep Reinforce). Agentic-coding MoE post-trained on Qwen 3.5
+# (arch Qwen3_5MoeForConditionalGeneration / model_type qwen3_5_moe). The 35B MoE
+# we serve is ~3B active with 256 experts, 256K context, and a NATIVE MTP module.
+# It uses ORDINARY GQA attention (NOT MLA like GLM-5.x/Kimi), so — like Laguna —
+# it keeps the FLASH_ATTN default and lets CUDAGraph capture run (no eager
+# override). The qwen3_xml/qwen3 parser family, not GLM/Kimi/Laguna, so it is
+# tracked separately. Both the single-node (TP=4, preset 'ornith') and the
+# single-GH200 (TP=1, 'ornith_gh200') deployments hit this block; it is
+# TP-agnostic — olivia.sh sets TP_SIZE from the preset's GPU count.
+IS_ORNITH=0
+if [[ "${MODEL}" == *"Ornith"* ]] || [[ "${MODEL}" == *"ornith"* ]]; then
+    IS_ORNITH=1
+fi
+
 # Kimi K2.6's fused MLA op (vllm.min_latency_fused_qkv_a_proj) has no fake/meta
 # dispatch, so vLLM's torch.compile/CUDAGraph path fails during profile_run on
 # this multi-node PP setup ("Multiple dispatch failed ... NotImplemented", from
@@ -360,7 +399,7 @@ fi
 # any OpenAI tool-using client (Claude Code via anthropic_proxy.py, etc.).
 # ``${VAR+x}`` distinguishes "user explicitly set (even to 0)" from "unset".
 if [[ -z "${ENABLE_AUTO_TOOL_CHOICE+x}" ]]; then
-    if [[ "${IS_GLM_MOE}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" ]]; then
+    if [[ "${IS_GLM_MOE}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" || "${IS_ORNITH}" == "1" ]]; then
         ENABLE_AUTO_TOOL_CHOICE=1
     else
         ENABLE_AUTO_TOOL_CHOICE=0
@@ -372,7 +411,13 @@ fi
 # matches typical Claude Code usage (which requests max_tokens=32000).
 # Other models keep the conservative 32K default.
 if [[ -z "${MAX_MODEL_LEN+x}" ]]; then
-    if [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" ]]; then
+    if [[ "${IS_ORNITH}" == "1" ]]; then
+        # Ornith 35B FP8 is small (~35 GB weights) with a 256K native window, so
+        # the FULL context fits both targets: single-GH200 single-user (KV ~10 GB
+        # @256K on a 96 GB card) and single-node concurrency-16 (the fp16 KV pool
+        # on 4×GH200 holds well over 16×256K tokens). Serve the whole 262144.
+        MAX_MODEL_LEN=262144
+    elif [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" ]]; then
         # GLM-5.1 ~205K, GLM-5.2 ~1M, Kimi K2.6 ~256K, Laguna M.1 ~256K native —
         # all ship far larger windows, but 128K is the safe default within budget.
         # On glm52's 3-node FP8 (~18 GB/GPU KV), 128K holds a few concurrent
@@ -520,6 +565,11 @@ elif [[ "${ENABLE_SPECULATIVE}" == "auto" ]]; then
     if [[ "${IS_GLM_MOE}" == "1" ]]; then
         USE_SPECULATIVE=1
         echo "[INFO] Auto-enabling MTP speculative decoding for GLM MoE model"
+    elif [[ "${IS_ORNITH}" == "1" ]]; then
+        # Ornith ships a native MTP head — MTP is the whole point of the preset
+        # (single-user decode speedup, exactly the ornith_gh200 goal). Auto-on.
+        USE_SPECULATIVE=1
+        echo "[INFO] Auto-enabling MTP speculative decoding for Ornith (native MTP module)"
     fi
 fi
 
@@ -545,6 +595,10 @@ if [[ "${USE_SPECULATIVE}" == "1" ]]; then
         echo "  Enabled:          yes"
         echo "  Method:           MTP (Multi-Token Prediction)"
         echo "  Spec Tokens:      ${MTP_SPECULATIVE_TOKENS}"
+    elif [[ "${IS_ORNITH}" == "1" ]]; then
+        echo "  Enabled:          yes"
+        echo "  Method:           ${ORNITH_MTP_METHOD} (native qwen3_5_moe MTP)"
+        echo "  Spec Tokens:      ${ORNITH_MTP_SPECULATIVE_TOKENS}"
     else
         echo "  Enabled:          yes"
         echo "  Method:           ngram"
@@ -593,6 +647,20 @@ if [[ "${IS_LAGUNA}" == "1" ]]; then
     echo "  Reasoning Parser: ${LAGUNA_REASONING_PARSER:-<none>}"
     echo "  Auto Tool Choice: ${ENABLE_AUTO_TOOL_CHOICE}"
     echo "  Thinking Mode:    ${LAGUNA_ENABLE_THINKING}"
+fi
+
+if [[ "${IS_ORNITH}" == "1" ]]; then
+    echo ""
+    echo "Ornith 1.0 Settings:"
+    echo "  Tool Parser:      ${ORNITH_TOOL_PARSER:-<none>}"
+    echo "  Reasoning Parser: ${ORNITH_REASONING_PARSER:-<none>}"
+    echo "  Auto Tool Choice: ${ENABLE_AUTO_TOOL_CHOICE}"
+    echo "  MTP:              native (mtp_num_hidden_layers=1)"
+    if [[ "${TP_SIZE}" == "1" ]]; then
+        echo "  Shape:            single GH200 card (TP=1) — max single-user throughput"
+    else
+        echo "  Shape:            single node (TP=${TP_SIZE})"
+    fi
 fi
 
 if [[ "${NUM_NODES}" -gt 1 ]]; then
@@ -864,6 +932,10 @@ if [[ "${USE_SPECULATIVE}" == "1" ]]; then
     if [[ "${IS_GLM_MOE}" == "1" ]]; then
         # GLM-4.7/GLM-5.1 use MTP (Multi-Token Prediction) speculative decoding
         SPEC_CONFIG='{"method": "mtp", "num_speculative_tokens": '${MTP_SPECULATIVE_TOKENS}'}'
+    elif [[ "${IS_ORNITH}" == "1" ]]; then
+        # Ornith (qwen3_5_moe) ships a native MTP module — vLLM's generic "mtp"
+        # method loads it and drafts from the model's own head, no draft model.
+        SPEC_CONFIG='{"method": "'${ORNITH_MTP_METHOD}'", "num_speculative_tokens": '${ORNITH_MTP_SPECULATIVE_TOKENS}'}'
     else
         # Default: ngram speculative decoding
         SPEC_CONFIG='{"method": "ngram", "num_speculative_tokens": '${NUM_SPECULATIVE_TOKENS}', "prompt_lookup_max": '${PROMPT_LOOKUP_MAX}'}'
@@ -955,6 +1027,33 @@ if [[ "${IS_LAGUNA}" == "1" ]]; then
     # the default chat-template kwargs. LAGUNA_ENABLE_THINKING=0 serves instant.
     if [[ "${LAGUNA_ENABLE_THINKING}" == "1" ]]; then
         VLLM_ARGS+=("--default-chat-template-kwargs" '{"enable_thinking": true}')
+    fi
+fi
+
+# Ornith 1.0 (Deep Reinforce) arguments. Mirrors the model card's vLLM serve
+# command: qwen3_xml tool parser + qwen3 reasoning parser + auto-tool-choice +
+# trust-remote-code + prefix caching. MTP is wired via --speculative-config above.
+if [[ "${IS_ORNITH}" == "1" ]]; then
+    if [[ -n "${ORNITH_TOOL_PARSER}" ]]; then
+        VLLM_ARGS+=("--tool-call-parser" "${ORNITH_TOOL_PARSER}")
+    fi
+    if [[ -n "${ORNITH_REASONING_PARSER}" ]]; then
+        VLLM_ARGS+=("--reasoning-parser" "${ORNITH_REASONING_PARSER}")
+    fi
+    if [[ "${ENABLE_AUTO_TOOL_CHOICE}" == "1" ]]; then
+        VLLM_ARGS+=("--enable-auto-tool-choice")
+    fi
+    if [[ -n "${SERVED_MODEL_NAME}" ]]; then
+        VLLM_ARGS+=("--served-model-name" "${SERVED_MODEL_NAME}")
+    fi
+    # qwen3_5_moe is a new arch that ships a custom config/code; the model card's
+    # serve command passes --trust-remote-code.
+    VLLM_ARGS+=("--trust-remote-code")
+    # Prefix caching: the model card recommends it (repetitive agentic-coding
+    # prompts share long prefixes). vLLM v1 defaults it on, but pass it explicitly
+    # to match the card. ORNITH_ENABLE_PREFIX_CACHING=0 to disable.
+    if [[ "${ORNITH_ENABLE_PREFIX_CACHING:-1}" == "1" ]]; then
+        VLLM_ARGS+=("--enable-prefix-caching")
     fi
 fi
 

@@ -247,13 +247,21 @@ export ANTHROPIC_BASE_URL=http://localhost:8002 ANTHROPIC_AUTH_TOKEN=x && claude
 
 Latest measured throughput / latency. **Update this section after every sweep** (with the date + config).
 
-### Ornith 1.0 (`ornith` / `ornith_gh200`) — Qwen3.5 hybrid-attn MoE FP8 · build in progress on-cluster · 2026-07-16
-Both are `qwen3_5_moe` FP8 W8A8, served from **one shared container**. **On-cluster inspection of the 35B FP8 checkpoint (2026-07-16) overturned the model card:** the arch is **hybrid attention** (Gated-DeltaNet `linear_attn` + full `self_attn`, the Qwen3-Next/3.5 lineage — *not* plain GQA), it's **multimodal** (vision tower), the FP8 is **compressed-tensors channel/token W8A8** (not block-FP8, so DeepGEMM is unused), and the config declares `mtp_num_hidden_layers=1` but the FP8 export **ships no MTP weights** → **MTP is off** (not available on these checkpoints).
+### Ornith 1.0 `ornith_gh200` — 35B MoE FP8 on 1× GH200, CUDAGraph · 2026-07-16
+Concurrency sweep (`bench_sweep.py`, `max_tokens=512`, reasoning on, warm/JIT-cached pass):
 
-- **`ornith`** — **397B flagship**, 2 nodes × 4 GH200, TP=4 + PP=2, 256K context. ~400 GB weights across 8×GH200 leaves ~280 GB KV (~18 seqs @256K). Crosses a node boundary (PP over Slingshot) like glm51 → PIECEWISE CUDAGraph + engine-as-actor Ray, **same multi-node PP decode-wedge risk**.
-- **`ornith_gh200`** — **35B** (~3B active) on **1× GH200 card**, TP=1, 256K context, max single-user throughput (~35 GB weights + ~10 GB KV @256K fit one 96 GB card). Auto-select backend (hybrid) + CUDAGraph capture.
+| Concurrency | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| Aggregate tok/s | 173.9 | 310.1 | 565.6 | 1038.9 | 1720.1 | 2866.5 | 4564.2 |
+| Per-stream tok/s | 173.9 | 155.2 | 141.5 | 130.0 | 107.6 | 89.8 | 71.5 |
+| p95 TTFT (s) | 0.04 | 0.07 | 0.07 | 0.07 | 0.16 | 0.20 | 0.34 |
 
-**Status:** 35B FP8 prefetched (projects tier); container build submitted (job 1592192, 1 GPU, ~2h). ⚠️ **First-serve verification pending:** that vLLM main builds+serves the hybrid multimodal `qwen3_5_moe` on NGC 26.05 (mamba/GDN kernels, vision tower, W8A8 FP8); CUDAGraph capture stability on the hybrid (fall back `CUDAGRAPH_MODE=NONE`); and for the 2-node `ornith`, engine-as-actor Ray + PIECEWISE de-wedge. Fill in the `bench_sweep.py` numbers after the first run.
+**Single GH200 card, TP=1, 0 failures 1→64.** Single-stream **~174 tok/s** — the fastest single-stream of any preset here (vs Laguna ~63, GLM-5.2 ~5.6, Kimi ~17), exactly the "max single-user throughput" this preset targets; MoE (~3B active) + CUDAGraph FULL capture (captures cleanly on the hybrid, unlike eager Kimi/glm52). Per-stream degrades gracefully to ~72 tok/s @64; aggregate near-linear to ~4560 tok/s @64. TTFT sub-100 ms through 8-way. (A cold-pass c=8 outlier — a 5.2 s triton JIT stall on a fresh shape — vanished once kernels were cached.) vLLM main `75bdad4`, transformers 5.8.1, NGC 26.05, 256K context.
+
+**On-cluster reality (Qwen3-Next hybrid on the NGC stack — the model card is misleading):** the 35B is `Qwen3_5MoeForConditionalGeneration`, a **hybrid** model (Gated-DeltaNet `linear_attn` + full `self_attn`), multimodal (vision tower, served for text), **channel/token W8A8 FP8** (not block-FP8 → DeepGEMM unused), and the FP8 export ships **no MTP weights** (config declares `mtp_num_hidden_layers=1` but the head is absent → MTP off). vLLM main pulls **flashinfer 0.6.14**, version-skewed against the container's cute-dsl (its Blackwell kernel imports `cutlass.cute.nvgpu.OperandMajorMode`, absent here) → importing it crashes engine init. Serving it needed: **flashinfer removed** (Hopper doesn't need its Blackwell kernels), the `ll_bf16` cute-dsl router-GEMM warmup **skipped** (needs the absent `quack`), and GDN prefill forced to the **in-tree Triton/FLA** kernel (`--additional-config '{"gdn_prefill_backend":"triton"}'`) — an all-Triton/CUTLASS path, zero flashinfer. Two shared build-script bugs were also fixed en route (`NGC_PYTORCH_TAG` forwarding, verify-from-source-tree). See CLAUDE.md.
+
+### Ornith 1.0 `ornith` — 397B flagship, 2 nodes · pending (2-node allocation unavailable)
+Not yet served — same shared `qwen3_5_moe` container. 2 nodes × 4 GH200, TP=4 + PP=2, ~400 GB W8A8, PIECEWISE CUDAGraph + engine-as-actor Ray (like glm52), same multi-node PP decode-wedge risk as glm51. Blocked only on scheduling a 2-node shape (est. ~1–2 days out at time of writing); the build + serving fixes are shared with `ornith_gh200`.
 
 ### Laguna M.1 (`laguna`) — 1 node × 4 GH200, FP8, CUDAGraph · 2026-06-20
 Concurrency sweep (`bench_sweep.py`, `max_tokens=512`), reasoning on (`enable_thinking=true`) vs off:

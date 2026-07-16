@@ -131,6 +131,14 @@ ORNITH_REASONING_PARSER="${ORNITH_REASONING_PARSER:-qwen3}"
 # single MTP layer is applied autoregressively). Tune 1-3 and watch accept rate.
 ORNITH_MTP_METHOD="${ORNITH_MTP_METHOD:-mtp}"
 ORNITH_MTP_SPECULATIVE_TOKENS="${ORNITH_MTP_SPECULATIVE_TOKENS:-2}"
+# GDN (Gated DeltaNet) linear-attention prefill backend. On Hopper vLLM defaults
+# ("auto") to FlashInfer for the GDN prefill kernel, but flashinfer 0.6.x is
+# version-skewed against the NGC container's cutlass-dsl (its Blackwell kernel
+# imports `cutlass.cute.nvgpu.OperandMajorMode`, absent here) — importing it
+# crashes engine init, and it's ALSO probed by the FP8-MoE oracle. Force the
+# in-tree Triton/FLA GDN kernel so Ornith serves with NO flashinfer dependency.
+# (Verified on-cluster 2026-07-16: triton path serves; flashinfer path does not.)
+ORNITH_GDN_PREFILL_BACKEND="${ORNITH_GDN_PREFILL_BACKEND:-triton}"
 # ENABLE_AUTO_TOOL_CHOICE default is model-dependent and gets resolved after
 # GLM detection below: 1 for GLM MoE models (tool parser is always set),
 # 0 elsewhere. Users can still override explicitly.
@@ -1088,6 +1096,11 @@ if [[ "${IS_ORNITH}" == "1" ]]; then
     # to match the card. ORNITH_ENABLE_PREFIX_CACHING=0 to disable.
     if [[ "${ORNITH_ENABLE_PREFIX_CACHING:-1}" == "1" ]]; then
         VLLM_ARGS+=("--enable-prefix-caching")
+    fi
+    # Force the Triton/FLA GDN prefill kernel (avoids the broken flashinfer path).
+    # Passed as one array element straight to `vllm serve`, so the JSON is safe.
+    if [[ -n "${ORNITH_GDN_PREFILL_BACKEND}" ]]; then
+        VLLM_ARGS+=("--additional-config" "{\"gdn_prefill_backend\": \"${ORNITH_GDN_PREFILL_BACKEND}\"}")
     fi
 fi
 

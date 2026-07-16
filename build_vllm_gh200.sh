@@ -859,6 +859,31 @@ print("PYPATCH_CUDA_VIEW_STABLE: stubbed get_cuda_view_from_cpu_tensor")
 PYPATCH_CUDA_VIEW_STABLE
 fi
 
+# ll_bf16 cute-dsl router-GEMM warmup (vLLM main, sm_90+): vLLM warms up a low-latency
+# BF16 router GEMM (cute_dsl/ll_bf16.py), but its availability check only verifies
+# `import cutlass.cute` (present on NGC) — NOT `quack` (the CuTe helper the kernel
+# actually needs), which is absent here. So the check green-lights the kernel and
+# kernel_warmup() then dies with "ModuleNotFoundError: No module named 'quack'",
+# failing engine init for any MoE model on Hopper. Make the check honest: also require
+# quack, so ll_bf16 disables cleanly when quack is missing and vLLM uses the standard
+# router GEMM. Patches the /opt/vllm source before install. No-ops on vLLM without this
+# file (older presets). Idempotent.
+python3 << 'PYPATCH_LL_BF16_QUACK'
+import os
+f = "/opt/vllm/vllm/model_executor/kernels/linear/cute_dsl/ll_bf16.py"
+if not os.path.exists(f):
+    print("PYPATCH_LL_BF16_QUACK: file absent (older vLLM), skipping"); raise SystemExit(0)
+s = open(f).read()
+if "import quack.compile_utils" in s:
+    print("PYPATCH_LL_BF16_QUACK: already applied"); raise SystemExit(0)
+anchor = "        import cutlass.cute  # noqa: F401"
+if anchor not in s:
+    print("PYPATCH_LL_BF16_QUACK: anchor not found (vLLM changed), skipping"); raise SystemExit(0)
+add = anchor + "\n        import quack.compile_utils  # noqa: F401  # NGC: ll_bf16 needs quack; skip if absent"
+open(f, "w").write(s.replace(anchor, add, 1))
+print("PYPATCH_LL_BF16_QUACK: is_available() now also requires quack")
+PYPATCH_LL_BF16_QUACK
+
 # -----------------------------------------------------------------------------
 # Graft requested upstream vLLM PRs (patch-during-build)
 # -----------------------------------------------------------------------------
@@ -1472,6 +1497,25 @@ if [[ ${BUILD_STATUS} -ne 0 ]]; then
         --constraint /tmp/constraints.txt \
         --root-user-action=ignore \
         . 2>&1 | tee /tmp/vllm_build.log | tail -100
+fi
+
+# flashinfer sanity: vLLM main pulls flashinfer, but on this NGC stack it can be
+# version-skewed against the container's cutlass-dsl — its eagerly-imported Blackwell
+# kernel references `cutlass.cute.nvgpu.OperandMajorMode` (absent), so `import
+# flashinfer` throws. That is a HARD engine-init crash for any model whose init/forward
+# probes flashinfer (Qwen3-Next/Ornith GDN prefill + the FP8-MoE backend oracle both
+# do). GH200 is Hopper and needs none of flashinfer's Blackwell kernels, and vLLM
+# falls back to Triton/CUTLASS — so if flashinfer is present but does NOT import
+# cleanly, uninstall it. Self-guarding: a healthy flashinfer (older presets/stacks) is
+# left untouched. Idempotent. (Ornith also forces the Triton GDN prefill kernel at
+# serve time via --additional-config; see run_vllm_server.sh IS_ORNITH.)
+if python3 -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('flashinfer') else 1)" 2>/dev/null; then
+    if python3 -c "import flashinfer" 2>/dev/null; then
+        echo "[flashinfer] imports cleanly — keeping"
+    else
+        echo "[flashinfer] present but import FAILS on this stack (cute-dsl skew) — uninstalling so vLLM falls back to Triton/CUTLASS"
+        pip uninstall -y flashinfer-python flashinfer 2>/dev/null || true
+    fi
 fi
 
 # Leave the vLLM SOURCE tree before importing: `pip install .` ran from /opt/vllm,

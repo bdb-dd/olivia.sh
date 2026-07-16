@@ -804,14 +804,32 @@ Knobs override: `ORNITH_TOOL_PARSER`, `ORNITH_REASONING_PARSER`,
 `ORNITH_MTP_SPECULATIVE_TOKENS`) only if you point at a checkpoint that has the MTP
 head. Expert parallel is **not** auto-enabled; `ENABLE_EXPERT_PARALLEL=1` to try it.
 
-> ⚠️ **Verify on first build/serve** (build submitted 2026-07-16, job 1592192 —
-> serve pending): that vLLM main builds+serves the hybrid multimodal `qwen3_5_moe`
-> on NGC 26.05 (mamba/GDN kernels, vision tower, compressed-tensors W8A8 FP8);
-> CUDAGraph capture stability on the hybrid (fall back `CUDAGRAPH_MODE=NONE`); and
-> — for the 2-node `ornith` — that engine-as-actor Ray + PIECEWISE de-wedges
-> decode. Then **pin `VLLM_VERSION`** to the validated commit (as glm52 does) and
-> record the sweep in README `## Performance`. (Prefetch of the 35B FP8 done; its
-> weights are on the projects tier.)
+**✅ `ornith_gh200` SERVES (validated 2026-07-16, vLLM main `75bdad4`, NGC 26.05).**
+Single GH200, TP=1, CUDAGraph FULL capture (captures cleanly on the hybrid, unlike
+Kimi/glm52), **~174 tok/s single-stream**, 0 failures 1→64 (~4560 tok/s @64). See
+README `## Performance`. Three things were required to get the Qwen3-Next hybrid up
+on this stack, all now codified (build) or defaulted (serve):
+> 1. **Drop skewed flashinfer.** vLLM main pulls flashinfer 0.6.14, whose eagerly-
+>    imported Blackwell kernel references `cutlass.cute.nvgpu.OperandMajorMode`
+>    (absent in the container's cute-dsl) → `import flashinfer` throws, crashing
+>    engine init (both the GDN prefill and the FP8-MoE oracle probe it). The build
+>    now import-tests flashinfer and **uninstalls it if broken** (self-guarding;
+>    Hopper needs none of its Blackwell kernels).
+> 2. **Skip the `ll_bf16` cute-dsl router-GEMM warmup.** Its availability check only
+>    verified `cutlass.cute` (present) not `quack` (absent) → `ModuleNotFoundError:
+>    quack` at warmup. The build pypatches the check to also require `quack`.
+> 3. **Force the Triton/FLA GDN prefill kernel** (`run_vllm_server.sh` IS_ORNITH:
+>    `--additional-config '{"gdn_prefill_backend":"triton"}'`, `ORNITH_GDN_PREFILL_BACKEND`)
+>    — the default "auto" picks flashinfer on Hopper, which we removed.
+>
+> Result: an all-Triton/CUTLASS path, zero flashinfer. (Two shared build-script bugs
+> were also fixed en route — `NGC_PYTORCH_TAG` not forwarded into the Phase-3
+> container, and the verify importing vLLM from the `/opt/vllm` source tree instead
+> of the install.) ⚠️ Still pending: **pin `VLLM_VERSION`** to `75bdad4` for repro
+> (currently unpinned `main`); and the **2-node `ornith`** (397B) serve — engine-as-
+> actor Ray + PIECEWISE de-wedge — is untested (2-node allocation unavailable at
+> validation time). The build fixes were validated by hand-patching the serving
+> container identically; a fresh gated rebuild has not yet re-confirmed them.
 
 #### Ornith Usage
 

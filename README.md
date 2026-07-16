@@ -5,7 +5,7 @@ Build and run [vLLM](https://github.com/vllm-project/vllm) on NVIDIA GH200 ARM64
 ## Features
 
 - **Preserves NGC PyTorch** - Builds vLLM without overwriting NVIDIA's custom PyTorch
-- **Model Presets** - Build + serve recipes for GLM-4.7, GLM-5.1, GLM-5.2, Kimi K2.6/K2.7, Laguna M.1, Gemma-4, Devstral, Llama, and Qwen
+- **Model Presets** - Build + serve recipes for GLM-4.7, GLM-5.1, GLM-5.2, Kimi K2.6/K2.7, Laguna M.1, Ornith 1.0, Gemma-4, Devstral, Llama, and Qwen
 - **Multi-node serving** - TP=4 intra-node + pipeline parallel across nodes over Slingshot, with an auto-bootstrapped Ray cluster (GLM-5.1/5.2 and Kimi span 2–3 nodes)
 - **Reproducible builds** - Pin a vLLM commit and graft not-yet-released upstream PRs from committed snapshots (`VLLM_PATCHES`), so a container rebuilds byte-identically
 - **GH200 Optimizations** - NCCL/NVLink tuning, optimal GPU ordering, Flash Attention, DeepGEMM/FP8 paths
@@ -233,6 +233,8 @@ export ANTHROPIC_BASE_URL=http://localhost:8002 ANTHROPIC_AUTH_TOKEN=x && claude
 | `kimi` | `moonshotai/Kimi-K2.6` | 8 (2 nodes × 4) | `vllm-kimi-4` | TP=4 + PP=2, native int4, MLA, multimodal, vLLM 0.21. Eager. reasoning_tokens on chat/completions |
 | `kimi27` | `moonshotai/Kimi-K2.7-Code` | 8 (2 nodes × 4) | `vllm-kimi-4` (shared) | Same arch + container as K2.6 (no rebuild); thinking-only |
 | `laguna` | `poolside/Laguna-M.1-FP8` | 4 | `vllm-laguna-1` | TP=4, single node. FP8 (~225 GB), dense attention (FLASH_ATTN), CUDAGraph on. vLLM v0.21.0, `poolside_v1` parsers |
+| `ornith` | `deepreinforce-ai/Ornith-1.0-35B-FP8` | 4 | `vllm-ornith-1` | TP=4, single node. FP8 (~35 GB), MoE (Qwen3.5, ~3B active), **native MTP**, 256K ctx, FLASH_ATTN + CUDAGraph. vLLM main, transformers ≥5.8.1, `qwen3_xml`/`qwen3` parsers |
+| `ornith_gh200` | `deepreinforce-ai/Ornith-1.0-35B-FP8` | 1 | `vllm-ornith-1` (shared) | **Single GH200 card** (TP=1), MTP on, 256K ctx — max single-user throughput; shares the `ornith` container |
 | `gemma4` | Gemma 4 (31B, multimodal) | 1–2 | `vllm-gemma4-1` | vLLM v0.19.0, AWQ |
 | `devstral` | `mistralai/Devstral-2-123B-Instruct-2512` | 4 | `vllm-devstral-1` | TP=4 |
 | `llama` | `meta-llama/Llama-3.3-70B-Instruct` | 4 | — | TP=4 |
@@ -244,6 +246,14 @@ export ANTHROPIC_BASE_URL=http://localhost:8002 ANTHROPIC_AUTH_TOKEN=x && claude
 ## Performance
 
 Latest measured throughput / latency. **Update this section after every sweep** (with the date + config).
+
+### Ornith 1.0 (`ornith` / `ornith_gh200`) — 35B MoE FP8, MTP · pending first on-cluster serve · added 2026-07-16
+Not yet built or served on Olivia — ledger placeholder for the config:
+
+- **`ornith`** — 1 node × 4 GH200, TP=4, MTP on, 256K context, tuned for ~16 concurrency (the fp16 KV pool on 4×GH200 holds well over 16 × 256K tokens; weights are only ~35 GB).
+- **`ornith_gh200`** — 1× GH200 card, TP=1, MTP on, 256K context, tuned for max single-user throughput (weights ~35 GB + ~10 GB KV @256K fit one 96 GB card).
+
+35B MoE (Qwen3.5, ~3B active) block-FP8 with a **native MTP head** (`mtp_num_hidden_layers=1`). Like Laguna it uses ordinary GQA attention (FLASH_ATTN), so CUDAGraph capture should run; MTP should add a single-stream decode speedup on top — the point of the single-card preset. ⚠️ **First-serve verification:** the vLLM-main `qwen3_5_moe` build, that the generic `mtp` speculative method loads Ornith's native head, capture stability on the NGC-torch stack (fall back to `CUDAGRAPH_MODE=NONE` like Kimi/glm52 if it IMAs), and the FP8/DeepGEMM path. Fill in the `bench_sweep.py` numbers after the first run.
 
 ### Laguna M.1 (`laguna`) — 1 node × 4 GH200, FP8, CUDAGraph · 2026-06-20
 Concurrency sweep (`bench_sweep.py`, `max_tokens=512`), reasoning on (`enable_thinking=true`) vs off:

@@ -77,11 +77,11 @@ show_presets() {
     echo "               vLLM: v0.21.0 (native Laguna), transformers>=5.7.0"
     echo "               FP8 ~225GB, single node (4× GH200, TP=4); poolside_v1 parsers"
     echo ""
-    echo "  ornith     - Ornith 1.0 35B MoE (Deep Reinforce, Qwen3.5, ~3B active)"
+    echo "  ornith     - Ornith 1.0 MoE (Deep Reinforce, Qwen3.5) — one container, two sizes"
     echo "               vLLM: main (qwen3_5_moe arch + MTP), transformers>=5.8.1, NGC 26.05"
-    echo "               FP8 ~35GB, native MTP, 256K ctx. Serve on a single node"
-    echo "               (preset 'ornith', TP=4) OR a single GH200 card"
-    echo "               (preset 'ornith_gh200', TP=1) — both share this container."
+    echo "               native MTP, 256K ctx, block-FP8. Serve either:"
+    echo "                 preset 'ornith'       → 397B flagship, 2 nodes × 4 (TP=4 + PP=2)"
+    echo "                 preset 'ornith_gh200' → 35B (~3B active), single GH200 card (TP=1)"
     echo ""
     echo "  devstral   - Devstral/Mistral models (7B-123B)"
     echo "               vLLM: main, transformers>=4.45.0"
@@ -249,18 +249,24 @@ apply_preset() {
             # wall (the glm52-on-main failure), bump NGC_PYTORCH_TAG=26.05-py3.
             PRESET_NOTES="Laguna M.1 (Poolside, 225B/23B MoE) FP8, single-node TP=4. vLLM v0.21.0 (native Laguna), transformers>=5.7.0, poolside_v1 parsers."
             ;;
-        ornith|Ornith|ornith-35b|ornith_35b|Ornith-1.0-35B|ornith-1.0|ornith_gh200|ornith-gh200)
+        ornith*|Ornith*)
             # All ornith* aliases share ONE container (vllm-ornith-1-sandbox):
-            # the single-node (ornith) and single-GH200 (ornith_gh200) presets
-            # differ only in TP/GPU count at serve time, not in the build.
+            # both sizes we serve are the SAME arch (qwen3_5_moe), so one build
+            # runs both — the presets differ only in model repo / node shape at
+            # serve time:
+            #   ornith        → 397B MoE flagship, 2 nodes × 4 (TP=4 + PP=2)
+            #   ornith_gh200  → 35B MoE, a single GH200 card (TP=1)
             MODEL_ID="ornith"
             # Ornith 1.0 (Deep Reinforce): agentic-coding model family
-            # post-trained on Qwen 3.5. We serve the 35B MoE (~3B active) — arch
+            # post-trained on Qwen 3.5. Both served sizes — the 35B MoE (~3B
+            # active) and the 397B MoE flagship — are arch
             # Qwen3_5MoeForConditionalGeneration / model_type qwen3_5_moe, 256K
-            # context, and a NATIVE MTP module (config: mtp_num_hidden_layers=1),
-            # so vLLM runs Multi-Token-Prediction speculative decode with no
-            # external draft model. Default quant is the official block-FP8
-            # checkpoint (deepreinforce-ai/Ornith-1.0-35B-FP8), auto-detected
+            # context, each with a NATIVE MTP module (config:
+            # mtp_num_hidden_layers=1), so vLLM runs Multi-Token-Prediction
+            # speculative decode with no external draft model (note: MTP is
+            # PP-gated, so it is auto-off on the 2-node 397B unless ALLOW_MTP_PP=1
+            # — see run_vllm_server.sh). Default quants are the official block-FP8
+            # checkpoints (Ornith-1.0-397B-FP8 / Ornith-1.0-35B-FP8), auto-detected
             # from quantization_config → no --quantization flag.
             #
             # vLLM version: qwen3_5_moe is a NEW architecture. Older releases
@@ -283,7 +289,7 @@ apply_preset() {
             PRESET_TRANSFORMERS=">=5.8.1"
             PRESET_NGC_TAG="26.05-py3"
             PRESET_DEEPGEMM_REF="88965b0781"
-            PRESET_NOTES="Ornith 1.0 35B MoE (Qwen3.5, ~3B active) FP8, single-node TP=4 (or 1 GH200 via ornith_gh200). Native MTP, qwen3_xml/qwen3 parsers. vLLM main + transformers>=5.8.1 + NGC 26.05."
+            PRESET_NOTES="Ornith 1.0 (Qwen3.5 MoE) FP8: ornith=397B flagship 2-node TP=4+PP=2, ornith_gh200=35B single GH200 (TP=1). Native MTP, qwen3_xml/qwen3 parsers. vLLM main + transformers>=5.8.1 + NGC 26.05."
             ;;
         devstral|mistral|Devstral|Mistral)
             MODEL_ID="devstral"

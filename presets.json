@@ -93,20 +93,20 @@
       "description": "Laguna M.1 225B MoE (23B active), block-FP8, single-node TP=4, CUDAGraph on"
     },
     "ornith": {
-      "aliases": ["ornith-35b", "ornith-1.0-35b", "ornith35b", "ornith-1.0"],
-      "model": "deepreinforce-ai/Ornith-1.0-35B-FP8",
-      "nodes": 1, "gpus": 4, "pp": 1,
+      "aliases": ["ornith-397b", "ornith-1.0-397b", "ornith397b", "ornith-1.0", "ornith-flagship"],
+      "model": "deepreinforce-ai/Ornith-1.0-397B-FP8",
+      "nodes": 2, "gpus": 4, "pp": 2,
       "container_prefix": "ornith", "index": 1,
-      "storage": "projects",
-      "description": "Ornith 1.0 35B MoE (Qwen3.5, ~3B active), block-FP8, single-node TP=4, MTP on, 256K ctx (tuned for concurrency ~16)"
+      "storage": "work",
+      "description": "Ornith 1.0 397B MoE (Qwen3.5) flagship, block-FP8 (~400 GB), 2-node TP=4+PP=2, native MTP (PP-gated), 256K ctx"
     },
     "ornith_gh200": {
-      "aliases": ["ornith-gh200", "ornith-1gpu", "ornith-solo", "ornith-35b-gh200"],
+      "aliases": ["ornith-gh200", "ornith-1gpu", "ornith-solo", "ornith-35b", "ornith-1.0-35b", "ornith35b"],
       "model": "deepreinforce-ai/Ornith-1.0-35B-FP8",
       "nodes": 1, "gpus": 1, "pp": 1,
       "container_prefix": "ornith", "index": 1,
       "storage": "projects",
-      "description": "Ornith 1.0 35B MoE FP8 on a SINGLE GH200 card (TP=1), MTP on, 256K ctx — tuned for max single-user throughput (shares the ornith container)"
+      "description": "Ornith 1.0 35B MoE (Qwen3.5, ~3B active) FP8 on a SINGLE GH200 card (TP=1), MTP on, 256K ctx — max single-user throughput (shares the ornith container)"
     },
     "devstral": {
       "aliases": ["mistral"],

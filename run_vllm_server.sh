@@ -388,6 +388,19 @@ if [[ "${IS_GLM51}" == "1" && -z "${CUDAGRAPH_MODE}" ]]; then
     CUDAGRAPH_MODE="PIECEWISE"
 fi
 
+# Ornith on a MULTI-NODE (PP>1) shape — the 397B 2-node preset — hits the same
+# custom-all-reduce decode wedge as glm51 (that reduction is the intra-node TP=4
+# NVLink one, model-independent). Default to PIECEWISE capture when unset: it
+# trips DISABLE_CUSTOM_ALL_REDUCE=auto → graph-safe NCCL all-reduce, which
+# de-wedges decode, and it amortizes per-step overhead. Ornith's ordinary GQA
+# attention captures cleanly (like Laguna), so PIECEWISE should hold; if it IMAs
+# on this NGC stack (like Kimi/glm52), fall back to CUDAGRAPH_MODE=NONE (eager)
+# + anthropic_proxy.py request serialization. Single-GPU ornith_gh200 (PP=1) is
+# untouched here and keeps auto-select capture.
+if [[ "${IS_ORNITH}" == "1" && "${PP_SIZE}" -gt 1 && -z "${CUDAGRAPH_MODE}" ]]; then
+    CUDAGRAPH_MODE="PIECEWISE"
+fi
+
 # Any GLM MoE model that uses the glm47/glm45 parser family
 IS_GLM_MOE=0
 if [[ "${IS_GLM47}" == "1" || "${IS_GLM5}" == "1" ]]; then
@@ -412,10 +425,11 @@ fi
 # Other models keep the conservative 32K default.
 if [[ -z "${MAX_MODEL_LEN+x}" ]]; then
     if [[ "${IS_ORNITH}" == "1" ]]; then
-        # Ornith 35B FP8 is small (~35 GB weights) with a 256K native window, so
-        # the FULL context fits both targets: single-GH200 single-user (KV ~10 GB
-        # @256K on a 96 GB card) and single-node concurrency-16 (the fp16 KV pool
-        # on 4×GH200 holds well over 16×256K tokens). Serve the whole 262144.
+        # Ornith serves the whole 256K native window on both shapes:
+        #   ornith_gh200 (35B, 1 card)  — ~35 GB weights + ~10 GB KV @256K single-user
+        #   ornith       (397B, 2 nodes) — ~400 GB weights across 8×GH200 leaves
+        #                 ~280 GB for KV (~18 sequences at full 256K). For higher
+        #                 concurrency, lower this or set KV_CACHE_DTYPE=fp8_e4m3.
         MAX_MODEL_LEN=262144
     elif [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" ]]; then
         # GLM-5.1 ~205K, GLM-5.2 ~1M, Kimi K2.6 ~256K, Laguna M.1 ~256K native —
@@ -658,6 +672,8 @@ if [[ "${IS_ORNITH}" == "1" ]]; then
     echo "  MTP:              native (mtp_num_hidden_layers=1)"
     if [[ "${TP_SIZE}" == "1" ]]; then
         echo "  Shape:            single GH200 card (TP=1) — max single-user throughput"
+    elif [[ "${NUM_NODES}" -gt 1 ]]; then
+        echo "  Shape:            ${NUM_NODES}-node 397B flagship (TP=${TP_SIZE} + PP=${PP_SIZE})"
     else
         echo "  Shape:            single node (TP=${TP_SIZE})"
     fi
@@ -1522,7 +1538,13 @@ else
     # answers, vs. the legacy executor wedging at 0 tok/s), so it is AUTO-ON for
     # GLM-5.2 (also triggerable via EXTRA_VLLM_ARGS="--data-parallel-backend ray").
     # HEAD_NODE_IP is known here.
-    if [[ "${IS_GLM52}" == "1" || "${EXTRA_VLLM_ARGS:-}" == *"data-parallel-backend"* ]]; then
+    #
+    # Ornith's 397B 2-node preset is ALSO built from vLLM main with this same
+    # external Ray bootstrap, so it hits the identical subprocess-EngineCore
+    # second-ray.init() failure — auto-on for it too. (Unverified on Olivia like
+    # the rest of the Ornith preset; if it misbehaves, the glm52 path is the
+    # reference. ornith_gh200 is single-node and never reaches here.)
+    if [[ "${IS_GLM52}" == "1" || "${IS_ORNITH}" == "1" || "${EXTRA_VLLM_ARGS:-}" == *"data-parallel-backend"* ]]; then
         # Add the backend flag unless the user already supplied it via EXTRA_VLLM_ARGS.
         if [[ "${EXTRA_VLLM_ARGS:-}" != *"data-parallel-backend"* ]]; then
             VLLM_ARGS+=("--data-parallel-backend" "ray")

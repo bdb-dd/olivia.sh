@@ -132,8 +132,8 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 | `glm47` | `QuantTrio/GLM-4.7-AWQ` | 4 | TP=4, MTP speculative |
 | `kimi` | `moonshotai/Kimi-K2.6` | 8 (2 nodes × 4) | TP=4 + PP=2, native int4, MLA, multimodal, vLLM v0.19.1 |
 | `laguna` | `poolside/Laguna-M.1-FP8` | 4 | TP=4, single node. FP8 (~225 GB), dense full attention (FLASH_ATTN), CUDAGraph capture on. vLLM v0.21.0, `poolside_v1` parsers. |
-| `ornith` | `deepreinforce-ai/Ornith-1.0-35B-FP8` | 4 | TP=4, single node. FP8 (~35 GB), Qwen3.5 MoE (~3B active), **native MTP** on, 256K ctx, FLASH_ATTN + CUDAGraph. vLLM main, transformers ≥5.8.1, `qwen3_xml`/`qwen3` parsers. Tuned for concurrency ~16. |
-| `ornith_gh200` | `deepreinforce-ai/Ornith-1.0-35B-FP8` | **1** | **Single GH200 card** (TP=1), MTP on, 256K ctx — max single-user throughput. Shares the `ornith` container (`vllm-ornith-1`). |
+| `ornith` | `deepreinforce-ai/Ornith-1.0-397B-FP8` | 8 (2 nodes × 4) | **397B flagship.** TP=4 + PP=2, block-FP8 (~400 GB). Qwen3.5 MoE, **native MTP** (PP-gated → auto-off; `ALLOW_MTP_PP=1` to try), 256K ctx, FLASH_ATTN + PIECEWISE capture. vLLM main + engine-as-actor Ray (like glm52). Same multi-node PP wedge risk as glm51 |
+| `ornith_gh200` | `deepreinforce-ai/Ornith-1.0-35B-FP8` | **1** | **35B on a single GH200 card** (TP=1). FP8 (~35 GB, ~3B active), MTP on, 256K ctx, FLASH_ATTN + CUDAGraph — max single-user throughput. Shares the `ornith` container (`vllm-ornith-1`), `qwen3_xml`/`qwen3` parsers |
 | `devstral` | `mistralai/Devstral-2-123B-Instruct-2512` | 4 | TP=4 |
 | `llama` | `meta-llama/Llama-3.3-70B-Instruct` | 4 | TP=4 |
 | `qwen` | `Qwen/Qwen2.5-72B-Instruct` | 4 | TP=4 |
@@ -338,7 +338,7 @@ The build script includes predefined configurations for common models. Run witho
 | `glm47` | GLM-4.7 (358B) flagship model | main | >=5.0.0rc0 |
 | `kimi` | Kimi K2.6 (1T / 32B active) MoE + MLA, multimodal | v0.19.1 | >=4.57.1,<5.0.0 |
 | `laguna` | Laguna M.1 (Poolside, 225B / 23B active) MoE coding model — FP8, single-node TP=4, native vLLM Laguna support | v0.21.0 | >=5.7.0 |
-| `ornith` | Ornith 1.0 35B MoE (Deep Reinforce, Qwen3.5, ~3B active) coding model — FP8, native MTP. Single-node TP=4; `ornith_gh200` alias serves 1× GH200 (TP=1). New `qwen3_5_moe` arch → build from main, NGC 26.05 | main | >=5.8.1 |
+| `ornith` | Ornith 1.0 MoE (Deep Reinforce, Qwen3.5) coding models — block-FP8, native MTP. One `qwen3_5_moe` container serves both `ornith` (397B flagship, 2-node TP=4+PP=2) and `ornith_gh200` (35B, 1× GH200, TP=1). New arch → build from main, NGC 26.05 | main | >=5.8.1 |
 | `devstral` | Devstral/Mistral models | main | >=4.45.0 |
 | `llama` | Llama 3.x models | main | >=4.45.0 |
 | `qwen` | Qwen 2.5 models | main | >=4.45.0 |
@@ -717,49 +717,43 @@ LAGUNA_ENABLE_THINKING=0 ./olivia.sh server start laguna
 # or direct: CONTAINER=vllm-laguna-1-sandbox MODEL=poolside/Laguna-M.1-FP8 ./run_vllm_server.sh
 ```
 
-### Ornith 1.0 (presets `ornith` / `ornith_gh200`) — 35B MoE FP8, native MTP
+### Ornith 1.0 (presets `ornith` / `ornith_gh200`) — Qwen3.5 MoE, FP8, native MTP
 
 Ornith 1.0 (Deep Reinforce, released 2026-06-25, MIT) is an agentic-coding model
 family that learns its own RL scaffolds. It ships in four sizes — 9B Dense, 31B
 Dense, 35B MoE, 397B MoE — with the 9B/35B/397B post-trained on **Qwen 3.5** and
-the 31B on Gemma 4. We serve the **35B MoE**: arch
-`Qwen3_5MoeForConditionalGeneration` (`model_type: qwen3_5_moe`), 40 layers, 256
-experts (top-8, **~3B active**), GQA (16 q-heads / 2 KV-heads), **256K context**,
-and — crucially — a **native MTP module** (`config.json`:
-`mtp_num_hidden_layers: 1`), so vLLM runs Multi-Token-Prediction speculative
-decode from the model's own head with **no external draft model**. Ornith emits
-`<think>` reasoning blocks and uses the `qwen3_xml` tool parser + `qwen3`
-reasoning parser. Like Laguna it uses **ordinary GQA attention** (not MLA/DSA), so
-it keeps the `FLASH_ATTN` backend and lets **CUDAGraph capture** run.
+the 31B on Gemma 4. We serve the two MoE sizes, both arch
+`Qwen3_5MoeForConditionalGeneration` (`model_type: qwen3_5_moe`), **256K context**,
+each with a **native MTP module** (`config.json`: `mtp_num_hidden_layers: 1`) so
+vLLM runs Multi-Token-Prediction speculative decode from the model's own head with
+**no external draft model**:
+- **397B MoE** (`ornith`) — 60 layers, 512 experts (top-10), 32 q-heads / 2 KV-heads. The flagship.
+- **35B MoE** (`ornith_gh200`) — 40 layers, 256 experts (top-8, **~3B active**), 16 q-heads / 2 KV-heads. Deep Reinforce's speed/quality sweet spot (faster than the 9B).
 
-**Why the 35B MoE for both presets** (and not the 397B flagship): the only
-official quant checkpoints are **FP8** (`Ornith-1.0-35B-FP8`,
-`Ornith-1.0-397B-FP8`) and GGUF — there is **no AWQ/INT4**. The 397B FP8 is
-~400 GB, which does **not** fit a single 4×GH200 node (384 GB) — it would need 2
-nodes, out of scope for a single-node preset. The 35B MoE FP8 (~35 GB) is the
-largest Ornith that fits a single node in the only published quant, is Deep
-Reinforce's stated **speed/quality sweet spot** (faster than the 9B thanks to ~3B
-active), and *also* fits a single GH200 card — so both requested targets land on
-the same checkpoint. `"(FP8 if supported)"` → FP8 is what's published, so FP8 it
-is (no 4-bit exists).
+Ornith emits `<think>` reasoning blocks and uses the `qwen3_xml` tool parser +
+`qwen3` reasoning parser. Like Laguna it uses **ordinary GQA attention** (not
+MLA/DSA), so it keeps the `FLASH_ATTN` backend and lets **CUDAGraph capture** run.
+The only official quants are **FP8** (`Ornith-1.0-{35B,397B}-FP8`) + GGUF — **no
+AWQ/INT4** — so both presets serve FP8 (`"(FP8 if supported)"` → FP8).
 
-The two presets differ only in GPU shape and workload tuning; they **share one
-container** (`vllm-ornith-1-sandbox`, like `kimi`/`kimi27`):
+**Two deployments, matched to what each size actually needs** — sharing **one
+container** (`vllm-ornith-1-sandbox`, since both are `qwen3_5_moe`), like
+`kimi`/`kimi27`:
 
-| Preset | Shape | Tuned for | KV headroom |
-|--------|-------|-----------|-------------|
-| `ornith` | 1 node × 4 GH200, TP=4 | concurrency ~16 at 256K | fp16 KV pool on 4×GH200 holds ≫ 16 × 256K tokens (weights only ~35 GB) |
-| `ornith_gh200` | **1× GH200 card, TP=1** | max single-user throughput at 256K | ~35 GB weights + ~10 GB KV @256K on a 96 GB card |
+| Preset | Model | Shape | Rationale |
+|--------|-------|-------|-----------|
+| `ornith` | 397B FP8 (~400 GB) | **2 nodes × 4 GH200**, TP=4 + PP=2 | The flagship genuinely needs multi-GPU capacity: ~400 GB doesn't fit one node (384 GB); 8×GH200 = 768 GB holds it with ~280 GB KV (~18 seqs @256K). Cross-node PP over Slingshot (not TP), like glm51. |
+| `ornith_gh200` | 35B FP8 (~35 GB) | **1× GH200 card**, TP=1 | The 35B only needs one GPU — reserving a whole node for it is waste. TP=1 (no cross-GPU comm) + MTP = max single-user throughput. ~35 GB weights + ~10 GB KV @256K on a 96 GB card. |
 
 | Quantization | Model | Size | Olivia fit |
 |--------------|-------|------|------------|
-| block-FP8 (F8_E4M3) | `deepreinforce-ai/Ornith-1.0-35B-FP8` | ~35 GB | **1 node × 4 (TP=4)** or **1 GH200 (TP=1)** — huge KV headroom either way |
-| BF16 | `deepreinforce-ai/Ornith-1.0-35B` | ~70 GB | Fits, but FP8 is the default (2× the KV/context room) |
-| FP8 397B | `deepreinforce-ai/Ornith-1.0-397B-FP8` | ~400 GB | Needs **2 nodes** (8×GH200) — not a preset here; repoint + `nodes=2 pp=2` if wanted |
+| block-FP8 (F8_E4M3) | `deepreinforce-ai/Ornith-1.0-397B-FP8` | ~400 GB | **2 nodes × 4 (TP=4 + PP=2)** — `ornith`; ~280 GB KV headroom |
+| block-FP8 (F8_E4M3) | `deepreinforce-ai/Ornith-1.0-35B-FP8` | ~35 GB | **1 GH200 (TP=1)** — `ornith_gh200`; huge KV headroom |
+| BF16 | `deepreinforce-ai/Ornith-1.0-{35B,397B}` | 2× | Fits at 2× the GPUs; FP8 is the default (2× the KV/context room) |
 | GGUF | `deepreinforce-ai/Ornith-1.0-{9B,35B}-GGUF` | varies | **No** — llama.cpp, not vLLM |
 
-**Build (`build_vllm_gh200.sh`, preset `ornith`):** `qwen3_5_moe` is a **new
-architecture** — older vLLM rejects it (`architectures
+**Build (`build_vllm_gh200.sh`, preset `ornith`, one container for both sizes):**
+`qwen3_5_moe` is a **new architecture** — older vLLM rejects it (`architectures
 ['Qwen3_5MoeForConditionalGeneration'] are not supported`, vllm#35344), and
 transformers 5.x renamed the config to `Qwen3_5MoeTextConfig` which pre-5.x-aware
 vLLM can't load (vllm#36236). So the preset builds **vLLM main** (like glm47) +
@@ -772,51 +766,71 @@ safer. All `ornith*` aliases build the one shared container.
 **Runtime specifics auto-applied by `run_vllm_server.sh` when `MODEL` contains
 `Ornith`** (`IS_ORNITH`): `--tool-call-parser qwen3_xml`, `--reasoning-parser
 qwen3`, `--enable-auto-tool-choice`, `--trust-remote-code`,
-`--enable-prefix-caching`, **MTP speculative decode**
-(`--speculative-config '{"method":"mtp","num_speculative_tokens":2}'`, auto-on),
-`MAX_MODEL_LEN=262144`, `FLASH_ATTN` backend, and CUDAGraph capture left on. TP is
-set from the preset's GPU count by `olivia.sh` (4 for `ornith`, 1 for
-`ornith_gh200`); the single-GPU case also skips the 4-GPU `CUDA_VISIBLE_DEVICES`
-reorder so it isn't handed non-existent device ids. All knobs override:
-`ORNITH_TOOL_PARSER`, `ORNITH_REASONING_PARSER`, `ORNITH_MTP_METHOD`,
-`ORNITH_MTP_SPECULATIVE_TOKENS` (default 2), `ORNITH_ENABLE_PREFIX_CACHING`.
-Expert parallel is **not** auto-enabled (TP shards the 256 experts, and the model
-is tiny); set `ENABLE_EXPERT_PARALLEL=1` to try it.
+`--enable-prefix-caching`, `MAX_MODEL_LEN=262144`, `FLASH_ATTN` backend. Shape is
+set from the preset by `olivia.sh` (`ornith` → NUM_NODES=2, TP=4, PP=2;
+`ornith_gh200` → 1 GPU, TP=1). Beyond that the two shapes diverge:
+
+- **`ornith_gh200` (TP=1, single node):** MTP **on**
+  (`--speculative-config '{"method":"mtp","num_speculative_tokens":2}'`, auto-on),
+  CUDAGraph capture auto-selected. The single-GPU case also skips the 4-GPU
+  `CUDA_VISIBLE_DEVICES` reorder so it isn't handed non-existent device ids.
+- **`ornith` (TP=4 + PP=2, 2 nodes):** like glm51 this crosses a node boundary
+  over Slingshot, so it inherits the **multi-node PP machinery**: PP (not TP)
+  across nodes, **PIECEWISE CUDAGraph** default (trips `--disable-custom-all-reduce`
+  → graph-safe NCCL, the glm51 de-wedge), and **engine-as-actor Ray**
+  (`--data-parallel-backend=ray`, like glm52 — vLLM main's external Ray bootstrap
+  needs it or init fails with `ActorHandleNotFoundError`). **MTP is auto-disabled
+  under PP>1** (the existing PP+MTP guard; the draft model's `SupportsPP` may work
+  on main — set `ALLOW_MTP_PP=1` to try it, which is the main lever against the
+  slow multi-node single-stream decode). Same **multi-node PP decode wedge** risk
+  as glm51/glm52 — if PIECEWISE capture doesn't de-wedge (or IMAs), fall back to
+  `CUDAGRAPH_MODE=NONE` (eager) + `anthropic_proxy.py` request serialization.
+
+Knobs override: `ORNITH_TOOL_PARSER`, `ORNITH_REASONING_PARSER`,
+`ORNITH_MTP_METHOD`, `ORNITH_MTP_SPECULATIVE_TOKENS` (default 2),
+`ORNITH_ENABLE_PREFIX_CACHING`, `ALLOW_MTP_PP`. Expert parallel is **not**
+auto-enabled; set `ENABLE_EXPERT_PARALLEL=1` to try it (may help the 397B's 512
+experts across 8 GPUs).
 
 > ⚠️ **Verify on first build/serve** (sourced from the model card + closest
 > presets, not yet run on Olivia): that vLLM main builds `qwen3_5_moe` on NGC
-> 26.05; that the generic `"mtp"` speculative method loads Ornith's native MTP
-> head (if not, try `ORNITH_MTP_METHOD=qwen3_next_mtp` or disable via
-> `ENABLE_SPECULATIVE=0`); that CUDAGraph **capture** is stable on the NGC-torch
-> stack (fall back to `CUDAGRAPH_MODE=NONE` like Kimi/glm52 if it IMAs); and the
-> FP8/DeepGEMM path. Then **pin `VLLM_VERSION`** to the validated main commit for
-> reproducibility (as glm52 does), and record the sweep in README `## Performance`.
+> 26.05; that the generic `"mtp"` method loads Ornith's native MTP head (else try
+> `ORNITH_MTP_METHOD=qwen3_next_mtp` or `ENABLE_SPECULATIVE=0`); CUDAGraph
+> **capture** stability on the NGC stack (fall back `CUDAGRAPH_MODE=NONE`); the
+> FP8/DeepGEMM path; and — for the 2-node `ornith` — that engine-as-actor Ray +
+> PIECEWISE de-wedges decode (the glm51/glm52 wedge lore applies), and whether
+> `ALLOW_MTP_PP=1` works on main. Then **pin `VLLM_VERSION`** to the validated
+> commit (as glm52 does) and record the sweep in README `## Performance`.
 
 #### Ornith Usage
 
 ```bash
-# 1. Prefetch the FP8 weights into the persistent HF cache (small, ~35 GB)
-./olivia.sh prefetch ornith        # -> deepreinforce-ai/Ornith-1.0-35B-FP8 (projects tier)
+# --- Flagship: 397B on 2 nodes (preset `ornith`) ---
+# 1. Prefetch the FP8 weights (~400 GB, work tier — resolved automatically)
+./olivia.sh prefetch ornith          # -> deepreinforce-ai/Ornith-1.0-397B-FP8 (/cluster/work)
 
-# 2. Build the container (vLLM main + transformers>=5.8.1 + NGC 26.05)
+# 2. Build the shared container (vLLM main + transformers>=5.8.1 + NGC 26.05)
 ./olivia.sh build ornith
 
-# 3a. Serve on a single node (TP=4, concurrency-oriented)
+# 3. Start (preset auto-allocates 2 nodes × 4 GPUs, TP=4 + PP=2)
 ./olivia.sh server start ornith
 ./olivia.sh server watch
+./olivia.sh cluster                   # check a 2-node shape can schedule now
 
-# 3b. OR serve on a single GH200 card (TP=1, max single-user throughput) —
-#     same container, no rebuild
-./olivia.sh server start ornith_gh200
+# Try MTP under PP (main lever for multi-node single-stream decode), or go eager
+ALLOW_MTP_PP=1 ./olivia.sh server start ornith
+CUDAGRAPH_MODE=NONE ./olivia.sh server start ornith   # eager + pair with proxy serialization
 
-# Tune MTP draft depth (default 2) or disable speculative decode
-ORNITH_MTP_SPECULATIVE_TOKENS=3 ./olivia.sh server start ornith
-ENABLE_SPECULATIVE=0 ./olivia.sh server start ornith
+# --- 35B on a single GH200 card (preset `ornith_gh200`) — same container, no rebuild ---
+./olivia.sh prefetch ornith_gh200     # -> deepreinforce-ai/Ornith-1.0-35B-FP8 (projects tier)
+./olivia.sh server start ornith_gh200 # TP=1, MTP on, max single-user throughput
 ```
 
-> Both presets serve under the same repo id, so run **one at a time** — the
-> durable router (`model_router.py`) maps a served model to a single live backend.
-> Route to it with `model: "ornith"` (or `ornith_gh200`, or the repo id).
+> The two presets now serve **distinct repo ids** (397B vs 35B), so the durable
+> router (`model_router.py`) can tell them apart — you can even run both at once
+> and route by `model: "ornith"` vs `"ornith_gh200"` (or the repo id / other
+> aliases). They share the container, but a 2-node job and a 1-GPU job are
+> independent SLURM allocations.
 
 ### Batching Proxy for SSH Tunnels
 

@@ -1474,6 +1474,15 @@ if [[ ${BUILD_STATUS} -ne 0 ]]; then
         . 2>&1 | tee /tmp/vllm_build.log | tail -100
 fi
 
+# Leave the vLLM SOURCE tree before importing: `pip install .` ran from /opt/vllm,
+# whose in-tree `vllm/` package has __init__.py but NONE of the compiled
+# extensions (those go into site-packages). Python prepends CWD to sys.path, so an
+# `import vllm` from /opt/vllm picks up the source shim and then dies on the first
+# compiled-only import — on recent vLLM main that's `import vllm._C_stable_libtorch`
+# (cuda.py), a FALSE "ModuleNotFoundError: vllm._C_stable_libtorch" that threw away
+# an otherwise-good build. cd to a neutral dir so we verify the INSTALLED package.
+cd /tmp
+
 # Verify NGC PyTorch is still intact
 echo ""
 echo "Verifying PyTorch after vLLM install..."

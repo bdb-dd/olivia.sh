@@ -829,18 +829,28 @@ on this stack, all now codified (build) or defaulted (serve):
 > built+served) in the build preset, and a **from-scratch gated rebuild re-confirmed**
 > the flashinfer/quack fixes reproduce a working serve (no hand-patching).
 >
-> ⚠️ **The 2-node `ornith` (397B) is BLOCKED (attempted 2026-07-17, job 1600643).**
-> Ray bootstrapped fine (8 GPUs), but vLLM's engine-as-actor init died in ~2 min
-> (pre weight-load): `Exception: Error computing device indices for
-> CUDA_VISIBLE_DEVICES: local range: [0, 8) base value: "0,1,2,3"`
-> (`get_physical_gpu_ids_for_local_dp_rank`). The `--data-parallel-backend=ray`
-> path (needed on main — the legacy executor hits `ActorHandleNotFoundError` with
-> our external Ray bootstrap) computes physical GPU ids for the whole world
-> (8 = TP4×PP2) against a per-node `CUDA_VISIBLE_DEVICES="0,1,2,3"` (4 GPUs) →
-> IndexError. Same multi-node-on-main class glm52 fought (executor + DP address/
-> placement); needs a focused debug pass on the DP=1 + TP+PP device-assignment
-> path with 2-node allocations. **`ornith_gh200` (35B) is the working, validated
-> preset; the 397B 2-node is a known-blocked follow-up.**
+**✅ The 2-node `ornith` (397B) also SERVES (validated 2026-07-17).** 8×GH200
+(TP=4 + PP=2), ~400 GB W8A8 loads in ~106 s, **~81 tok/s single-stream, 0 failures
+1→16, ~845 tok/s @16 — and NO multi-node PP decode wedge** (engine-as-actor
+RayExecutorV2 + PIECEWISE capture, the glm52 lesson). Getting there took two
+multi-node fixes on top of the shared serving fixes:
+> 1. **Device-index (`env -u CUDA_VISIBLE_DEVICES`).** On `251f7e4` the
+>    EngineCoreActor computes physical GPU ids for the WHOLE world (8 = TP4×PP2)
+>    by indexing `CUDA_VISIBLE_DEVICES` — but that's the node-local 4 GPUs, so id 4
+>    IndexErrors (`Error computing device indices ... local range [0,8) base
+>    "0,1,2,3"`). Fixed by leaving CVD *unset in the container* so vLLM returns raw
+>    ids and Ray places the 8 workers. NB **singularity leaks the host CVD**, so
+>    omitting our `--env` isn't enough — `run_vllm_server.sh` prefixes the exec with
+>    `env -u CUDA_VISIBLE_DEVICES` (+ `RAY_EXPERIMENTAL_NOSET`) for `NUM_NODES>1`.
+>    Executor-independent (v1 runs EngineCore as a Ray actor for both the legacy and
+>    engine-as-actor backends; `ENGINE_AS_ACTOR=0` forces the plain one but hits the
+>    same bug). Empty CVD ("") ≠ unset — empty = zero GPUs, which breaks `ray start`.
+> 2. **cutlass FP8 `weight_loader` double-set.** The compressed-tensors W8A8 FP8
+>    cutlass linear sets `weight_loader` twice when linear dims need 16-alignment
+>    padding (`pad_n>0` + channel-wise scale) → `AssertionError: Overwriting
+>    existing tensor attribute: weight_loader`. Only the 397B's dims are unaligned
+>    (the 35B's aren't), so 35B never hit it. Build pypatches out the redundant
+>    re-set (`PYPATCH_CUTLASS_WEIGHTLOADER`).
 
 #### Ornith Usage
 

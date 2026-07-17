@@ -250,6 +250,24 @@ else
     export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 fi
 
+# Multi-node engine-as-actor (--data-parallel-backend=ray) device-assignment fix.
+# On vLLM main >= ~251f7e4 the EngineCoreActor computes physical GPU ids for the
+# WHOLE world (TP×PP, e.g. 8 for TP=4+PP=2) by INDEXING into CUDA_VISIBLE_DEVICES
+# — but that env is only the node-local 4 GPUs ("0,1,2,3"), so device id 4 blows
+# past it: `Exception: Error computing device indices ... local range: [0, 8)
+# base value: "0,1,2,3"` (get_physical_gpu_ids_for_local_dp_rank). The fix is to
+# leave CUDA_VISIBLE_DEVICES *unset IN THE CONTAINER*, so device_id_to_physical
+# takes its no-env branch and returns the RAW id (interface.py) and Ray places the
+# 8 workers across the nodes itself. NB unset != empty: empty ("") means ZERO
+# visible GPUs, which breaks `ray start`'s GPU registration — so we OMIT the CVD
+# --env from SING_CMD (below) rather than forwarding an empty value. NOSET stops
+# Ray stamping a sticky per-actor CVD that would re-trigger the index. Single-node
+# is untouched (keeps the 1,2,3,0 NVLink reorder above). CLEAR_CVD_MULTINODE=0 to opt out.
+if [[ "${NUM_NODES}" -gt 1 && "${CLEAR_CVD_MULTINODE:-1}" == "1" ]]; then
+    export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES="${RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES:-1}"
+    MULTINODE_UNSET_CVD=1
+fi
+
 # NCCL optimizations for GH200 NVLink
 export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-NVL}"        # Use NVLink for P2P
 export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-PHB}" # GPU Direct RDMA level
@@ -1292,10 +1310,29 @@ if [[ "${ENABLE_PROXY}" == "1" ]]; then
     fi
 fi
 
+# CUDA_VISIBLE_DEVICES handling: single-node passes the (reordered) value so the
+# container sees the intended GPUs. Multi-node must leave CVD *unset in-container*
+# (see the device-assignment note above; unset != empty). Omitting our --env is NOT
+# enough — singularity passes the HOST env by default, so SLURM's per-node
+# CUDA_VISIBLE_DEVICES="0,1,2,3" leaks in and the EngineCoreActor still indexes [0,8)
+# into it. So we STRIP it from singularity's own environment with `env -u` (the whole
+# node's 4 GPUs stay visible via the cgroup; unset CVD -> device_id_to_physical
+# returns raw ids). `env -u` prefixes the exec so it applies to every SING_CMD use
+# (ray start AND the vLLM launch).
+if [[ "${MULTINODE_UNSET_CVD:-0}" == "1" ]]; then
+    _CVD_ENV=()
+    _SING_PREFIX=(env -u CUDA_VISIBLE_DEVICES)
+else
+    _CVD_ENV=(--env "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}")
+    _SING_PREFIX=()
+fi
+
 # Build shared singularity command array (used by both single-node and multi-node paths)
 SING_CMD=(
+    "${_SING_PREFIX[@]}"
     singularity exec --nv
-    --env "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+    "${_CVD_ENV[@]}"
+    --env "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=${RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES:-}"
     --env "NCCL_P2P_LEVEL=${NCCL_P2P_LEVEL}"
     --env "NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL}"
     --env "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
@@ -1575,7 +1612,12 @@ else
     # second-ray.init() failure — auto-on for it too. (Unverified on Olivia like
     # the rest of the Ornith preset; if it misbehaves, the glm52 path is the
     # reference. ornith_gh200 is single-node and never reaches here.)
-    if [[ "${IS_GLM52}" == "1" || "${IS_ORNITH}" == "1" || "${EXTRA_VLLM_ARGS:-}" == *"data-parallel-backend"* ]]; then
+    # ENGINE_AS_ACTOR=0 forces the PLAIN Ray distributed executor instead (no DP
+    # actor). Useful on newer vLLM where the subprocess-EngineCore ray.init() issue
+    # may be fixed — and where the engine-as-actor DP device-assignment miscomputes
+    # physical GPU ids for a multi-node TP+PP (DP=1) engine (indexes the whole world
+    # into a per-node 4-GPU CUDA_VISIBLE_DEVICES -> IndexError).
+    if [[ "${ENGINE_AS_ACTOR:-auto}" != "0" && ( "${IS_GLM52}" == "1" || "${IS_ORNITH}" == "1" || "${EXTRA_VLLM_ARGS:-}" == *"data-parallel-backend"* ) ]]; then
         # Add the backend flag unless the user already supplied it via EXTRA_VLLM_ARGS.
         if [[ "${EXTRA_VLLM_ARGS:-}" != *"data-parallel-backend"* ]]; then
             VLLM_ARGS+=("--data-parallel-backend" "ray")

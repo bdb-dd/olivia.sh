@@ -887,6 +887,44 @@ open(f, "w").write(s.replace(anchor, add, 1))
 print("PYPATCH_LL_BF16_QUACK: is_available() now also requires quack")
 PYPATCH_LL_BF16_QUACK
 
+# compressed-tensors W8A8 FP8 cutlass linear double-sets `weight_loader`:
+# process_weights_after_loading() sets it on the weight, then AGAIN inside the
+# `pad_n > 0 and weight_scale.numel() > 1` branch (padding + channel-wise scale),
+# which trips set_weight_attrs' `assert not hasattr(weight, "weight_loader")`.
+# Only bites models whose linear dims need 16-alignment padding — e.g. the Ornith
+# 397B multi-node FP8 (the 35B's dims are aligned, so it never hits it). The re-set
+# is redundant (already set above), so drop it. No-ops on vLLM without this file.
+# Idempotent.
+python3 << 'PYPATCH_CUTLASS_WEIGHTLOADER'
+import os
+f = "/opt/vllm/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py"
+if not os.path.exists(f):
+    print("PYPATCH_CUTLASS_WEIGHTLOADER: file absent, skipping"); raise SystemExit(0)
+s = open(f).read()
+if "Ornith-397B fix" in s:
+    print("PYPATCH_CUTLASS_WEIGHTLOADER: already applied"); raise SystemExit(0)
+old = (
+    '            replace_parameter(layer, weight_scale_name, padded_scale.data)\n'
+    '            set_weight_attrs(\n'
+    '                getattr(layer, weight_name),\n'
+    '                {\n'
+    '                    "weight_loader": self.padded_weight_loader,\n'
+    '                },\n'
+    '            )'
+)
+new = (
+    '            replace_parameter(layer, weight_scale_name, padded_scale.data)\n'
+    '            # NGC/Ornith-397B fix: weight_loader already set on this weight\n'
+    '            # above; re-setting it here trips set_weight_attrs\' "Overwriting\n'
+    '            # existing tensor attribute" assert when pad_n>0 + channel-wise FP8\n'
+    '            # scale (unaligned linear dims). The re-set is redundant, so skip it.'
+)
+if old not in s:
+    print("PYPATCH_CUTLASS_WEIGHTLOADER: anchor not found (vLLM changed), skipping"); raise SystemExit(0)
+open(f, "w").write(s.replace(old, new, 1))
+print("PYPATCH_CUTLASS_WEIGHTLOADER: dropped redundant weight_loader re-set")
+PYPATCH_CUTLASS_WEIGHTLOADER
+
 # -----------------------------------------------------------------------------
 # Graft requested upstream vLLM PRs (patch-during-build)
 # -----------------------------------------------------------------------------

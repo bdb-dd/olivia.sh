@@ -262,15 +262,18 @@ Concurrency sweep (`bench_sweep.py`, `max_tokens=512`, warm/JIT-cached pass on t
 
 **On-cluster reality (Qwen3-Next hybrid on the NGC stack — the model card is misleading):** the 35B is `Qwen3_5MoeForConditionalGeneration`, a **hybrid** model (Gated-DeltaNet `linear_attn` + full `self_attn`), multimodal (vision tower, served for text), **channel/token W8A8 FP8** (not block-FP8 → DeepGEMM unused), and the FP8 export ships **no MTP weights** (config declares `mtp_num_hidden_layers=1` but the head is absent → MTP off). vLLM main pulls **flashinfer 0.6.14**, version-skewed against the container's cute-dsl (its Blackwell kernel imports `cutlass.cute.nvgpu.OperandMajorMode`, absent here) → importing it crashes engine init. Serving it needed: **flashinfer removed** (Hopper doesn't need its Blackwell kernels), the `ll_bf16` cute-dsl router-GEMM warmup **skipped** (needs the absent `quack`), and GDN prefill forced to the **in-tree Triton/FLA** kernel (`--additional-config '{"gdn_prefill_backend":"triton"}'`) — an all-Triton/CUTLASS path, zero flashinfer. Two shared build-script bugs were also fixed en route (`NGC_PYTORCH_TAG` forwarding, verify-from-source-tree). See CLAUDE.md.
 
-### Ornith 1.0 `ornith` — 397B flagship, 2 nodes · attempted 2026-07-17, blocked on multi-node init
-Same shared `qwen3_5_moe` container; 2 nodes × 4 GH200, TP=4 + PP=2, ~400 GB W8A8 (prefetched). First 2-node run (job 1600643): Ray cluster bootstrapped cleanly (8 GPUs registered), but vLLM's **engine-as-actor** init died in ~2 min (before weight load) with:
+### Ornith 1.0 `ornith` — 397B flagship, 2 nodes × 4 GH200, TP=4 + PP=2, PIECEWISE capture · 2026-07-17
+Concurrency sweep (`bench_sweep.py`, `max_tokens=256`, reasoning on, warm pass):
 
-```
-Exception: Error computing device indices for CUDA_VISIBLE_DEVICES:
-           local range: [0, 8) base value: "0,1,2,3"    (vllm/v1/engine/utils.py get_physical_gpu_ids_for_local_dp_rank)
-```
+| Concurrency | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| Aggregate tok/s | 81.5 | 148.4 | 276.0 | 499.8 | 845.4 |
+| Per-stream tok/s | 81.5 | 74.5 | 69.1 | 62.5 | 52.9 |
+| p95 TTFT (s) | 0.07 | 0.12 | 0.12 | 0.13 | 0.29 |
 
-The `--data-parallel-backend=ray` engine-as-actor path (needed because on vLLM main the legacy executor hits `ActorHandleNotFoundError` with our external Ray bootstrap — the glm52 lesson) computes physical GPU ids for the **whole world** (8 = TP4×PP2) against a per-node `CUDA_VISIBLE_DEVICES="0,1,2,3"` (4 GPUs), so it `IndexError`s. This is the same multi-node-on-main class of problem glm52 fought (engine-as-actor vs legacy-executor, DP address/placement) and needs a focused debug pass with 2-node allocations — the DP=1 + TP+PP device-assignment path, not the wedge. **`ornith_gh200` (35B, validated) is the working preset; the 397B 2-node is a known-blocked follow-up.**
+**397B on 2 nodes (8×GH200), 0 failures 1→16 — and NO multi-node PP decode wedge** (the engine-as-actor RayExecutorV2 + PIECEWISE capture avoids glm51's wedge, the glm52 lesson paying off). Single-stream **~81 tok/s** is remarkable for a 397B over Slingshot PP (vs glm52's ~5.6 tok/s eager on 3 nodes) — PIECEWISE capture + only 2 PP stages + MoE. ~400 GB W8A8 loads in ~106 s; KV cache 3.99M tokens (15.2× concurrency @256K). vLLM main pinned `251f7e4`, NGC 26.05.
+
+**Three fixes were needed for the multi-node path** (all now codified): the EngineCoreActor on `251f7e4` computes physical GPU ids for the whole world (8) by indexing `CUDA_VISIBLE_DEVICES`, which is only the node-local 4 GPUs → `IndexError` — fixed by stripping CVD from the container with **`env -u CUDA_VISIBLE_DEVICES`** (+ `RAY_EXPERIMENTAL_NOSET`), so vLLM uses raw ids and Ray places the 8 workers itself (singularity leaks the host CVD, so omitting the `--env` wasn't enough). And the compressed-tensors **W8A8 FP8 cutlass** linear double-sets `weight_loader` when linear dims need 16-alignment padding (the 397B's do, the 35B's don't) → `AssertionError` — patched (redundant re-set dropped). Both the legacy and engine-as-actor Ray executors hit the device-index bug (v1 runs EngineCore as a Ray actor either way), so the fix is executor-independent. See CLAUDE.md.
 
 ### Laguna M.1 (`laguna`) — 1 node × 4 GH200, FP8, CUDAGraph · 2026-06-20
 Concurrency sweep (`bench_sweep.py`, `max_tokens=512`), reasoning on (`enable_thinking=true`) vs off:

@@ -804,7 +804,7 @@ Knobs override: `ORNITH_TOOL_PARSER`, `ORNITH_REASONING_PARSER`,
 `ORNITH_MTP_SPECULATIVE_TOKENS`) only if you point at a checkpoint that has the MTP
 head. Expert parallel is **not** auto-enabled; `ENABLE_EXPERT_PARALLEL=1` to try it.
 
-**✅ `ornith_gh200` SERVES (validated 2026-07-16, vLLM main `75bdad4`, NGC 26.05).**
+**✅ `ornith_gh200` SERVES (validated 2026-07-16, vLLM main pinned `251f7e4`, NGC 26.05).**
 Single GH200, TP=1, CUDAGraph FULL capture (captures cleanly on the hybrid, unlike
 Kimi/glm52), **~174 tok/s single-stream**, 0 failures 1→64 (~4560 tok/s @64). See
 README `## Performance`. Three things were required to get the Qwen3-Next hybrid up
@@ -825,8 +825,8 @@ on this stack, all now codified (build) or defaulted (serve):
 > Result: an all-Triton/CUTLASS path, zero flashinfer. (Two shared build-script bugs
 > were also fixed en route — `NGC_PYTORCH_TAG` not forwarded into the Phase-3
 > container, and the verify importing vLLM from the `/opt/vllm` source tree instead
-> of the install.) ⚠️ Still pending: **pin `VLLM_VERSION`** to `75bdad4` for repro
-> (currently unpinned `main`); and the **2-node `ornith`** (397B) serve — engine-as-
+> of the install.) `VLLM_VERSION` is now **pinned to `251f7e4`** (the commit that
+> built+served) in the build preset. ⚠️ Still pending: the **2-node `ornith`** (397B) serve — engine-as-
 > actor Ray + PIECEWISE de-wedge — is untested (2-node allocation unavailable at
 > validation time). The build fixes were validated by hand-patching the serving
 > container identically; a fresh gated rebuild has not yet re-confirmed them.

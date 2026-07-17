@@ -284,11 +284,14 @@ apply_preset() {
             # DeepGEMM is pinned to the main-matching ref for build compatibility
             # only (unused by Ornith's channel/token FP8). transformers >=5.8.1.
             #
-            # ⚠️ VERIFY on first build/serve, then PIN VLLM_VERSION to the
-            # validated main commit for reproducibility (as glm52 does). If a
-            # tagged release ships qwen3_5_moe + the transformers-5.x fix, switch
-            # to it and drop back to NGC 26.03 if its ABI allows.
-            PRESET_VLLM_VERSION="main"
+            # PINNED to the exact main commit that BUILT + SERVED + benchmarked
+            # ornith_gh200 on-cluster (251f7e4, 2026-07-16) — like glm52, so the
+            # build is reproducible (main is a moving target: an earlier attempt
+            # cloned 75bdad4 and main advanced ~1.7 h before this one succeeded).
+            # Override VLLM_VERSION=main to track latest (then re-pin + re-validate).
+            # If a tagged release ships qwen3_5_moe + the transformers-5.x fix,
+            # switch to it and drop back to NGC 26.03 if its ABI allows.
+            PRESET_VLLM_VERSION="251f7e478e8eb0c90a01eb8fff40056da2aa3ff7"
             PRESET_TRANSFORMERS=">=5.8.1"
             PRESET_NGC_TAG="26.05-py3"
             PRESET_DEEPGEMM_REF="88965b0781"

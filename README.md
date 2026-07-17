@@ -247,16 +247,18 @@ export ANTHROPIC_BASE_URL=http://localhost:8002 ANTHROPIC_AUTH_TOKEN=x && claude
 
 Latest measured throughput / latency. **Update this section after every sweep** (with the date + config).
 
-### Ornith 1.0 `ornith_gh200` — 35B MoE FP8 on 1× GH200, CUDAGraph · 2026-07-16
-Concurrency sweep (`bench_sweep.py`, `max_tokens=512`, reasoning on, warm/JIT-cached pass):
+### Ornith 1.0 `ornith_gh200` — 35B MoE FP8 on 1× GH200, CUDAGraph · 2026-07-16/17
+Concurrency sweep (`bench_sweep.py`, `max_tokens=512`, warm/JIT-cached pass on the pinned-commit rebuild):
 
 | Concurrency | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
 |---|---|---|---|---|---|---|---|
-| Aggregate tok/s | 173.9 | 310.1 | 565.6 | 1038.9 | 1720.1 | 2866.5 | 4564.2 |
-| Per-stream tok/s | 173.9 | 155.2 | 141.5 | 130.0 | 107.6 | 89.8 | 71.5 |
-| p95 TTFT (s) | 0.04 | 0.07 | 0.07 | 0.07 | 0.16 | 0.20 | 0.34 |
+| Agg tok/s — reasoning **on**  | 173.7 | 309.8 | 569.5 | 1044.3 | 1697.5 | 2836.2 | 4620.6 |
+| Per-stream tok/s — **on**     | 173.8 | 155.1 | 142.5 | 130.7 | 106.2 | 88.8 | 72.4 |
+| Agg tok/s — reasoning **off** | 173.8 | 258.5 | 567.2 | 979.8 | 1645.2 | 2820.6 | 4210.4 |
+| Per-stream tok/s — **off**    | 173.9 | 157.8 | 141.9 | 127.0 | 105.9 | 88.3 | 70.2 |
+| p95 TTFT (s)                  | 0.04 | 0.07 | 0.07 | 0.08 | 0.16 | 0.19 | 0.28 |
 
-**Single GH200 card, TP=1, 0 failures 1→64.** Single-stream **~174 tok/s** — the fastest single-stream of any preset here (vs Laguna ~63, GLM-5.2 ~5.6, Kimi ~17), exactly the "max single-user throughput" this preset targets; MoE (~3B active) + CUDAGraph FULL capture (captures cleanly on the hybrid, unlike eager Kimi/glm52). Per-stream degrades gracefully to ~72 tok/s @64; aggregate near-linear to ~4560 tok/s @64. TTFT sub-100 ms through 8-way. (A cold-pass c=8 outlier — a 5.2 s triton JIT stall on a fresh shape — vanished once kernels were cached.) vLLM main pinned `251f7e4`, transformers 5.8.1, NGC 26.05, 256K context.
+**Single GH200 card, TP=1, 0 failures 1→64.** Single-stream **~174 tok/s** — the fastest single-stream of any preset here (vs Laguna ~63, GLM-5.2 ~5.6, Kimi ~17), exactly the "max single-user throughput" this preset targets; MoE (~3B active) + CUDAGraph FULL capture (captures cleanly on the hybrid, unlike eager Kimi/glm52). Per-stream degrades gracefully to ~72 tok/s @64; aggregate near-linear to ~4620 tok/s @64. TTFT sub-100 ms through 8-way. **Reasoning on vs off is the same decode rate** (per-stream tok/s within noise) — thinking (`chat_template_kwargs={"enable_thinking": false}` to disable) just emits more tokens per request, so a request is longer, not slower per token; the slightly lower *aggregate* off is only shorter answers finishing early (lower steady-state batch occupancy), same as Laguna. (A cold c=8 outlier — a 5.2 s triton JIT stall on a fresh shape — vanishes once kernels are cached.) vLLM main pinned `251f7e4`, transformers 5.8.1, NGC 26.05, 256K context; identical numbers on the hand-patched container and the from-scratch pinned rebuild.
 
 **On-cluster reality (Qwen3-Next hybrid on the NGC stack — the model card is misleading):** the 35B is `Qwen3_5MoeForConditionalGeneration`, a **hybrid** model (Gated-DeltaNet `linear_attn` + full `self_attn`), multimodal (vision tower, served for text), **channel/token W8A8 FP8** (not block-FP8 → DeepGEMM unused), and the FP8 export ships **no MTP weights** (config declares `mtp_num_hidden_layers=1` but the head is absent → MTP off). vLLM main pulls **flashinfer 0.6.14**, version-skewed against the container's cute-dsl (its Blackwell kernel imports `cutlass.cute.nvgpu.OperandMajorMode`, absent here) → importing it crashes engine init. Serving it needed: **flashinfer removed** (Hopper doesn't need its Blackwell kernels), the `ll_bf16` cute-dsl router-GEMM warmup **skipped** (needs the absent `quack`), and GDN prefill forced to the **in-tree Triton/FLA** kernel (`--additional-config '{"gdn_prefill_backend":"triton"}'`) — an all-Triton/CUTLASS path, zero flashinfer. Two shared build-script bugs were also fixed en route (`NGC_PYTORCH_TAG` forwarding, verify-from-source-tree). See CLAUDE.md.
 

@@ -262,8 +262,15 @@ Concurrency sweep (`bench_sweep.py`, `max_tokens=512`, warm/JIT-cached pass on t
 
 **On-cluster reality (Qwen3-Next hybrid on the NGC stack — the model card is misleading):** the 35B is `Qwen3_5MoeForConditionalGeneration`, a **hybrid** model (Gated-DeltaNet `linear_attn` + full `self_attn`), multimodal (vision tower, served for text), **channel/token W8A8 FP8** (not block-FP8 → DeepGEMM unused), and the FP8 export ships **no MTP weights** (config declares `mtp_num_hidden_layers=1` but the head is absent → MTP off). vLLM main pulls **flashinfer 0.6.14**, version-skewed against the container's cute-dsl (its Blackwell kernel imports `cutlass.cute.nvgpu.OperandMajorMode`, absent here) → importing it crashes engine init. Serving it needed: **flashinfer removed** (Hopper doesn't need its Blackwell kernels), the `ll_bf16` cute-dsl router-GEMM warmup **skipped** (needs the absent `quack`), and GDN prefill forced to the **in-tree Triton/FLA** kernel (`--additional-config '{"gdn_prefill_backend":"triton"}'`) — an all-Triton/CUTLASS path, zero flashinfer. Two shared build-script bugs were also fixed en route (`NGC_PYTORCH_TAG` forwarding, verify-from-source-tree). See CLAUDE.md.
 
-### Ornith 1.0 `ornith` — 397B flagship, 2 nodes · pending (2-node allocation unavailable)
-Not yet served — same shared `qwen3_5_moe` container. 2 nodes × 4 GH200, TP=4 + PP=2, ~400 GB W8A8, PIECEWISE CUDAGraph + engine-as-actor Ray (like glm52), same multi-node PP decode-wedge risk as glm51. Blocked only on scheduling a 2-node shape (est. ~1–2 days out at time of writing); the build + serving fixes are shared with `ornith_gh200`.
+### Ornith 1.0 `ornith` — 397B flagship, 2 nodes · attempted 2026-07-17, blocked on multi-node init
+Same shared `qwen3_5_moe` container; 2 nodes × 4 GH200, TP=4 + PP=2, ~400 GB W8A8 (prefetched). First 2-node run (job 1600643): Ray cluster bootstrapped cleanly (8 GPUs registered), but vLLM's **engine-as-actor** init died in ~2 min (before weight load) with:
+
+```
+Exception: Error computing device indices for CUDA_VISIBLE_DEVICES:
+           local range: [0, 8) base value: "0,1,2,3"    (vllm/v1/engine/utils.py get_physical_gpu_ids_for_local_dp_rank)
+```
+
+The `--data-parallel-backend=ray` engine-as-actor path (needed because on vLLM main the legacy executor hits `ActorHandleNotFoundError` with our external Ray bootstrap — the glm52 lesson) computes physical GPU ids for the **whole world** (8 = TP4×PP2) against a per-node `CUDA_VISIBLE_DEVICES="0,1,2,3"` (4 GPUs), so it `IndexError`s. This is the same multi-node-on-main class of problem glm52 fought (engine-as-actor vs legacy-executor, DP address/placement) and needs a focused debug pass with 2-node allocations — the DP=1 + TP+PP device-assignment path, not the wedge. **`ornith_gh200` (35B, validated) is the working preset; the 397B 2-node is a known-blocked follow-up.**
 
 ### Laguna M.1 (`laguna`) — 1 node × 4 GH200, FP8, CUDAGraph · 2026-06-20
 Concurrency sweep (`bench_sweep.py`, `max_tokens=512`), reasoning on (`enable_thinking=true`) vs off:

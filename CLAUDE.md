@@ -826,10 +826,21 @@ on this stack, all now codified (build) or defaulted (serve):
 > were also fixed en route — `NGC_PYTORCH_TAG` not forwarded into the Phase-3
 > container, and the verify importing vLLM from the `/opt/vllm` source tree instead
 > of the install.) `VLLM_VERSION` is now **pinned to `251f7e4`** (the commit that
-> built+served) in the build preset. ⚠️ Still pending: the **2-node `ornith`** (397B) serve — engine-as-
-> actor Ray + PIECEWISE de-wedge — is untested (2-node allocation unavailable at
-> validation time). The build fixes were validated by hand-patching the serving
-> container identically; a fresh gated rebuild has not yet re-confirmed them.
+> built+served) in the build preset, and a **from-scratch gated rebuild re-confirmed**
+> the flashinfer/quack fixes reproduce a working serve (no hand-patching).
+>
+> ⚠️ **The 2-node `ornith` (397B) is BLOCKED (attempted 2026-07-17, job 1600643).**
+> Ray bootstrapped fine (8 GPUs), but vLLM's engine-as-actor init died in ~2 min
+> (pre weight-load): `Exception: Error computing device indices for
+> CUDA_VISIBLE_DEVICES: local range: [0, 8) base value: "0,1,2,3"`
+> (`get_physical_gpu_ids_for_local_dp_rank`). The `--data-parallel-backend=ray`
+> path (needed on main — the legacy executor hits `ActorHandleNotFoundError` with
+> our external Ray bootstrap) computes physical GPU ids for the whole world
+> (8 = TP4×PP2) against a per-node `CUDA_VISIBLE_DEVICES="0,1,2,3"` (4 GPUs) →
+> IndexError. Same multi-node-on-main class glm52 fought (executor + DP address/
+> placement); needs a focused debug pass on the DP=1 + TP+PP device-assignment
+> path with 2-node allocations. **`ornith_gh200` (35B) is the working, validated
+> preset; the 397B 2-node is a known-blocked follow-up.**
 
 #### Ornith Usage
 

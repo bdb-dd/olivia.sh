@@ -1,0 +1,27 @@
+{
+  "id": "calc-operator-precedence",
+  "category": "parser",
+  "description": "Recursive-descent calculator ignores operator precedence and parentheses.",
+  "prompt": "evaluate(expr) in calc.py computes integer arithmetic over strings like '2+3*4'. It currently evaluates strictly left-to-right, ignoring operator precedence and parentheses: evaluate('2+3*4') returns 20 but should return 14, and parentheses are ignored entirely. Fix calc.py (and tokenizer.py if needed) so evaluate() honors standard precedence (* and / bind tighter than + and -) and parentheses. Use integer division (//) for '/'. Keep the public function signature evaluate(expr: str) -> int; do not rename it. tokenizer.tokenize already returns the correct token list.",
+  "files": {
+    "tokenizer.py": "import re\n\n\ndef tokenize(s):\n    return re.findall(r\"\\d+|[+\\-*/()]\", s.replace(\" \", \"\"))\n",
+    "calc.py": "from tokenizer import tokenize\n\n\ndef evaluate(expr):\n    tokens = tokenize(expr)\n    result = int(tokens[0])\n    i = 1\n    while i < len(tokens):\n        op = tokens[i]\n        rhs = int(tokens[i + 1])\n        if op == \"+\":\n            result += rhs\n        elif op == \"-\":\n            result -= rhs\n        elif op == \"*\":\n            result *= rhs\n        elif op == \"/\":\n            result //= rhs\n        i += 2\n    return result\n"
+  },
+  "tools": [
+    "read_file",
+    "write_file",
+    "list_dir",
+    "grep",
+    "run_bash"
+  ],
+  "oracle_files": {
+    "grade_test.py": "from calc import evaluate\n\nassert evaluate(\"2+3*4\") == 14\nassert evaluate(\"2*3+4\") == 10\nassert evaluate(\"(2+3)*4\") == 20\nassert evaluate(\"10-2-3\") == 5\nassert evaluate(\"2+3*4-1\") == 13\nassert evaluate(\"100/5/2\") == 10\nassert evaluate(\"2*(3+4)*2\") == 28\nassert evaluate(\"7\") == 7\nassert evaluate(\"1+2*3-4/2\") == 5\nprint(\"PASS\")\n"
+  },
+  "oracle": [
+    {
+      "check": "bash_exit_zero",
+      "command": "python3 grade_test.py"
+    }
+  ],
+  "max_turns": 25
+}

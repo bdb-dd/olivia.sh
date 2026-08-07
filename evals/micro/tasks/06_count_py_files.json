@@ -1,0 +1,18 @@
+{
+  "id": "count-py-files",
+  "category": "analysis",
+  "description": "Inspect the tree and report a deterministic count (recursive, ignoring non-.py).",
+  "prompt": "Count how many Python (.py) files exist under the src/ directory, searching recursively. Write just that number (digits only, no other text) to a file named count.txt.",
+  "files": {
+    "src/a.py": "x = 1\n",
+    "src/b.py": "y = 2\n",
+    "src/sub/c.py": "z = 3\n",
+    "src/notes.txt": "this is not python\n",
+    "src/sub/data.json": "{}\n"
+  },
+  "tools": ["list_dir", "read_file", "run_bash", "write_file"],
+  "max_turns": 10,
+  "oracle": [
+    {"check": "file_equals", "path": "count.txt", "content": "3"}
+  ]
+}

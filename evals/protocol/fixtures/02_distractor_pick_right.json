@@ -1,0 +1,37 @@
+{
+  "id": "distractor-pick-right",
+  "category": "tool-selection",
+  "description": "Two tools offered, only one is relevant; must pick the right tool and not fire the distractor.",
+  "request": {
+    "system": "You are a helpful assistant with access to tools. Use them when they are needed.",
+    "messages": [
+      {"role": "user", "content": "Is it raining in Tokyo right now?"}
+    ],
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather for a location.",
+        "input_schema": {
+          "type": "object",
+          "properties": {"location": {"type": "string"}},
+          "required": ["location"]
+        }
+      },
+      {
+        "name": "send_email",
+        "description": "Send an email to a recipient.",
+        "input_schema": {
+          "type": "object",
+          "properties": {"to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}},
+          "required": ["to", "body"]
+        }
+      }
+    ],
+    "max_tokens": 512
+  },
+  "expect": [
+    {"check": "calls_tool", "tool": "get_weather"},
+    {"check": "does_not_call", "tool": "send_email"},
+    {"check": "tool_args_valid", "tool": "get_weather"}
+  ]
+}

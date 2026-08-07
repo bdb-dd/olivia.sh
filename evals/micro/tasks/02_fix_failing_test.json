@@ -1,0 +1,15 @@
+{
+  "id": "fix-failing-test",
+  "category": "bugfix",
+  "description": "A one-line bug in a function; the agent must read, locate, fix, and verify via the test script.",
+  "prompt": "The script test_add.py fails because of a bug in math_utils.py. Find and fix the bug in math_utils.py so that running `python3 test_add.py` prints PASS and exits 0. Do not edit test_add.py.",
+  "files": {
+    "math_utils.py": "def add(a, b):\n    return a - b\n",
+    "test_add.py": "from math_utils import add\n\nassert add(2, 3) == 5\nassert add(10, 5) == 15\nprint(\"PASS\")\n"
+  },
+  "tools": ["read_file", "write_file", "list_dir", "grep", "run_bash"],
+  "max_turns": 12,
+  "oracle": [
+    {"check": "bash_exit_zero", "command": "python3 test_add.py"}
+  ]
+}

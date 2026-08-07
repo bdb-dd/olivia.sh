@@ -1,0 +1,15 @@
+{
+  "id": "implement-function",
+  "category": "implement",
+  "description": "Implement a stubbed function against a spec encoded as asserts.",
+  "prompt": "Implement the is_prime(n) function in primes.py so that running `python3 test_primes.py` prints PASS and exits 0. Do not edit test_primes.py.",
+  "files": {
+    "primes.py": "def is_prime(n):\n    raise NotImplementedError\n",
+    "test_primes.py": "from primes import is_prime\n\nassert is_prime(2)\nassert is_prime(13)\nassert is_prime(97)\nassert not is_prime(1)\nassert not is_prime(0)\nassert not is_prime(15)\nassert not is_prime(100)\nprint(\"PASS\")\n"
+  },
+  "tools": ["read_file", "write_file", "list_dir", "run_bash"],
+  "max_turns": 12,
+  "oracle": [
+    {"check": "bash_exit_zero", "command": "python3 test_primes.py"}
+  ]
+}

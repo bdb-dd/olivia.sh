@@ -1,0 +1,29 @@
+{
+  "id": "think-before-tool",
+  "category": "block-ordering",
+  "description": "Reasoning model with thinking on: a problem that warrants thought before acting. Exercises the proxy's thinking -> tool_use block-transition state machine. Only meaningful with thinking enabled (requires_thinking); block_order checks ordering among the blocks that are present.",
+  "requires_thinking": true,
+  "request": {
+    "system": "You are a careful assistant. Think step by step, then use the calculator tool to compute the final value.",
+    "messages": [
+      {"role": "user", "content": "A train travels 240 km in 3 hours, then 150 km in 2 hours. Use the calculator to find its average speed over the whole trip in km/h."}
+    ],
+    "tools": [
+      {
+        "name": "calculator",
+        "description": "Evaluate an arithmetic expression and return the result.",
+        "input_schema": {
+          "type": "object",
+          "properties": {"expression": {"type": "string"}},
+          "required": ["expression"]
+        }
+      }
+    ],
+    "max_tokens": 1024
+  },
+  "expect": [
+    {"check": "calls_tool", "tool": "calculator"},
+    {"check": "tool_args_valid", "tool": "calculator"},
+    {"check": "block_order", "order": ["thinking", "tool_use"]}
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "id": "write-exact-file",
+  "category": "file-ops",
+  "description": "Single write, no bash — the simplest 'can it use one tool correctly and stop' case.",
+  "prompt": "Create a file named greeting.txt whose contents are exactly the text: Hello, World!",
+  "files": {},
+  "tools": ["write_file", "list_dir", "read_file"],
+  "max_turns": 6,
+  "oracle": [
+    {"check": "file_equals", "path": "greeting.txt", "content": "Hello, World!"}
+  ]
+}

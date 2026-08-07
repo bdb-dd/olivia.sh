@@ -1,0 +1,31 @@
+{
+  "id": "weather-single-tool",
+  "category": "tool-selection",
+  "description": "One obviously-needed tool is offered; a competent agent must call it with schema-valid args.",
+  "request": {
+    "system": "You are a helpful assistant with access to tools. Use them when they are needed.",
+    "messages": [
+      {"role": "user", "content": "What's the current weather in Paris, France?"}
+    ],
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather for a location.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "location": {"type": "string", "description": "City and country, e.g. 'Paris, France'"},
+            "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+          },
+          "required": ["location"]
+        }
+      }
+    ],
+    "max_tokens": 512
+  },
+  "expect": [
+    {"check": "calls_tool", "tool": "get_weather"},
+    {"check": "tool_args_valid", "tool": "get_weather"},
+    {"check": "tool_args_include", "tool": "get_weather", "keys": ["location"]}
+  ]
+}

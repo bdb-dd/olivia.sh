@@ -1,0 +1,14 @@
+{
+  "id": "fix-syntax-error",
+  "category": "bugfix",
+  "description": "A non-runnable file (syntax error); fix until it runs and prints the sentinel.",
+  "prompt": "broken.py has a syntax error and will not run. Fix it so that running `python3 broken.py` prints OK.",
+  "files": {
+    "broken.py": "def main():\n    print(\"OK\"\n\n\nmain()\n"
+  },
+  "tools": ["read_file", "write_file", "run_bash"],
+  "max_turns": 10,
+  "oracle": [
+    {"check": "stdout_contains", "command": "python3 broken.py", "text": "OK"}
+  ]
+}

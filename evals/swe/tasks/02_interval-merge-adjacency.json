@@ -1,0 +1,26 @@
+{
+  "id": "interval-merge-adjacency",
+  "category": "algorithm",
+  "description": "Interval merge treats touching intervals as disjoint.",
+  "prompt": "merge(intervals) in intervals.py merges a list of (start, end) integer intervals into the minimal sorted set of non-overlapping intervals. It currently treats touching intervals as separate: merge([(1,2),(2,3)]) returns [(1,2),(2,3)] but should return [(1,3)] because they touch at 2. Overlapping intervals already merge; the input may be unsorted. Fix merge() so touching AND overlapping intervals combine. Keep the signature merge(intervals) -> list[(start, end)] sorted by start.",
+  "files": {
+    "intervals.py": "def merge(intervals):\n    if not intervals:\n        return []\n    s = sorted(intervals)\n    result = [list(s[0])]\n    for start, end in s[1:]:\n        if start < result[-1][1]:\n            result[-1][1] = max(result[-1][1], end)\n        else:\n            result.append([start, end])\n    return [tuple(x) for x in result]\n"
+  },
+  "tools": [
+    "read_file",
+    "write_file",
+    "list_dir",
+    "grep",
+    "run_bash"
+  ],
+  "oracle_files": {
+    "grade_test.py": "from intervals import merge\n\nassert merge([]) == []\nassert merge([(1, 3)]) == [(1, 3)]\nassert merge([(1, 2), (2, 3)]) == [(1, 3)]\nassert merge([(1, 5), (2, 3)]) == [(1, 5)]\nassert merge([(1, 4), (2, 5), (7, 9)]) == [(1, 5), (7, 9)]\nassert merge([(5, 6), (1, 2), (3, 4)]) == [(1, 2), (3, 4), (5, 6)]\nassert merge([(1, 10), (2, 3), (4, 5), (11, 12)]) == [(1, 10), (11, 12)]\nassert merge([(1, 2), (3, 4), (2, 3)]) == [(1, 4)]\nprint(\"PASS\")\n"
+  },
+  "oracle": [
+    {
+      "check": "bash_exit_zero",
+      "command": "python3 grade_test.py"
+    }
+  ],
+  "max_turns": 25
+}

@@ -26,3 +26,6 @@ chat.db-shm
 .mcp.json
 
 cc_dumps/
+
+# Agentic-eval run outputs (scorecards/JSON are regenerated per run)
+evals/results/

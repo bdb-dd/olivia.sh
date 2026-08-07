@@ -1,0 +1,26 @@
+{
+  "id": "lru-cache-recency",
+  "category": "data-structure",
+  "description": "LRU cache fails to refresh recency on get and on updating put.",
+  "prompt": "LRUCache(capacity) in lru.py implements a least-recently-used cache: get(key) returns the value or -1 if absent; put(key, value) inserts/updates; when full, put evicts the least-recently-used key. Bug: recency is only tracked on initial insertion, so a get() that hits and a put() that updates an existing key do NOT mark the key most-recently-used, causing the wrong key to be evicted. Fix lru.py so every successful get and every put marks the key most-recently-used. Keep the class name LRUCache and methods get/put.",
+  "files": {
+    "lru.py": "class LRUCache:\n    def __init__(self, capacity):\n        self.capacity = capacity\n        self.store = {}\n        self.order = []  # least-recently-used at front\n\n    def get(self, key):\n        if key not in self.store:\n            return -1\n        return self.store[key]\n\n    def put(self, key, value):\n        if key in self.store:\n            self.store[key] = value\n            return\n        if len(self.store) >= self.capacity:\n            oldest = self.order.pop(0)\n            del self.store[oldest]\n        self.store[key] = value\n        self.order.append(key)\n"
+  },
+  "tools": [
+    "read_file",
+    "write_file",
+    "list_dir",
+    "grep",
+    "run_bash"
+  ],
+  "oracle_files": {
+    "grade_test.py": "from lru import LRUCache\n\nc = LRUCache(2)\nc.put(1, 1)\nc.put(2, 2)\nassert c.get(1) == 1\nc.put(3, 3)            # should evict key 2 (least recently used)\nassert c.get(2) == -1\nc.put(4, 4)            # should evict key 1\nassert c.get(1) == -1\nassert c.get(3) == 3\nassert c.get(4) == 4\n\nd = LRUCache(2)\nd.put(1, 1)\nd.put(2, 2)\nd.put(1, 10)          # updating key 1 makes it most-recently-used\nd.put(3, 3)           # should evict key 2\nassert d.get(2) == -1\nassert d.get(1) == 10\nassert d.get(3) == 3\nprint(\"PASS\")\n"
+  },
+  "oracle": [
+    {
+      "check": "bash_exit_zero",
+      "command": "python3 grade_test.py"
+    }
+  ],
+  "max_turns": 25
+}

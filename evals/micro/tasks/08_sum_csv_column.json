@@ -1,0 +1,14 @@
+{
+  "id": "sum-csv-column",
+  "category": "data",
+  "description": "Multi-step: read a data file, compute over it, write the result. Rewards using bash/python rather than mental arithmetic.",
+  "prompt": "Read data.csv (it has a header row 'id,value'). Sum the integers in the 'value' column and write just the total (digits only) to a file named total.txt.",
+  "files": {
+    "data.csv": "id,value\n1,10\n2,25\n3,7\n4,8\n"
+  },
+  "tools": ["read_file", "write_file", "run_bash"],
+  "max_turns": 10,
+  "oracle": [
+    {"check": "file_equals", "path": "total.txt", "content": "50"}
+  ]
+}

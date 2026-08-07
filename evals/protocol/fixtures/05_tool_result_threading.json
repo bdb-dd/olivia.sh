@@ -1,0 +1,35 @@
+{
+  "id": "tool-result-threading",
+  "category": "multi-turn-threading",
+  "description": "History already contains an assistant tool_use and the user's tool_result. The model should consume the result and answer in text (no further tool call). Exercises the proxy's reverse translation of assistant tool_use + user tool_result into OpenAI assistant.tool_calls + role:tool messages.",
+  "request": {
+    "system": "You are a helpful assistant with access to tools.",
+    "messages": [
+      {"role": "user", "content": "What's the weather in Paris right now?"},
+      {"role": "assistant", "content": [
+        {"type": "text", "text": "Let me check the current weather in Paris."},
+        {"type": "tool_use", "id": "toolu_demo_01", "name": "get_weather", "input": {"location": "Paris, France"}}
+      ]},
+      {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_demo_01", "content": "18 degrees celsius, partly cloudy, wind 12 km/h"}
+      ]}
+    ],
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather for a location.",
+        "input_schema": {
+          "type": "object",
+          "properties": {"location": {"type": "string"}},
+          "required": ["location"]
+        }
+      }
+    ],
+    "max_tokens": 256
+  },
+  "expect": [
+    {"check": "no_tool_call"},
+    {"check": "final_text_nonempty"},
+    {"check": "text_contains", "text": "18"}
+  ]
+}

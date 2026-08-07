@@ -1,0 +1,28 @@
+{
+  "id": "no-tool-trivial",
+  "category": "no-tool-needed",
+  "description": "A tool is offered but the question is answerable directly; a competent agent answers in text and does NOT call the tool (knows when not to act).",
+  "request": {
+    "system": "You are a helpful assistant. You have tools, but only use them when they are actually needed.",
+    "messages": [
+      {"role": "user", "content": "What is 17 multiplied by 4? Answer with just the number."}
+    ],
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather for a location.",
+        "input_schema": {
+          "type": "object",
+          "properties": {"location": {"type": "string"}},
+          "required": ["location"]
+        }
+      }
+    ],
+    "max_tokens": 256
+  },
+  "expect": [
+    {"check": "no_tool_call"},
+    {"check": "final_text_nonempty"},
+    {"check": "text_contains", "text": "68"}
+  ]
+}

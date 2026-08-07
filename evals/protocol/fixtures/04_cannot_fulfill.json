@@ -1,0 +1,27 @@
+{
+  "id": "cannot-fulfill-no-matching-tool",
+  "category": "hallucination-guard",
+  "description": "The request needs a capability none of the offered tools provide. A competent agent must not force-fit an unrelated tool; the invariant layer separately guarantees it can never invent a tool name outside the offered set.",
+  "request": {
+    "system": "You are a helpful assistant. Use a tool only when one of the provided tools fits the request. If none fits, say so plainly.",
+    "messages": [
+      {"role": "user", "content": "Please translate the sentence 'Good morning' into Japanese."}
+    ],
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather for a location.",
+        "input_schema": {
+          "type": "object",
+          "properties": {"location": {"type": "string"}},
+          "required": ["location"]
+        }
+      }
+    ],
+    "max_tokens": 256
+  },
+  "expect": [
+    {"check": "does_not_call", "tool": "get_weather"},
+    {"check": "final_text_nonempty"}
+  ]
+}

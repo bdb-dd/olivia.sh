@@ -279,6 +279,25 @@ Concurrency sweep (`bench_sweep.py`, `max_tokens=256`, reasoning on, warm pass):
 
 **Three fixes were needed for the multi-node path** (all now codified): the EngineCoreActor on `251f7e4` computes physical GPU ids for the whole world (8) by indexing `CUDA_VISIBLE_DEVICES`, which is only the node-local 4 GPUs → `IndexError` — fixed by stripping CVD from the container with **`env -u CUDA_VISIBLE_DEVICES`** (+ `RAY_EXPERIMENTAL_NOSET`), so vLLM uses raw ids and Ray places the 8 workers itself (singularity leaks the host CVD, so omitting the `--env` wasn't enough). And the compressed-tensors **W8A8 FP8 cutlass** linear double-sets `weight_loader` when linear dims need 16-alignment padding (the 397B's do, the 35B's don't) → `AssertionError` — patched (redundant re-set dropped). Both the legacy and engine-as-actor Ray executors hit the device-index bug (v1 runs EngineCore as a Ray actor either way), so the fix is executor-independent. See CLAUDE.md.
 
+### Qwen3.8 27B (`qwen38`) — 27B dense on 1× GH200, block-FP8, PIECEWISE capture · 2026-08-17
+First run on the new `vllm-glm53-1` container (vLLM v0.27.1 + NGC 26.07). `bench_sweep.py`, `max_tokens=512`.
+
+| Concurrency | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| Agg tok/s — **warm** | **85.7** | **162.5** | **317.8** | — | — | — | — |
+| Per-stream — **warm** | 85.7 | 81.3 | 79.5 | — | — | — | — |
+| p95 TTFT (s) — **warm** | 0.07 | 0.13 | 0.11 | — | — | — | — |
+| Agg tok/s — *cold* | 85.6 | 162.4 | *137.6* | 208.7 | 1142.0 | 1259.6 | 3143.1 |
+| p95 TTFT (s) — *cold* | 0.07 | 0.13 | *8.55* | *13.10* | 0.21 | *4.91* | 0.49 |
+
+**Serves cleanly, 0 failures 1→64 on both passes.** Weights **28.46 GiB loaded in 21.1 s**; **KV cache 832,557 tokens** = 3.18× concurrency at the full 262,144-token context. Single-stream **~85.7 tok/s** — for a *dense* 27B that compares well against the sparse models here (ornith_gh200's 35B MoE hits ~174 tok/s but activates only ~3B/token; Laguna's 225B MoE gets ~63 tok/s on 4× the GPUs). **CUDAGraph PIECEWISE capture works** (51 graphs) — the hybrid linear+full attention captures cleanly like Ornith, unlike the GLM-5.x/Kimi MLA models that IMA.
+
+⚠️ **The sweep is INCOMPLETE — warm data only for 1/2/4.** The SSH master dropped mid-run (2FA re-auth needed) before the warm 8→64 levels were captured. The *cold* row is a first-touch pass and its 4/8/32 entries are polluted by Triton JIT stalls on fresh shapes — c=4 went **137.6 agg / 8.55 s TTFT cold → 317.8 / 0.11 s warm**, so treat every italicised cold number as a JIT artefact, not a throughput result. Same effect the Ornith sweep saw. **Re-run `--levels 8,16,32,64` warm to finish this table.**
+
+**Not yet tested: MTP.** The checkpoint really ships the head (22 `mtp.*` tensors) and vLLM registers `Qwen3_5MTP`, so `ENABLE_SPECULATIVE=1` is the obvious next measurement and the likeliest large win.
+
+**Reasoning not observed.** `reasoning_content` came back empty on every prompt, including with `chat_template_kwargs={"enable_thinking": true}` — the kwarg *is* being applied (prompt tokens change: 87→83) and the template does reference `enable_thinking`/`<think>`, but the model answered directly with no `<think>` block on the test prompts. Parsers (`qwen3_xml`/`qwen3`) are configured but unexercised. Answers were correct, including the bat-and-ball trick question.
+
 ### Laguna M.1 (`laguna`) — 1 node × 4 GH200, FP8, CUDAGraph · 2026-06-20
 Concurrency sweep (`bench_sweep.py`, `max_tokens=512`), reasoning on (`enable_thinking=true`) vs off:
 

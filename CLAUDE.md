@@ -129,6 +129,8 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 | `glm51_v19` (alias `glm51`) | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | TP=4 + PP=2, vLLM v0.19.0, container index 1. **Defaults to PIECEWISE CUDAGraph capture** (NGC-26.03 rebuild): de-wedged via NCCL all-reduce, ~22 tok/s/stream, 0-fail 1→64. The old serialization workaround is no longer needed. |
 | `glm51_v20` | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | Same as glm51_v19 but on vLLM v0.20.0 + RayExecutorV2, container index 2. **Quarantined** — same wedge as v0.19.0; kept for diagnostic work only. |
 | `glm52` | `RedHatAI/GLM-5.2-FP8` | 12 (3 nodes × 4) | TP=4 + PP=3. Block-FP8 (~755 GB) — does **not** fit 8 GPUs, hence 3 nodes. **Needs vLLM main `091386a` (pinned) + PR#45895** (new skip-topk DSA indexer); not in any release. Same multi-node PP wedge as glm51 → proxy serialization. fp8 KV cache + DeepGEMM (`VLLM_DEEP_GEMM_WARMUP=skip`). |
+| `glm53` | `zai-org/GLM-5.3-FP8` | 12 (3 nodes × 4) | GLM-5.2's **same base, re-post-trained** — identical arch, so it **reuses the glm52 container** (index 1, no rebuild) and inherits the whole 5.2 runtime profile. **Weights not public yet** (Z.ai promised them ~2 weeks after the 2026-08-14 launch); confirm the repo id when they land. |
+| `glm53_v27` | `zai-org/GLM-5.3-FP8` | 12 (3 nodes × 4) | Same model on its **own** `vllm-glm53-1` container built from **vLLM v0.27.1 + NGC 26.07**, no PR graft. The upgrade path off glm52's pinned-main build — **unvalidated**. |
 | `glm47` | `QuantTrio/GLM-4.7-AWQ` | 4 | TP=4, MTP speculative |
 | `kimi` | `moonshotai/Kimi-K2.6` | 8 (2 nodes × 4) | TP=4 + PP=2, native int4, MLA, multimodal, vLLM v0.19.1 |
 | `laguna` | `poolside/Laguna-M.1-FP8` | 4 | TP=4, single node. FP8 (~225 GB), dense full attention (FLASH_ATTN), CUDAGraph capture on. vLLM v0.21.0, `poolside_v1` parsers. |
@@ -138,7 +140,7 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 | `llama` | `meta-llama/Llama-3.3-70B-Instruct` | 4 | TP=4 |
 | `qwen` | `Qwen/Qwen2.5-72B-Instruct` | 4 | TP=4 |
 
-**Per-preset GPU allocation:** `olivia.sh server start` reads resources from `get_preset_resources()` in `olivia.sh` and passes corresponding `--nodes`, `--gpus-per-node`, `--cpus-per-task` overrides to `sbatch`. `glm51` (2 nodes × 4) and `glm52` (3 nodes × 4) cross node boundaries; everything else runs single-node 4 GPUs. The `cluster` snapshot reports start-time/feasibility for 1-, 2-, and 3-node × 4-GPU shapes.
+**Per-preset GPU allocation:** `olivia.sh server start` reads resources from `get_preset_resources()` in `olivia.sh` and passes corresponding `--nodes`, `--gpus-per-node`, `--cpus-per-task` overrides to `sbatch`. `glm51` (2 nodes × 4) and `glm52`/`glm53` (3 nodes × 4) cross node boundaries; everything else runs single-node 4 GPUs. The `cluster` snapshot reports start-time/feasibility for 1-, 2-, and 3-node × 4-GPU shapes.
 
 #### Prefetch Module
 ```bash
@@ -335,6 +337,7 @@ The build script includes predefined configurations for common models. Run witho
 | `glm51_v19` (alias `glm51`) | GLM-5.1 (744B / 40B active) MoE+DSA flagship, recipe-default | v0.19.0 | >=5.4.0 |
 | `glm51_v20` | GLM-5.1 on RayExecutorV2 — **quarantined**, same multi-node PP wedge as v0.19.0 | v0.20.0 | >=5.4.0 |
 | `glm52` | GLM-5.2 (744B / 40B active) MoE+DSA, successor to 5.1 — FP8. Builds vLLM main pinned to `091386a` + auto-grafts PR#45895 snapshot (`VLLM_PATCHES`); not in any release | main `091386a` + PR#45895 | >=5.4.0 |
+| `glm53_v27` | GLM-5.3 on a **tagged** release. Same arch as 5.2, so this preset exists only to retire the pinned-main + PR-graft build (PR#45895 merged upstream in v0.24.0) and pick up the DSA/parser work through v0.27.1. NGC 26.07 (torch 2.13), vllm-project DeepGEMM `e21c821f`. Builds `vllm-glm53-1`; the serve preset `glm53` needs no build at all | v0.27.1 | >=5.5.3 |
 | `glm47` | GLM-4.7 (358B) flagship model | main | >=5.0.0rc0 |
 | `kimi` | Kimi K2.6 (1T / 32B active) MoE + MLA, multimodal | v0.19.1 | >=4.57.1,<5.0.0 |
 | `laguna` | Laguna M.1 (Poolside, 225B / 23B active) MoE coding model — FP8, single-node TP=4, native vLLM Laguna support | v0.21.0 | >=5.7.0 |
@@ -612,6 +615,101 @@ GLM-5.2 is the successor to GLM-5.1: same `GlmMoeDsaForCausalLM` MoE+DSA archite
 
 # Check whether a 3-node shape can schedule right now
 ./olivia.sh cluster
+```
+
+### GLM-5.3 (presets `glm53` / `glm53_v27`) — same base as 5.2, weights pending
+
+GLM-5.3 (Z.ai, announced **2026-08-14**) is **not a new architecture and not a new
+pretrain**. It is GLM-5.2's *same 744B / ~40B-active base* re-post-trained — Z.ai's
+own framing is that "every reported gain comes from scaled post-training". Same
+`GlmMoeDsaForCausalLM`, same MoE+DSA, same periodic/skip-topk indexer, same 1M
+native context. The headline gains are agentic-coding and long-horizon (Terminal-Bench
+3.0 4.6 → 28.3, DeepSWE v1.1 46.2 → 66.9) plus an unplanned jump in cyber-security
+capability (CyberGym 84.5%) — which is exactly *why* the weights were held back.
+
+> ⚠️ **The weights are not public yet (as of 2026-08-17).** GLM-5.3 shipped
+> API-only (Z.ai API, GLM Coding Plan, ZCode); Z.ai said open weights would follow
+> "in stages after safety evaluation, roughly two weeks" → **~end of August 2026**.
+> There is **no `zai-org/GLM-5.3*` repo on HuggingFace** yet, no published license
+> (5.2 was MIT; that does **not** carry over automatically), and no announced quant
+> lineup. `presets.json` therefore points at the **expected** id
+> `zai-org/GLM-5.3-FP8` (following 5.2's naming) — **confirm it, the license, and
+> the actual quants before prefetching.** A `RedHatAI/GLM-5.3-FP8`-style re-host is
+> likely too, as with 5.2.
+
+**Because the architecture is unchanged, no new model support is needed anywhere —
+the deployed glm52 container already serves it.** That is the whole design of the
+`glm53` preset: it points `container_prefix` at `glm52` / index 1, so
+`./olivia.sh server start glm53` runs the **already-validated** 3-node FP8 container
+with **no build and no allocation spent**. The two presets:
+
+| Preset | Container | vLLM | Why |
+|--------|-----------|------|-----|
+| `glm53` | `vllm-glm52-1-sandbox` (**shared**, no rebuild) | main `091386a` + PR#45895 graft | Day-0 serving the moment weights land. Zero build risk — this container already serves 744B DSA FP8 across 12 GPUs. |
+| `glm53_v27` | `vllm-glm53-1-sandbox` (**its own**) | **v0.27.1** + NGC 26.07 | The upgrade path. Separate container name, so it structurally cannot clobber the working glm52 one. |
+
+**Runtime:** `run_vllm_server.sh` detects `GLM-5.3` in `MODEL` (`IS_GLM53`) and
+**lights `IS_GLM52` as the "5.2-family runtime profile"** rather than duplicating
+five blocks — so 5.3 inherits verbatim: block-FP8 DeepGEMM path
+(`VLLM_USE_DEEP_GEMM=1`, `VLLM_DEEP_GEMM_WARMUP=skip`), **eager CUDAGraph**
+(`CUDAGRAPH_MODE=NONE`), no fp8-KV override (FLASHMLA_SPARSE on Hopper rejects it),
+RayExecutorV2 engine-as-actor, the PP=3 layer partition `26,24,28`, sparse-MLA
+auto-select backend, glm47/glm45 parsers, `--trust-remote-code`, 128K default
+context. `IS_GLM53` stays a separate flag purely for reporting and for the day a
+future 5.x *isn't* the 5.2 base — split them there first.
+
+#### Is an updated vLLM worth it? (checked 2026-08-17)
+
+Yes, but as a **separate gated experiment**, not as a prerequisite for serving 5.3.
+
+*What has changed upstream since glm52 was pinned to main `091386a` (2026-06-17):*
+- **PR#45895 merged** (`ab666069`, 2026-06-19) and is an ancestor of **v0.24.0**
+  (2026-06-29) onward — verified against `v0.27.1` (`compare` → `behind_by: 0`). The
+  whole reason glm52 pins an unreleased main commit + grafts a patch **evaporates**;
+  a modern preset builds a **tag**.
+- **v0.24.0** added the streaming parser engine for GLM-4.7/5.1/5.2 (tool-call
+  streaming — relevant to Claude Code through `anthropic_proxy.py`).
+- **v0.27.0** added *skip sparse indexer scoring for short dense prefills* (#48407),
+  straight on the GLM-5.x DSA hot path, plus Quark GLM-5.2 checkpoint fixes (#48886).
+- **v0.27.0 moved to torch 2.13.0 + Triton 3.7.1** — a breaking environment change.
+  NGC 26.05 (glm52's base) ships torch 2.12.0a0; **NGC 26.07** ships 2.13.0a0 +
+  CUDA 13.3.1 and is the newest tag, so the preset moves there. This matters because
+  our `--no-deps` strategy keeps *NGC's* torch, so vLLM's pin and the base image
+  should agree.
+- **DeepGEMM moved:** vLLM no longer pins deepseek-ai — v0.27.1 pins
+  `vllm-project/DeepGEMM` @ `e21c821f`. The build script gained a `DEEPGEMM_REPO`
+  knob (default unchanged: deepseek-ai) so the preset can match vLLM's pin exactly.
+
+*What it does **not** obviously buy:* nothing upstream addresses the CUDAGraph
+capture IMA (still eager) or the multi-node PP decode wedge — #48720 is an RFC for
+*detecting* TP deadlocks, not fixing them. glm52 already avoids the wedge via
+engine-as-actor RayExecutorV2. A newer torch/inductor *might* fix the capture IMA
+(that would be the big win — glm52's ~5.6 tok/s single-stream is eager-bound), which
+is worth one `CUDAGRAPH_MODE=PIECEWISE` retry on the new container.
+
+*The de-risking trick:* **validate `glm53_v27` against `GLM-5.2-FP8`, which is
+already in the work-tier cache** — the arch is identical, so a clean 5.2 serve on
+the new container proves the whole toolchain *before* 5.3 weights exist, and the
+existing README numbers give an exact A/B baseline. If it regresses, `glm53` on the
+glm52 container is the fallback and needs no rebuild.
+
+### GLM-5.3 Usage
+
+```bash
+# --- Path A: serve on the existing glm52 container (no build) ---
+# 0. FIRST confirm the real repo id + license once Z.ai publishes the weights;
+#    presets.json currently holds the EXPECTED id zai-org/GLM-5.3-FP8.
+./olivia.sh prefetch glm53            # ~755 GB -> /cluster/work (work-tier preset)
+./olivia.sh cluster                   # check a 3-node × 4-GPU shape can schedule
+./olivia.sh server start glm53        # runs vllm-glm52-1-sandbox, TP=4 + PP=3
+./olivia.sh server watch
+
+# --- Path B: the vLLM upgrade (own container, cannot clobber glm52) ---
+./olivia.sh build glm53_v27           # vLLM v0.27.1 + NGC 26.07 + vllm-project DeepGEMM
+# Validate the toolchain on GLM-5.2 weights we already have, BEFORE 5.3 lands:
+./olivia.sh server start glm53_v27 --model RedHatAI/GLM-5.2-FP8
+# Then A/B against README "## Performance" -> GLM-5.2 (glm52). Retry capture once:
+CUDAGRAPH_MODE=PIECEWISE ./olivia.sh server start glm53_v27 --model RedHatAI/GLM-5.2-FP8
 ```
 
 ### Kimi K2.6 Quantization Options
@@ -986,4 +1084,4 @@ Naming examples:
 
 ## Troubleshooting
 
-**Allocation failures / jobs stuck pending.** Before debugging a job that won't start, rule out a cluster maintenance window: run `scontrol show reservation` on the cluster. A `maintstop` reservation covers all nodes and only permits specific maintenance accounts; SLURM reports `ReqNodeNotAvail, Reserved for maintenance` without useful context. Multi-node jobs (e.g. the 2×4-GPU `glm51` or 3×4-GPU `glm52` presets) are especially sensitive.
+**Allocation failures / jobs stuck pending.** Before debugging a job that won't start, rule out a cluster maintenance window: run `scontrol show reservation` on the cluster. A `maintstop` reservation covers all nodes and only permits specific maintenance accounts; SLURM reports `ReqNodeNotAvail, Reserved for maintenance` without useful context. Multi-node jobs (e.g. the 2×4-GPU `glm51` or 3×4-GPU `glm52`/`glm53` presets) are especially sensitive.

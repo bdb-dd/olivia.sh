@@ -340,10 +340,28 @@ if [[ "${MODEL}" == *"GLM-5.2"* ]] || [[ "${MODEL}" == *"glm-5.2"* ]]; then
     IS_GLM52=1
 fi
 
-# GLM-5.x family: everything 5.1 and 5.2 share — sparse-MLA attention backend,
-# --trust-remote-code, and the generous 128K default context. (5.1-only and
-# 5.2-only specifics, e.g. the cyankiwi chat-template fix or the FP8 DeepGEMM
-# path, stay keyed on IS_GLM51 / IS_GLM52 individually.)
+# Detect GLM-5.3. It is NOT a new architecture and NOT a new pretrain: Z.ai
+# re-post-trained GLM-5.2's *same 744B base* ("every reported gain comes from
+# scaled post-training"), so the checkpoint is byte-compatible in every way that
+# matters to a serving stack — same GlmMoeDsaForCausalLM, same ~40B active, same
+# skip-topk DSA indexer, same 1M native context, same block-FP8 quant.
+#
+# It therefore wants the ENTIRE GLM-5.2 runtime profile: eager CUDAGraph (capture
+# IMAs on this NGC stack), the DeepGEMM block-FP8 path, RayExecutorV2, the PP=3
+# layer partition, no bf16 KV override. Rather than duplicate ~5 blocks, we light
+# IS_GLM52 as the "5.2-family profile" flag and keep IS_GLM53 for reporting and
+# for any future 5.3-only divergence. If Z.ai ever ships a 5.3 that ISN'T the 5.2
+# base, split them here first.
+IS_GLM53=0
+if [[ "${MODEL}" == *"GLM-5.3"* ]] || [[ "${MODEL}" == *"glm-5.3"* ]]; then
+    IS_GLM53=1
+    IS_GLM52=1
+fi
+
+# GLM-5.x family: everything 5.1, 5.2 and 5.3 share — sparse-MLA attention
+# backend, --trust-remote-code, and the generous 128K default context. (5.1-only
+# and 5.2-family-only specifics, e.g. the cyankiwi chat-template fix or the FP8
+# DeepGEMM path, stay keyed on IS_GLM51 / IS_GLM52 individually.)
 IS_GLM5=0
 if [[ "${IS_GLM51}" == "1" || "${IS_GLM52}" == "1" ]]; then
     IS_GLM5=1
@@ -403,8 +421,10 @@ fi
 # (the same eager-only story as Kimi — verified 2026-06-18, job 1308936 died with
 # "CUDA error: an illegal memory access" under <auto-select>). Default to eager
 # (mode=NONE) when unset so `./olivia.sh server start glm52` works out of the box;
-# override CUDAGRAPH_MODE=PIECEWISE etc. to retry capture. Scoped to 5.2 only —
-# glm51 keeps its own capture experiment (see its CUDAGraph TODO).
+# override CUDAGRAPH_MODE=PIECEWISE etc. to retry capture. Scoped to the 5.2
+# FAMILY (so GLM-5.3 inherits it — same base, same capture behaviour expected);
+# glm51 keeps its own capture experiment (see its CUDAGraph TODO). Worth retrying
+# on the glm53_v27 container: a newer torch/inductor may not miscompile.
 if [[ "${IS_GLM52}" == "1" && -z "${CUDAGRAPH_MODE}" ]]; then
     CUDAGRAPH_MODE="NONE"
 fi
@@ -465,7 +485,7 @@ if [[ -z "${MAX_MODEL_LEN+x}" ]]; then
         #                 concurrency, lower this or set KV_CACHE_DTYPE=fp8_e4m3.
         MAX_MODEL_LEN=262144
     elif [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" ]]; then
-        # GLM-5.1 ~205K, GLM-5.2 ~1M, Kimi K2.6 ~256K, Laguna M.1 ~256K native —
+        # GLM-5.1 ~205K, GLM-5.2/5.3 ~1M, Kimi K2.6 ~256K, Laguna M.1 ~256K native —
         # all ship far larger windows, but 128K is the safe default within budget.
         # On glm52's 3-node FP8 (~18 GB/GPU KV), 128K holds a few concurrent
         # sequences; raise with --kv-cache-dtype fp8 (see KV_CACHE_DTYPE) or
@@ -663,7 +683,9 @@ fi
 
 if [[ "${IS_GLM_MOE}" == "1" ]]; then
     echo ""
-    if [[ "${IS_GLM52}" == "1" ]]; then
+    if [[ "${IS_GLM53}" == "1" ]]; then
+        echo "GLM-5.3 Settings (GLM-5.2-family runtime profile):"
+    elif [[ "${IS_GLM52}" == "1" ]]; then
         echo "GLM-5.2 Settings:"
     elif [[ "${IS_GLM51}" == "1" ]]; then
         echo "GLM-5.1 Settings:"

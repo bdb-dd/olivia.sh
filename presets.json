@@ -61,6 +61,14 @@
       "storage": "work",
       "description": "GLM-5.2 744B MoE+DSA, block-FP8, 3-node TP=4+PP=3"
     },
+    "glm52_awq": {
+      "aliases": ["glm52-awq", "glm-5.2-awq", "glm52awq"],
+      "model": "cyankiwi/GLM-5.2-AWQ-INT4",
+      "nodes": 2, "gpus": 4, "pp": 2,
+      "container_prefix": "glm53", "index": 1,
+      "storage": "projects",
+      "description": "GLM-5.2 744B MoE+DSA, AWQ/compressed-tensors INT4 (~411 GB) — the 2-node TP=4+PP=2 path CLAUDE.md anticipated, now that the quant exists. Persistent tier, already cached. Runs on the glm53 (vLLM v0.27.1) container: the skip-topk indexer it needs is native there, not grafted"
+    },
     "glm53": {
       "aliases": ["glm-5.3", "glm5.3"],
       "model": "zai-org/GLM-5.3-FP8",

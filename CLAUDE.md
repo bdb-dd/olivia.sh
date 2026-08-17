@@ -129,6 +129,7 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 | `glm51_v19` (alias `glm51`) | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | TP=4 + PP=2, vLLM v0.19.0, container index 1. **Defaults to PIECEWISE CUDAGraph capture** (NGC-26.03 rebuild): de-wedged via NCCL all-reduce, ~22 tok/s/stream, 0-fail 1→64. The old serialization workaround is no longer needed. |
 | `glm51_v20` | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | Same as glm51_v19 but on vLLM v0.20.0 + RayExecutorV2, container index 2. **Quarantined** — same wedge as v0.19.0; kept for diagnostic work only. |
 | `glm52` | `RedHatAI/GLM-5.2-FP8` | 12 (3 nodes × 4) | TP=4 + PP=3. Block-FP8 (~755 GB) — does **not** fit 8 GPUs, hence 3 nodes. **Needs vLLM main `091386a` (pinned) + PR#45895** (new skip-topk DSA indexer); not in any release. Same multi-node PP wedge as glm51 → proxy serialization. fp8 KV cache + DeepGEMM (`VLLM_DEEP_GEMM_WARMUP=skip`). |
+| `glm52_awq` | `cyankiwi/GLM-5.2-AWQ-INT4` | **8 (2 nodes × 4)** | TP=4 + **PP=2**. AWQ/compressed-tensors INT4 (~411 GB) fits 8 GPUs, so it costs **8 GPU-h/hour instead of 12**. Same DSA skip-topk indexer as the FP8, so it needs PR#45895 → runs on the **glm53** (vLLM v0.27.1) container where that is native. Weights live on the **persistent** tier and are already cached. Auto-applies `VLLM_PP_LAYER_PARTITION=38,40` (see below). **Not yet served.** |
 | `glm53` | `zai-org/GLM-5.3-FP8` | 12 (3 nodes × 4) | GLM-5.2's **same base, re-post-trained** — identical arch, so it **reuses the glm52 container** (index 1, no rebuild) and inherits the whole 5.2 runtime profile. **Weights not public yet** (Z.ai promised them ~2 weeks after the 2026-08-14 launch); confirm the repo id when they land. |
 | `glm53_v27` | `zai-org/GLM-5.3-FP8` | 12 (3 nodes × 4) | Same model on its **own** `vllm-glm53-1` container built from **vLLM v0.27.1 + NGC 26.07**, no PR graft. The upgrade path off glm52's pinned-main build — **unvalidated**. |
 | `glm47` | `QuantTrio/GLM-4.7-AWQ` | 4 | TP=4, MTP speculative |
@@ -581,7 +582,7 @@ GLM-5.2 is the successor to GLM-5.1: same `GlmMoeDsaForCausalLM` MoE+DSA archite
 | Quantization | Model | Size | Olivia fit |
 |--------------|-------|------|------------|
 | block-FP8 (e4m3, [128,128]) | `zai-org/GLM-5.2-FP8` / `RedHatAI/GLM-5.2-FP8` | ~755 GB | **3 nodes × 4 GH200** (TP=4 + PP=3); 8 GPUs won't fit |
-| AWQ-4bit | — | ~430 GB | Does **not exist yet** (would be the preferred 2-node / 8-GPU path) |
+| AWQ / compressed-tensors INT4 | `cyankiwi/GLM-5.2-AWQ-INT4` | **~411 GB** | **NOW EXISTS** (preset `glm52_awq`) — **2 nodes × 4 GH200** (TP=4 + PP=2), the cheaper path this table used to say was hypothetical. Verified on-cluster 2026-08-17: `GlmMoeDsaForCausalLM`, 78 layers, 1M ctx, `pack-quantized` 4-bit group_size 32, **same skip-topk indexer** (`index_topk_freq=4`, `index_skip_topk_offset=3`), MTP head present. Already fully cached on the **persistent** projects tier |
 | NVFP4 | `Lorbus/GLM-5.2-NVFP4` etc. | — | **No** — needs Blackwell FP4 tensor cores |
 | BF16 | `zai-org/GLM-5.2` | ~1.5 TB | No — 16+ GPUs |
 
@@ -1074,7 +1075,20 @@ Naming examples:
 - `vllm-devstral-1-sandbox` - Devstral build #1
 - `vllm-generic-1-sandbox` - Generic build #1
 
-**Persistent model cache (`HF_HOME`)**: HuggingFace model weights (hundreds of GB) live in a persistent project area — e.g. `/cluster/projects/<proj>/huggingface`. They must **not** sit on `/cluster/work`, which NRIS auto-purges after 21–42 days (this silently deleted a ~430 GB GLM-5.1 AWQ cache once, leaving only metadata + dangling symlinks). `HF_HOME` is set in `mise.local.toml` and forwarded to jobs by `olivia.sh`; populate it with `./olivia.sh prefetch`. Note `/cluster/work` and `/cluster/projects` are different Lustre filesystems, so migrating weights between them is copy-then-delete (no cross-FS hardlinks).
+**Persistent model cache (`HF_HOME`)**: HuggingFace model weights (hundreds of GB) live in a persistent project area — e.g. `/cluster/projects/<proj>/huggingface`. They must **not** sit on `/cluster/work`, which NRIS auto-purges after 21–42 days (this silently deleted a ~430 GB GLM-5.1 AWQ cache once, leaving only metadata + dangling symlinks).
+
+> 🔥 **This happened again, to everything — verified 2026-08-17.** *Every* work-tier
+> model cache had been purged to metadata-only: `RedHatAI--GLM-5.2-FP8` (632K),
+> `cyankiwi--GLM-5.1-AWQ-4bit` (380K), `deepreinforce-ai--Ornith-1.0-397B-FP8`
+> (568K), `moonshotai--Kimi-K2.6` (328K), `moonshotai--Kimi-K2.7-Code` (608K),
+> `poolside--Laguna-M.1-FP8` (228K). `blobs/` was empty and every snapshot symlink
+> dangled. Only the **projects**-tier copies survived. So **every `"storage":
+> "work"` preset — `glm51`, `glm52`, `glm53`, `kimi`, `kimi27`, `ornith` — will
+> silently re-download its weights inside the GPU allocation** unless you
+> `prefetch` first. `du -sh $HF_HOME/hub/models--*` is the 2-second check: a
+> multi-hundred-GB model reading as KB is a purged cache, not a present one.
+> **Always `./olivia.sh prefetch <preset>` before `server start` on a work-tier
+> preset that has been idle for more than ~3 weeks.** `HF_HOME` is set in `mise.local.toml` and forwarded to jobs by `olivia.sh`; populate it with `./olivia.sh prefetch`. Note `/cluster/work` and `/cluster/projects` are different Lustre filesystems, so migrating weights between them is copy-then-delete (no cross-FS hardlinks).
 
 **Ephemeral compile/JIT caches**: Triton, DeepGEMM, TorchInductor and vLLM compile caches are regenerable and stay under `$PWD/cache/` on `/cluster/work` (`run_vllm_server.sh` sets `TRITON_CACHE_DIR`, `DG_JIT_CACHE_DIR`, `TORCHINDUCTOR_CACHE_DIR`, `VLLM_CACHE_ROOT`). They're large and high-churn, so auto-purge is harmless — but they must avoid the small home quota (defaulting them to `~/.triton` crashes jobs mid-profile with `Disk quota exceeded`).
 

@@ -530,7 +530,13 @@ fi
 
 # GLM-5.1 AWQ: swap the MoE flashinfer kernel variant
 # (QuantTrio recipe uses MOE_FP16 for GLM-5-AWQ, not MOE_FP8 like GLM-4.7-AWQ)
-if [[ "${IS_GLM51}" == "1" && "${IS_AWQ}" == "1" ]]; then
+# Applies to the whole GLM-5.x AWQ lineage, not just 5.1: cyankiwi publishes both
+# GLM-5.1-AWQ-4bit and GLM-5.2-AWQ-INT4, same GlmMoeDsaForCausalLM, same 4-bit
+# weight-only MoE. Leaving the global FLASHINFER_MOE_FP8=1 default on for a 4-bit
+# checkpoint points vLLM at an FP8 MoE kernel the weights cannot feed — and on
+# containers where the build uninstalled a version-skewed flashinfer (the Ornith
+# lesson, likely on the v0.27.1/glm53 container too) there is no flashinfer at all.
+if [[ "${IS_GLM5}" == "1" && "${IS_AWQ}" == "1" ]]; then
     export VLLM_USE_FLASHINFER_MOE_FP8=0
     export VLLM_USE_FLASHINFER_MOE_FP16=1
 fi
@@ -556,6 +562,17 @@ if [[ "${IS_GLM52}" == "1" && "${IS_AWQ}" == "0" ]]; then
     #   FLASHMLA_SPARSE: [kv_cache_dtype not supported]
     # Override KV_CACHE_DTYPE explicitly only if you know your backend supports it.
     : # (no fp8 KV default for glm52 on GH200)
+fi
+
+# --- GLM-5.2-family multi-node bits that are QUANT-INDEPENDENT --------------
+# These two used to live inside the `IS_AWQ == 0` branch above, which was fine
+# while block-FP8 was the only GLM-5.2 quant. It no longer is: a complete
+# cyankiwi/GLM-5.2-AWQ-INT4 (compressed-tensors pack-quantized 4-bit, ~411 GB)
+# now exists, and it is the SAME GlmMoeDsaForCausalLM with the SAME skip-topk
+# indexer (index_topk_freq=4, index_skip_topk_offset=3 — verified on the
+# on-cluster checkpoint). Both settings below are about DSA + cross-node PP, not
+# about the GEMM path, so gating them on FP8 silently mis-served the AWQ.
+if [[ "${IS_GLM52}" == "1" ]]; then
     # GLM-5.2 multi-node uses RayExecutorV2 (no Ray Compiled Graph). The legacy
     # executor's Compiled Graph wedges decode at 0 tok/s here; V2 decodes cleanly.
     # V2 with our external Ray bootstrap only works in engine-as-Ray-actor mode
@@ -565,15 +582,26 @@ if [[ "${IS_GLM52}" == "1" && "${IS_AWQ}" == "0" ]]; then
     if [[ "${_RAYV2_EXPLICIT}" == "0" ]]; then
         VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1
     fi
-    # Custom PP layer partition (PP=3 only). GLM-5.2's DSA skip-topk layer at a
-    # pipeline-stage boundary trips `KeyError: model.layers.<N>.self_attn.attn`
-    # in get_attn_backends_for_group on the default even split (78/3 → boundary
-    # at layer 52, a skip-topk layer). 26/24/28 moves the boundaries to layers
-    # 0/26/50 — all FULL-indexer layers (full when max(L-2,0) % index_topk_freq
-    # == 0) — which gets init all the way to a live server. (Decode then still
-    # hits the multi-node PP wedge; see CLAUDE.md. Necessary, not sufficient.)
+    # Custom PP layer partition. GLM-5.2's DSA skip-topk layer at a pipeline-stage
+    # boundary trips `KeyError: model.layers.<N>.self_attn.attn` in
+    # get_attn_backends_for_group. A boundary must land on a FULL-indexer layer;
+    # empirically those satisfy max(L-2,0) % index_topk_freq == 0 (freq=4), i.e.
+    # L in {0, 2, 6, 10, ... 4k+2}.
+    #
+    #   PP=3 (78 layers, FP8): default even split → boundary at layer 52, a
+    #         skip-topk layer → KeyError. 26/24/28 puts boundaries at 0/26/50,
+    #         all full-indexer. VALIDATED on-cluster (glm52 serves with this).
+    #   PP=2 (78 layers, the ~411 GB AWQ shape): default even split → boundary at
+    #         layer 39, and (39-2)%4 == 1, so it is NOT full-indexer and should
+    #         trip the same KeyError. 38/40 puts the boundary at layer 38, which
+    #         IS full-indexer ((38-2)%4 == 0), and stays near-balanced.
+    #         DERIVED from the PP=3 rule, NOT yet validated on-cluster — if it
+    #         still KeyErrors, try the next full-indexer boundary (42/36) or
+    #         override VLLM_PP_LAYER_PARTITION directly.
     if [[ "${PP_SIZE}" == "3" ]]; then
         VLLM_PP_LAYER_PARTITION="${VLLM_PP_LAYER_PARTITION:-26,24,28}"
+    elif [[ "${PP_SIZE}" == "2" ]]; then
+        VLLM_PP_LAYER_PARTITION="${VLLM_PP_LAYER_PARTITION:-38,40}"
     fi
 fi
 

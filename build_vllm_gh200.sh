@@ -1738,12 +1738,31 @@ except Exception as e:
     print("  Container builds but cannot serve — check the dependency-install phase.")
     sys.exit(1)
 
-# Check if CUDA graphs work (this is the key test)
-try:
-    from vllm.worker.model_runner import CUDAGraphRunner
-    print("CUDA Graphs module: ✓")
-except ImportError as e:
-    print(f"CUDA Graphs module: ⚠ {e}")
+# Check that a CUDAGraph capture path is importable.
+#
+# `vllm.worker.model_runner.CUDAGraphRunner` is the V0 engine layout and no longer
+# exists on modern vLLM: V1 moved workers under `vllm.v1.worker` and replaced the
+# CUDAGraphRunner class with the CUDAGraphWrapper dispatcher in
+# `vllm.compilation.cuda_graph`. So on anything recent the old probe reported
+# "⚠ No module named 'vllm.worker'" on EVERY build — a stale check reading as a
+# real defect (seen on the v0.27.1/glm53 build). Try the V1 path first, fall back
+# to V0 so older pinned presets (glm51 v0.19.0, kimi v0.19.1) still report ✓.
+_cudagraph_probe = None
+for _mod, _sym in (
+    ("vllm.compilation.cuda_graph", "CUDAGraphWrapper"),   # V1 (current)
+    ("vllm.v1.worker.gpu_model_runner", "GPUModelRunner"), # V1 fallback
+    ("vllm.worker.model_runner", "CUDAGraphRunner"),       # V0 (legacy pins)
+):
+    try:
+        __import__(_mod, fromlist=[_sym])
+        _cudagraph_probe = f"{_mod}.{_sym}"
+        break
+    except ImportError:
+        continue
+if _cudagraph_probe:
+    print(f"CUDA Graphs module: ✓ ({_cudagraph_probe})")
+else:
+    print("CUDA Graphs module: ⚠ no known capture path importable")
 
 # Check torch.compile availability
 try:

@@ -923,6 +923,15 @@ cmd_build() {
     # build glm52 on 26.03's inductor (which, unlike 26.05, may not miscompile
     # DSA CUDAGraph capture). build_vllm_gh200.sh resolves env > preset > default.
     [[ -n "${NGC_PYTORCH_TAG:-}" ]] && env_vars="${env_vars} NGC_PYTORCH_TAG=${NGC_PYTORCH_TAG}"
+    # Forward a walltime override. sbatch honours SBATCH_TIMELIMIT from the
+    # environment and it beats the `#SBATCH --time=02:00:00` baked into
+    # build_vllm_gh200.sh. Needed because 2 h is no longer generous: a modern
+    # vLLM (v0.27.1) spends ~15 min just unpacking a fresh NGC sandbox onto
+    # Lustre before the CUDA compile even starts. NB you cannot fix this after
+    # the fact — SLURM only lets a user *lower* a running job's limit
+    # ("Access/permission denied"), so set it at submit time:
+    #   BUILD_TIME_LIMIT=06:00:00 ./olivia.sh build glm53_v27
+    [[ -n "${BUILD_TIME_LIMIT:-}" ]] && env_vars="${env_vars} SBATCH_TIMELIMIT=${BUILD_TIME_LIMIT}"
 
     info "Submitting build job for '${model_id}'..."
     echo "    Environment: ${env_vars}" >&2

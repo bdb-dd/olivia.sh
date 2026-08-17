@@ -713,6 +713,73 @@ glm52 container is the fallback and needs no rebuild.
 CUDAGRAPH_MODE=PIECEWISE ./olivia.sh server start glm53_v27 --model RedHatAI/GLM-5.2-FP8
 ```
 
+### Qwen3.8 27B (preset `qwen38`) — dense multimodal on ONE GH200
+
+Qwen3.8 (Alibaba, open weights 2026-08-13/14, **Apache 2.0**) shipped a 27B dense
+multimodal model and a 2.4T-A95B MoE. We serve the **27B**, which is close to an
+ideal fit for a single Olivia card.
+
+**Verified from the published `Qwen/Qwen3.8-27B-FP8` config + the downloaded
+checkpoint (2026-08-17) — not from the model card:**
+- Arch **`Qwen3_5ForConditionalGeneration`**, `model_type: qwen3_5` — the **same
+  Qwen 3.5 family as Ornith**, but **dense** where Ornith is
+  `Qwen3_5MoeForConditionalGeneration`. Registered natively in **vLLM v0.27.1**
+  (`registry.py:581`), which is why this needs **no new container** — it shares
+  `vllm-glm53-1-sandbox` (vLLM 0.27.1, transformers 5.15.0, DeepGEMM 2.6.1).
+- 27B dense, **64 layers**, hidden 5120, 24 q-heads / 4 KV-heads, **262144** native
+  context (1M via YaRN, not enabled).
+- **HYBRID attention like Ornith**: 48 linear-attn layers + 16 full (full every
+  4th) → vLLM must **auto-select** the backend, never forced `FLASH_ATTN`.
+- **Multimodal**: 27-layer vision tower (hidden 1152, patch 16), 333 vision
+  tensors. Served for **text**; the encoder loads dormant.
+- Quant is **DeepSeek-style block-FP8** (`[128,128]`, e4m3, dynamic) ≈ **29 GB**.
+  ⚠️ This is the one place it **differs from Ornith**: Ornith is compressed-tensors
+  channel/token W8A8 and never touches DeepGEMM, whereas Qwen3.8 rides the **same
+  DeepGEMM lane as glm52**. Hence `VLLM_USE_DEEP_GEMM=1` + `WARMUP=skip` and the
+  flashinfer FP8-MoE kernel forced off (it is dense — there is no MoE kernel).
+- **MTP head genuinely present** — 22 `mtp.*` tensors (`mtp.fc.weight`,
+  `mtp.layers.0.*`) of 1606 total, and vLLM registers `Qwen3_5MTP`. **The opposite
+  of Ornith**, whose FP8 declared `mtp_num_hidden_layers=1` and shipped none. So
+  MTP speculative decode should really work here.
+
+| Quantization | Model | Size | Olivia fit |
+|--------------|-------|------|------------|
+| block-FP8 | `Qwen/Qwen3.8-27B-FP8` | **~29 GB** | **1 GH200 (TP=1)** — preset `qwen38`; ~56 GB KV headroom |
+| BF16 | `Qwen/Qwen3.8-27B` | ~54 GB | 1 GH200, ~32 GB KV — the no-quant-variable fallback |
+| AWQ-INT4 | `cyankiwi/Qwen3.8-27B-AWQ-INT4` | ~15 GB | 1 GH200 — only worth it to pack several models per node |
+| NVFP4 / GGUF / MLX | various | — | **No** — Blackwell FP4, llama.cpp, Apple |
+| MoE flagship | `Qwen/Qwen3.8-2.4T-A95B(-FP8)` | ~2.4 T params | Far beyond 12 GPUs — not attempted |
+
+**Runtime specifics (`IS_QWEN38`)**: `--tool-call-parser qwen3_xml`,
+`--reasoning-parser qwen3` (same family as Ornith), `--enable-auto-tool-choice`,
+`--trust-remote-code`, `--enable-prefix-caching`, `MAX_MODEL_LEN=262144`,
+auto-select attention backend, DeepGEMM block-FP8 path. Knobs:
+`QWEN38_TOOL_PARSER`, `QWEN38_REASONING_PARSER`, `QWEN38_ENABLE_PREFIX_CACHING`,
+`QWEN38_GDN_PREFILL_BACKEND`.
+
+> The GDN prefill backend is **empty (auto) by default here, unlike Ornith's
+> forced `triton`**. Ornith pins Triton only because *its* container had a broken
+> flashinfer that the build uninstalled; the glm53 container carries a **working
+> flashinfer 0.6.17** ("imports cleanly — keeping"). If the flashinfer GDN path
+> misbehaves, `QWEN38_GDN_PREFILL_BACKEND=triton` is the known-good fallback.
+
+> **Status: weights cached, NEVER SERVED.** 29 GB on the persistent projects tier,
+> 0 incomplete, blobs verified. Nothing below has been run on-cluster yet.
+
+#### Qwen3.8 Usage
+
+```bash
+./olivia.sh prefetch qwen38            # already done — 29 GB, persistent tier
+./olivia.sh server start qwen38        # 1 GH200, TP=1 (no build needed)
+./olivia.sh server watch
+
+# The first thing to try once it serves clean — the MTP head is really there:
+ENABLE_SPECULATIVE=1 ./olivia.sh server start qwen38
+
+# If the flashinfer GDN prefill path misbehaves, fall back to Ornith's kernel:
+QWEN38_GDN_PREFILL_BACKEND=triton ./olivia.sh server start qwen38
+```
+
 ### Kimi K2.6 Quantization Options
 
 Kimi K2.6 (Moonshot) is a 1T-parameter MoE (~32B active) with 384 experts, MLA attention, a 262K context window, and a native MoonViT vision encoder (multimodal). It uses the same 2-node shape as glm51 on Olivia: it does **not** fit on a single 4-GPU node.

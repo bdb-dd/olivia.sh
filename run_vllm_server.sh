@@ -139,6 +139,18 @@ ORNITH_MTP_SPECULATIVE_TOKENS="${ORNITH_MTP_SPECULATIVE_TOKENS:-2}"
 # in-tree Triton/FLA GDN kernel so Ornith serves with NO flashinfer dependency.
 # (Verified on-cluster 2026-07-16: triton path serves; flashinfer path does not.)
 ORNITH_GDN_PREFILL_BACKEND="${ORNITH_GDN_PREFILL_BACKEND:-triton}"
+# --- Qwen3.8 27B (Alibaba, open-weighted 2026-08-13/14, Apache 2.0) -----------
+# Same Qwen 3.5 lineage as Ornith and therefore the same parser family, but a
+# DENSE 27B rather than a MoE, so it gets its own knobs.
+QWEN38_TOOL_PARSER="${QWEN38_TOOL_PARSER:-qwen3_xml}"
+QWEN38_REASONING_PARSER="${QWEN38_REASONING_PARSER:-qwen3}"
+# GDN prefill backend. Ornith is pinned to "triton" because its container had a
+# BROKEN flashinfer that the build uninstalled. That is NOT the situation here:
+# the glm53/v0.27.1 container carries a working flashinfer 0.6.17 ("imports
+# cleanly — keeping" in the build log), so leave this EMPTY and let vLLM pick.
+# Set QWEN38_GDN_PREFILL_BACKEND=triton to force the in-tree Triton/FLA kernel if
+# the flashinfer GDN path misbehaves — that is the known-good Ornith fallback.
+QWEN38_GDN_PREFILL_BACKEND="${QWEN38_GDN_PREFILL_BACKEND:-}"
 # ENABLE_AUTO_TOOL_CHOICE default is model-dependent and gets resolved after
 # GLM detection below: 1 for GLM MoE models (tool parser is always set),
 # 0 elsewhere. Users can still override explicitly.
@@ -407,6 +419,37 @@ if [[ "${MODEL}" == *"Ornith"* ]] || [[ "${MODEL}" == *"ornith"* ]]; then
     IS_ORNITH=1
 fi
 
+# Detect Qwen3.8 (Alibaba, open weights 2026-08-13/14, Apache 2.0). VERIFIED from
+# the published Qwen/Qwen3.8-27B-FP8 config.json, NOT from the model card:
+#   - arch `Qwen3_5ForConditionalGeneration`, model_type `qwen3_5` — the SAME
+#     Qwen 3.5 family as Ornith, but DENSE (Ornith is ...MoeForConditionalGeneration).
+#     Registered natively in vLLM v0.27.1 (registry.py:581), so no new build.
+#   - 27B dense, 64 layers, hidden 5120, 24 q-heads / 4 KV-heads, 262144 ctx.
+#   - HYBRID attention like Ornith: 48 linear-attn layers + 16 full, full every
+#     4th. So do NOT force FLASH_ATTN — vLLM must auto-select (mamba/GDN kernels
+#     + recurrent state for the linear layers).
+#   - MULTIMODAL: 27-layer vision tower (hidden 1152, patch 16). We serve it for
+#     TEXT; the encoder just loads.
+#   - Quant is DeepSeek-style BLOCK-FP8 ([128,128] e4m3, dynamic) — note this
+#     DIFFERS from Ornith, which is compressed-tensors channel/token W8A8. Block
+#     FP8 means this one DOES ride the DeepGEMM path (glm52's lane, not Ornith's).
+#   - MTP: the head is REALLY THERE. Verified against the downloaded checkpoint's
+#     weight_map (2026-08-17): 22 `mtp.*` tensors — mtp.fc.weight,
+#     mtp.layers.0.{input_layernorm,mlp.*,...} — out of 1606 total, alongside 333
+#     vision tensors and language layers 0-63. This is the OPPOSITE of Ornith,
+#     whose FP8 export declared mtp_num_hidden_layers=1 but shipped ZERO mtp
+#     tensors, and vLLM v0.27.1 registers Qwen3_5MTP (registry.py:660). So MTP
+#     speculative decode should genuinely work here — likely the single biggest
+#     decode win available on a 1-GPU dense model.
+#     Left OFF by default only because nothing has been SERVED yet; flipping an
+#     untested spec-decode config on by default would turn a first-serve smoke
+#     test into a confusing failure. `ENABLE_SPECULATIVE=1` is the first thing to
+#     try once it serves clean.
+IS_QWEN38=0
+if [[ "${MODEL}" == *"Qwen3.8"* ]] || [[ "${MODEL}" == *"qwen3.8"* ]]; then
+    IS_QWEN38=1
+fi
+
 # Kimi K2.6's fused MLA op (vllm.min_latency_fused_qkv_a_proj) has no fake/meta
 # dispatch, so vLLM's torch.compile/CUDAGraph path fails during profile_run on
 # this multi-node PP setup ("Multiple dispatch failed ... NotImplemented", from
@@ -465,7 +508,7 @@ fi
 # any OpenAI tool-using client (Claude Code via anthropic_proxy.py, etc.).
 # ``${VAR+x}`` distinguishes "user explicitly set (even to 0)" from "unset".
 if [[ -z "${ENABLE_AUTO_TOOL_CHOICE+x}" ]]; then
-    if [[ "${IS_GLM_MOE}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" || "${IS_ORNITH}" == "1" ]]; then
+    if [[ "${IS_GLM_MOE}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" || "${IS_ORNITH}" == "1" || "${IS_QWEN38}" == "1" ]]; then
         ENABLE_AUTO_TOOL_CHOICE=1
     else
         ENABLE_AUTO_TOOL_CHOICE=0
@@ -477,7 +520,12 @@ fi
 # matches typical Claude Code usage (which requests max_tokens=32000).
 # Other models keep the conservative 32K default.
 if [[ -z "${MAX_MODEL_LEN+x}" ]]; then
-    if [[ "${IS_ORNITH}" == "1" ]]; then
+    if [[ "${IS_QWEN38}" == "1" ]]; then
+        # Qwen3.8-27B is 262144 native (1M via YaRN, not enabled here). Dense 27B
+        # block-FP8 is only ~30 GB on a 96 GB card, so the full window fits with
+        # room to spare — no reason to clip it like the big multi-node models.
+        MAX_MODEL_LEN=262144
+    elif [[ "${IS_ORNITH}" == "1" ]]; then
         # Ornith serves the whole 256K native window on both shapes:
         #   ornith_gh200 (35B, 1 card)  — ~35 GB weights + ~10 GB KV @256K single-user
         #   ornith       (397B, 2 nodes) — ~400 GB weights across 8×GH200 leaves
@@ -564,6 +612,20 @@ if [[ "${IS_GLM52}" == "1" && "${IS_AWQ}" == "0" ]]; then
     : # (no fp8 KV default for glm52 on GH200)
 fi
 
+# Qwen3.8 block-FP8: [128,128] e4m3 dynamic is the DeepSeek-style blocked quant,
+# the same GEMM lane GLM-5.2 uses — so it wants DeepGEMM on Hopper, NOT the
+# flashinfer FP8-MoE kernel (and it is dense anyway, so there is no MoE kernel to
+# pick). This is the one place Qwen3.8 diverges from Ornith, whose channel/token
+# W8A8 never touches DeepGEMM. Skip the JIT warmup for the same reason glm52 does
+# — it adds minutes to startup; override VLLM_DEEP_GEMM_WARMUP="" to warm up.
+if [[ "${IS_QWEN38}" == "1" && "${IS_AWQ}" == "0" ]]; then
+    if [[ "${VLLM_USE_DEEP_GEMM_EXPLICIT}" == "0" ]]; then
+        export VLLM_USE_DEEP_GEMM=1
+    fi
+    export VLLM_DEEP_GEMM_WARMUP="${VLLM_DEEP_GEMM_WARMUP:-skip}"
+    export VLLM_USE_FLASHINFER_MOE_FP8=0
+fi
+
 # --- GLM-5.2-family multi-node bits that are QUANT-INDEPENDENT --------------
 # These two used to live inside the `IS_AWQ == 0` branch above, which was fine
 # while block-FP8 was the only GLM-5.2 quant. It no longer is: a complete
@@ -614,8 +676,9 @@ fi
 # from whatever is installed — if nothing works, the error will tell us what
 # to install.
 if [[ -z "${VLLM_ATTENTION_BACKEND}" ]]; then
-    if [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_ORNITH}" == "1" ]]; then
+    if [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_ORNITH}" == "1" || "${IS_QWEN38}" == "1" ]]; then
         # Don't force FLASH_ATTN — these need vLLM to auto-select a special backend:
+        #   Qwen3.8  HYBRID, same as Ornith (48 linear-attn + 16 full layers).
         #   GLM-5.x  sparse-MLA (DSA); Kimi K2.6 standard MLA — FLASH_ATTN rejects MLA.
         #   Ornith   HYBRID (Gated-DeltaNet linear_attn + full self_attn) — the
         #            linear-attn layers use a mamba/GDN kernel + recurrent state, not
@@ -1169,6 +1232,30 @@ if [[ "${IS_ORNITH}" == "1" ]]; then
     # Passed as one array element straight to `vllm serve`, so the JSON is safe.
     if [[ -n "${ORNITH_GDN_PREFILL_BACKEND}" ]]; then
         VLLM_ARGS+=("--additional-config" "{\"gdn_prefill_backend\": \"${ORNITH_GDN_PREFILL_BACKEND}\"}")
+    fi
+fi
+
+# Qwen3.8 27B dense — same Qwen3.5 parser family as Ornith, different shape.
+if [[ "${IS_QWEN38}" == "1" ]]; then
+    if [[ -n "${QWEN38_TOOL_PARSER}" ]]; then
+        VLLM_ARGS+=("--tool-call-parser" "${QWEN38_TOOL_PARSER}")
+    fi
+    if [[ -n "${QWEN38_REASONING_PARSER}" ]]; then
+        VLLM_ARGS+=("--reasoning-parser" "${QWEN38_REASONING_PARSER}")
+    fi
+    if [[ "${ENABLE_AUTO_TOOL_CHOICE}" == "1" ]]; then
+        VLLM_ARGS+=("--enable-auto-tool-choice")
+    fi
+    if [[ -n "${SERVED_MODEL_NAME}" ]]; then
+        VLLM_ARGS+=("--served-model-name" "${SERVED_MODEL_NAME}")
+    fi
+    VLLM_ARGS+=("--trust-remote-code")
+    if [[ "${QWEN38_ENABLE_PREFIX_CACHING:-1}" == "1" ]]; then
+        VLLM_ARGS+=("--enable-prefix-caching")
+    fi
+    # Empty by default here (unlike Ornith) — this container's flashinfer works.
+    if [[ -n "${QWEN38_GDN_PREFILL_BACKEND}" ]]; then
+        VLLM_ARGS+=("--additional-config" "{\"gdn_prefill_backend\": \"${QWEN38_GDN_PREFILL_BACKEND}\"}")
     fi
 fi
 

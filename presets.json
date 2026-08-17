@@ -85,6 +85,14 @@
       "storage": "work",
       "description": "GLM-5.3 on a modern vLLM release (v0.27.1 + NGC 26.07, no PR graft) — own container, the upgrade path off glm52's pinned-main build"
     },
+    "qwen38": {
+      "aliases": ["qwen3.8", "qwen38-27b", "qwen3.8-27b", "qwen38_gh200"],
+      "model": "Qwen/Qwen3.8-27B-FP8",
+      "nodes": 1, "gpus": 1, "pp": 1,
+      "container_prefix": "glm53", "index": 1,
+      "storage": "projects",
+      "description": "Qwen3.8 27B DENSE multimodal (Qwen3_5ForConditionalGeneration), block-FP8 ~30 GB on a SINGLE GH200 card (TP=1), hybrid linear+full attn, 262K ctx. Shares the glm53 container — vLLM v0.27.1 registers this arch natively"
+    },
     "glm47": {
       "aliases": ["glm-4.7"],
       "model": "QuantTrio/GLM-4.7-AWQ",

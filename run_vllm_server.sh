@@ -3,7 +3,18 @@
 #SBATCH --partition=accel
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=0
-#SBATCH --time=08:00:00
+#SBATCH --time=02:00:00
+# Walltime default is deliberately CONSERVATIVE (2 h), not the old 8 h.
+# An interactive serve session bills every allocated hour whether or not a
+# request ever arrives, and 8 h is long enough that an unattended job wastes
+# most of it: qwen38 job 2022174 (2026-08-17) lost the SSH master mid-bench and
+# then sat idle to the full 8 h TIMEOUT, burning ~8 GPU-hours to produce nothing.
+# Pick the limit to fit the task and pass TIME_LIMIT for anything longer:
+#   TIME_LIMIT=00:45:00 ./olivia.sh server start qwen38   # serve + one sweep
+#   TIME_LIMIT=06:00:00 ./olivia.sh server start glm52    # long soak
+# NB SLURM only lets a user LOWER a running job's limit, so raising it after
+# submit is impossible — but `scontrol update jobid=N TimeLimit=..` to shorten
+# an over-long job still works and is worth doing the moment you know.
 #SBATCH --output=logs/vllm_server_%j.log
 #SBATCH --error=logs/vllm_server_%j.log
 # NOTE: Neither --ntasks nor --gpus/--gpus-per-node are set here as #SBATCH
@@ -450,6 +461,24 @@ if [[ "${MODEL}" == *"Qwen3.8"* ]] || [[ "${MODEL}" == *"qwen3.8"* ]]; then
     IS_QWEN38=1
 fi
 
+# Detect Borealis (NbAiLab / National Library of Norway) — Norwegian-centric
+# instruct family. VERIFIED from NbAiLab/borealis-27b config.json:
+#   - arch `Gemma3ForConditionalGeneration`, model_type `gemma3`, 62 layers,
+#     131072 max_position_embeddings, torch_dtype bfloat16, NO quantization_config.
+#   - Multimodal: SigLIP vision tower (27 layers, 1152 hidden, 896x896 / patch 14).
+#     We serve it for TEXT; the encoder loads dormant.
+# Deliberately NOT given a parser/backend block: Gemma 3 is ordinary attention
+# (sliding-window + full), so it keeps the FLASH_ATTN default and lets CUDAGraph
+# capture run, and this is an instruct model that emits neither <think> blocks nor
+# a tool-call grammar vLLM has a parser for — so no --reasoning-parser, no
+# --tool-call-parser, no --enable-auto-tool-choice. The ONLY thing it needs from
+# us is a context default: the generic fallback is 32768, which would silently
+# throw away three quarters of the model's native window.
+IS_BOREALIS=0
+if [[ "${MODEL}" == *"borealis"* ]] || [[ "${MODEL}" == *"Borealis"* ]]; then
+    IS_BOREALIS=1
+fi
+
 # Kimi K2.6's fused MLA op (vllm.min_latency_fused_qkv_a_proj) has no fake/meta
 # dispatch, so vLLM's torch.compile/CUDAGraph path fails during profile_run on
 # this multi-node PP setup ("Multiple dispatch failed ... NotImplemented", from
@@ -520,7 +549,13 @@ fi
 # matches typical Claude Code usage (which requests max_tokens=32000).
 # Other models keep the conservative 32K default.
 if [[ -z "${MAX_MODEL_LEN+x}" ]]; then
-    if [[ "${IS_QWEN38}" == "1" ]]; then
+    if [[ "${IS_BOREALIS}" == "1" ]]; then
+        # Gemma-3 27B BF16 is ~54 GB of a 96 GB card, and Gemma 3 interleaves
+        # sliding-window layers with full-attention ones so the KV cache stays
+        # modest — the full native 131072 window fits comfortably. Lower this if
+        # you want more concurrent sequences instead of more context.
+        MAX_MODEL_LEN=131072
+    elif [[ "${IS_QWEN38}" == "1" ]]; then
         # Qwen3.8-27B is 262144 native (1M via YaRN, not enabled here). Dense 27B
         # block-FP8 is only ~30 GB on a 96 GB card, so the full window fits with
         # room to spare — no reason to clip it like the big multi-node models.

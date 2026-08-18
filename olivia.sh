@@ -1244,6 +1244,9 @@ start_server_job() {
     # TimeLimit=HH:MM:SS.)
     if [[ -n "${TIME_LIMIT:-}" ]]; then
         sbatch_opts+=" --time=${TIME_LIMIT}"
+        echo "    walltime:    ${TIME_LIMIT} (TIME_LIMIT override)" >&2
+    else
+        echo "    walltime:    02:00:00 (run_vllm_server.sh default; set TIME_LIMIT to change)" >&2
     fi
 
     # Debug: echo the exact command being submitted so regressions like

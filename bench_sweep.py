@@ -15,10 +15,35 @@ PROMPT = ("Explain in depth how a B-tree database index works, including node "
           "splits, rebalancing on insert and delete, and why fan-out matters.")
 
 
-def one_request(url, model, prompt, max_tokens, idx, out, ctk=None, timeout=900):
+def build_prompt(base, prompt_tokens, idx):
+    """Prompt for request `idx`, padded to ~prompt_tokens.
+
+    The per-request marker goes FIRST and the filler is seeded from idx, so two
+    concurrent requests diverge at token zero. That matters: vLLM v1 enables
+    prefix caching BY DEFAULT (and several presets pass --enable-prefix-caching
+    explicitly). With a shared prefix and the variant marker appended at the end
+    — as this script used to do — requests 2..N would hit the cache and skip
+    prefill almost entirely. At ~600 tokens that is noise; at 100K+ it makes
+    prefill look free and turns TTFT and aggregate throughput into fiction.
+    """
+    if prompt_tokens <= 0:
+        return f"(variant {idx}) {base}"
+    head = f"Session {idx * 7919}, shard {idx}. "
+    filler, i = [head], idx * 1000003
+    approx_chars = prompt_tokens * 4
+    while sum(len(x) for x in filler) < approx_chars:
+        i += 1
+        filler.append(f"Record {i}: node {i * 7 % 977} holds key {i * 31 % 4093} "
+                      f"with fanout {i % 17 + 2} and depth {i % 5 + 1}. ")
+    return ("".join(filler))[:approx_chars] + "\n\n" + base
+
+
+def one_request(url, model, prompt, max_tokens, idx, out, ctk=None, timeout=900,
+                prompt_tokens=0):
     body = {
         "model": model,
-        "messages": [{"role": "user", "content": f"{prompt} (variant {idx})"}],
+        "messages": [{"role": "user",
+                      "content": build_prompt(prompt, prompt_tokens, idx)}],
         "max_tokens": max_tokens, "temperature": 1.0, "top_p": 0.95,
         "stream": True, "stream_options": {"include_usage": True},
     }
@@ -58,10 +83,12 @@ def one_request(url, model, prompt, max_tokens, idx, out, ctk=None, timeout=900)
         out[idx] = {"ok": False, "err": str(e), "total": time.perf_counter() - t0}
 
 
-def run_level(url, model, prompt, max_tokens, concurrency, ctk=None, timeout=900):
+def run_level(url, model, prompt, max_tokens, concurrency, ctk=None, timeout=900,
+              prompt_tokens=0):
     out = {}
     threads = [threading.Thread(target=one_request,
-                                args=(url, model, prompt, max_tokens, i, out, ctk, timeout))
+                                args=(url, model, prompt, max_tokens, i, out, ctk,
+                                      timeout, prompt_tokens))
                for i in range(concurrency)]
     t0 = time.perf_counter()
     for t in threads: t.start()
@@ -109,19 +136,8 @@ if __name__ == "__main__":
                          "presets (e.g. glm51) so a hung level fails fast")
     a = ap.parse_args()
     ctk = json.loads(a.chat_template_kwargs) if a.chat_template_kwargs else None
-    prompt = a.prompt
-    if a.prompt_tokens > 0:
-        # Deterministic, low-entropy filler. Numbered lines keep the text from
-        # being trivially prefix-cacheable across variants and stop the model
-        # short-circuiting on repetition.
-        filler, i = [], 0
-        approx_chars = a.prompt_tokens * 4
-        while sum(len(x) for x in filler) < approx_chars:
-            i += 1
-            filler.append(f"Record {i}: node {i*7 % 977} holds key {i*31 % 4093} "
-                          f"with fanout {i % 17 + 2} and depth {i % 5 + 1}. ")
-        prompt = ("".join(filler))[:approx_chars] + "\n\n" + a.prompt
     print("concurrency,prompt_tokens,agg_tok_s,median_per_stream_tok_s,median_ttft_s,p95_ttft_s,failures,total_tokens,wall_s",
           flush=True)
     for lvl in [int(x) for x in a.levels.split(",")]:
-        run_level(a.url, a.model, prompt, a.max_tokens, lvl, ctk, a.timeout)
+        run_level(a.url, a.model, a.prompt, a.max_tokens, lvl, ctk, a.timeout,
+                  a.prompt_tokens)

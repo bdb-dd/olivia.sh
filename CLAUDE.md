@@ -713,6 +713,45 @@ glm52 container is the fallback and needs no rebuild.
 CUDAGRAPH_MODE=PIECEWISE ./olivia.sh server start glm53_v27 --model RedHatAI/GLM-5.2-FP8
 ```
 
+### Borealis 27B (preset `borealis`) — Norwegian-centric, Gemma-3, one GH200
+
+Borealis is the **National Library of Norway**'s (NbAiLab) Norwegian-centric
+instruct family — a fitting resident for a Norwegian national HPC cluster. We
+serve the **27B** full release, `NbAiLab/borealis-27b`.
+
+**Verified from the published config (2026-08-18), not the model card:**
+- Arch **`Gemma3ForConditionalGeneration`**, `model_type: gemma3`, **62 layers**,
+  **131072** max position embeddings, `torch_dtype: bfloat16`.
+- **No `quantization_config` and no quantized release** — the only other artefacts
+  are GGUF (llama.cpp, unusable here). So we serve **BF16 ~54 GB**, which still
+  fits a **single GH200** (96 GB) at TP=1 with room for KV.
+- **Multimodal**: SigLIP vision tower (27 layers, 1152 hidden, 896×896, patch 14).
+  Served for **text**; the encoder loads dormant.
+- Shares **`vllm-glm53-1-sandbox`** — the third model on that one build, after
+  GLM-5.3 and Qwen3.8. Gemma 3 has been supported in vLLM for many releases.
+
+| Quantization | Model | Size | Olivia fit |
+|--------------|-------|------|------------|
+| BF16 | `NbAiLab/borealis-27b` | ~54 GB | **1 GH200 (TP=1)** — preset `borealis` |
+| BF16 (open-licence variant) | `NbAiLab/borealis-open-27b` | ~54 GB | same shape; different licence terms |
+| GGUF | `NbAiLab/borealis-27b{,-open}-gguf` | varies | **No** — llama.cpp, not vLLM |
+
+**Runtime: deliberately almost nothing (`IS_BOREALIS`).** Gemma 3 is ordinary
+attention (sliding-window layers interleaved with full), so it keeps the
+**`FLASH_ATTN`** default and lets **CUDAGraph capture** run — no eager override, no
+auto-select backend. It is an instruct model that emits neither `<think>` blocks
+nor a tool-call grammar vLLM has a parser for, so **no `--reasoning-parser`, no
+`--tool-call-parser`, no `--enable-auto-tool-choice`**. The single override is
+`MAX_MODEL_LEN=131072`: the generic fallback is 32768, which would silently
+discard three quarters of the native window.
+
+> **Status: weights cached (~54 GB, persistent tier), NEVER SERVED.**
+
+```bash
+./olivia.sh prefetch borealis                        # done
+TIME_LIMIT=00:50:00 ./olivia.sh server start borealis  # 1 GH200, TP=1
+```
+
 ### Qwen3.8 27B (preset `qwen38`) — dense multimodal on ONE GH200
 
 Qwen3.8 (Alibaba, open weights 2026-08-13/14, **Apache 2.0**) shipped a 27B dense

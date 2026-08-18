@@ -1541,6 +1541,21 @@ pip install --no-cache-dir --no-deps --root-user-action=ignore --no-build-isolat
     echo "         other presets are unaffected. Override DEEPGEMM_REF/DEEPGEMM_REPO."
 }
 
+# tilelang — required by DeepSeek-V4's "mhc" (head-compression) attention path.
+# Without it the model loads and then dies at worker start with:
+#   ImportError: tilelang is required for mhc but is not installed.
+# (verified on-cluster 2026-08-18, job 2037091). It is a pure wheel on aarch64
+# (manylinux_2_34_aarch64 exists for 0.1.13), so this adds no compile time.
+# Installed unconditionally and failure-tolerated, exactly like DeepGEMM above:
+# it is additive for every other preset, and making it preset-conditional would
+# mean a container that serves DeepSeek only if it happened to be built for it.
+echo ""
+echo "Installing tilelang (required by DeepSeek-V4 mhc attention)..."
+pip install --no-cache-dir --no-deps --root-user-action=ignore tilelang 2>&1 | tail -5 || {
+    echo "Warning: tilelang install failed. DeepSeek-V4 will not load (mhc path);"
+    echo "         all other presets are unaffected."
+}
+
 # vLLM main (post-v0.20) ships a Rust frontend under vllm/vllm-rs (tokenizer,
 # tool/reasoning parsers, incl. the deepseek_v32 renderer used by DSA models).
 # Its pyproject build needs an actual Rust toolchain (cargo/rustc) in addition

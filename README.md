@@ -296,6 +296,34 @@ Loaded in **45 s to healthy** — the fastest startup here, since BF16 skips deq
 
 > ⚠️ **The attention backend must be auto-selected, never forced to `FLASH_ATTN`.** Job 2032118 died at engine init in 110 s with `ValueError: Selected backend AttentionBackendEnum.FLASH_ATTN is not valid ... Reason: ['mm_prefix (PrefixLM bidirectional attention) requires FlashAttention v4, which does not resolve for this head_size']`. Gemma 3's **text** path is ordinary sliding-window + full attention, but its **vision tower** makes the config multimodal PrefixLM — the image prefix gets bidirectional attention — and vLLM only serves that via FA4, an SM100/Blackwell path unavailable at this head size on Hopper. **This bites even though we only ever send text.** Fixed by leaving `VLLM_ATTENTION_BACKEND` unset.
 
+### Laguna S 2.1 (`lagunas21`) — 1 node × 4 GH200, FP8, TP=4 · 2026-08-18
+`bench_sweep.py`, `max_tokens=512`, **warm pass**. **KV cache 3,190,414 tokens.**
+
+**Concurrency at short context (~74 prompt tokens):**
+
+| Concurrency | 1 | 2 | 4 | 8 | 16 | 32 | 64 | 96 | 128 |
+|---|---|---|---|---|---|---|---|---|---|
+| Aggregate tok/s | 192.7 | 339.0 | 614.8 | 1105.1 | 1867.9 | 3132.4 | 5229.5 | 6362.3 | **7750.9** |
+| Per-stream tok/s | 192.8 | 169.7 | 153.8 | 138.3 | 116.9 | 98.2 | 82.3 | 66.9 | 61.6 |
+| p95 TTFT (s) | 0.03 | 0.04 | 0.04 | 0.04 | 0.05 | 0.07 | 0.11 | 0.14 | 0.22 |
+| Failures | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+
+**The fastest preset here: ~193 tok/s single-stream and 7751 tok/s aggregate at 128-way, 0 failures throughout, p95 TTFT ≤0.22 s.** For scale, qwen38 peaks at 3162 @64 and Borealis at 2666 @64 — though both are 1-GPU presets against this one's 4, so *per GPU* qwen38 is still ahead on aggregate. **128 is not the ceiling**: aggregate was still climbing (6362 → 7751) and per-stream fell only 8% from 96 to 128, so the top end has not saturated.
+
+**Context ladder (the number that matters), `--prompt-tokens` calibrated to the real tokenizer:**
+
+| Context (actual prompt tokens) | c=1 agg | c=1 per-stream | c=1 TTFT | c=16 agg | c=16 per-stream | c=16 p95 TTFT |
+|---|---|---|---|---|---|---|
+| ~74 | 192.7 | 192.8 | 0.03 | 1867.9 | 116.9 | 0.05 |
+| 15,975 (16K) | 184.6 | 187.8 | 0.08 | 807.7 | 53.7 | 4.49 |
+| 99,474 (100K) | 69.8 | 91.8 | 2.73 | **118.3** | 11.9 | **36.95** |
+
+> 🔥 **Long context is brutally expensive, and it invalidates reading any short-context headline as a general result.** From ~74 to ~100K tokens: single-stream falls **64%** (192.7 → 69.8), 16-way aggregate falls **94%** (1867.9 → 118.3), and 16-way p95 TTFT rises **740×** (0.05 s → 36.95 s). Still 0 failures — it does not break, it just gets very slow. At 100K × 16 the model delivers ~118 tok/s aggregate with ~37 s to first token, which is a different service entirely from the 7751 tok/s the concurrency table advertises.
+
+**Capacity limits** (KV 3,190,414 tokens): 16K×16 = 256K ✓, 100K×16 = 1.6M ✓, **200K×16 = 3.2M ✗** (over by ~10K), **500K×16 = 8M ✗**. 200K and 500K at c=1 need `MAX_MODEL_LEN` raised above the `IS_LAGUNA` default of 131072 — otherwise requests are rejected with HTTP 400 rather than silently truncated.
+
+> ⚠️ **`--prompt-tokens` needs per-tokenizer calibration.** The first attempt used digit-heavy filler, which tokenises near one token per character: a requested 16K came back as **28,534** real tokens and a requested 100K resolved to ~178K, past the window, failing with HTTP 400. Switching to prose overshot the other way (5.8 chars/token here, not 4). `--chars-per-token 5.8` lands within **0.16%**. This is why the CSV reports the server's actual `prompt_tokens` on every row — never trust the target.
+
 ### Qwen3.8 27B (`qwen38`) — 27B dense on 1× GH200, block-FP8, PIECEWISE capture · 2026-08-18
 `bench_sweep.py`, `max_tokens=512`, **warm pass** (a discarded warmup pass runs first — see the JIT note below).
 

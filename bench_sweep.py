@@ -15,35 +15,55 @@ PROMPT = ("Explain in depth how a B-tree database index works, including node "
           "splits, rebalancing on insert and delete, and why fan-out matters.")
 
 
-def build_prompt(base, prompt_tokens, idx):
+def build_prompt(base, prompt_tokens, idx, chars_per_token=4.0):
     """Prompt for request `idx`, padded to ~prompt_tokens.
 
-    The per-request marker goes FIRST and the filler is seeded from idx, so two
-    concurrent requests diverge at token zero. That matters: vLLM v1 enables
-    prefix caching BY DEFAULT (and several presets pass --enable-prefix-caching
-    explicitly). With a shared prefix and the variant marker appended at the end
-    — as this script used to do — requests 2..N would hit the cache and skip
-    prefill almost entirely. At ~600 tokens that is noise; at 100K+ it makes
-    prefill look free and turns TTFT and aggregate throughput into fiction.
+    Two properties matter and both were learned the hard way:
+
+    1. Per-request divergence. The marker goes FIRST and the filler is seeded from
+       idx, so two concurrent requests differ at token zero. vLLM v1 enables prefix
+       caching BY DEFAULT, so a shared prefix would let requests 2..N skip prefill
+       entirely — at 100K+ that makes prefill look free and turns TTFT into fiction.
+
+    2. Predictable tokenisation. The filler is PROSE, not "Record 123: node 456...".
+       Digit-heavy text tokenises at roughly one token per character, so the earlier
+       numeric filler ran ~2.24 chars/token against an assumed 4.0 and overshot by
+       1.78x: a requested 16K came back as 28,534 real tokens, and a requested 100K
+       resolved to ~178K, past the model's 131,072 window, and was rejected with
+       HTTP 400. English prose sits near 4 chars/token, so targets land close.
+       `chars_per_token` lets you calibrate per tokenizer; the CSV always reports
+       the server's ACTUAL prompt_tokens, so the estimate never has to be trusted.
     """
     if prompt_tokens <= 0:
         return f"(variant {idx}) {base}"
-    head = f"Session {idx * 7919}, shard {idx}. "
-    filler, i = [head], idx * 1000003
-    approx_chars = prompt_tokens * 4
+    # Low-digit prose. Sentences are permuted per request so the text diverges
+    # immediately without relying on numbers.
+    clauses = [
+        "The index maintains balanced depth across every leaf so lookups stay predictable. ",
+        "When a page overflows the library splits it and promotes a separator upward. ",
+        "Readers descend from the root through internal pages toward the leaf level. ",
+        "Sequential scans follow sibling pointers rather than returning to the parent. ",
+        "Deletions borrow entries from a neighbour before considering a merge. ",
+        "Higher fanout shortens the tree and reduces the number of pages fetched. ",
+        "Cached upper levels absorb most of the traffic in a warm workload. ",
+        "Write amplification grows when pages split repeatedly under random insertion. ",
+    ]
+    n = len(clauses)
+    filler = [f"Session marker {idx}. "]
+    i = idx
+    approx_chars = int(prompt_tokens * chars_per_token)
     while sum(len(x) for x in filler) < approx_chars:
+        filler.append(clauses[(i * 7 + idx) % n])
         i += 1
-        filler.append(f"Record {i}: node {i * 7 % 977} holds key {i * 31 % 4093} "
-                      f"with fanout {i % 17 + 2} and depth {i % 5 + 1}. ")
     return ("".join(filler))[:approx_chars] + "\n\n" + base
 
 
 def one_request(url, model, prompt, max_tokens, idx, out, ctk=None, timeout=900,
-                prompt_tokens=0):
+                prompt_tokens=0, chars_per_token=4.0):
     body = {
         "model": model,
         "messages": [{"role": "user",
-                      "content": build_prompt(prompt, prompt_tokens, idx)}],
+                      "content": build_prompt(prompt, prompt_tokens, idx, chars_per_token)}],
         "max_tokens": max_tokens, "temperature": 1.0, "top_p": 0.95,
         "stream": True, "stream_options": {"include_usage": True},
     }
@@ -84,11 +104,11 @@ def one_request(url, model, prompt, max_tokens, idx, out, ctk=None, timeout=900,
 
 
 def run_level(url, model, prompt, max_tokens, concurrency, ctk=None, timeout=900,
-              prompt_tokens=0):
+              prompt_tokens=0, chars_per_token=4.0):
     out = {}
     threads = [threading.Thread(target=one_request,
                                 args=(url, model, prompt, max_tokens, i, out, ctk,
-                                      timeout, prompt_tokens))
+                                      timeout, prompt_tokens, chars_per_token))
                for i in range(concurrency)]
     t0 = time.perf_counter()
     for t in threads: t.start()
@@ -131,6 +151,10 @@ if __name__ == "__main__":
     ap.add_argument("--chat-template-kwargs", default=None,
                     help='JSON dict passed as chat_template_kwargs, e.g. '
                          '\'{"enable_thinking": false}\' to disable reasoning')
+    ap.add_argument("--chars-per-token", type=float, default=4.0,
+                    help="calibration for --prompt-tokens. English prose is ~4; "
+                         "digit-heavy text is ~2.2. Check the prompt_tokens column "
+                         "and adjust if the target is missed.")
     ap.add_argument("--timeout", type=int, default=900,
                     help="per-request timeout (s); lower it for wedge-prone "
                          "presets (e.g. glm51) so a hung level fails fast")
@@ -140,4 +164,4 @@ if __name__ == "__main__":
           flush=True)
     for lvl in [int(x) for x in a.levels.split(",")]:
         run_level(a.url, a.model, a.prompt, a.max_tokens, lvl, ctk, a.timeout,
-                  a.prompt_tokens)
+                  a.prompt_tokens, a.chars_per_token)

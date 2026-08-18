@@ -61,6 +61,46 @@
       "storage": "work",
       "description": "GLM-5.2 744B MoE+DSA, block-FP8, 3-node TP=4+PP=3"
     },
+    "glm52_awq": {
+      "aliases": ["glm52-awq", "glm-5.2-awq", "glm52awq"],
+      "model": "cyankiwi/GLM-5.2-AWQ-INT4",
+      "nodes": 2, "gpus": 4, "pp": 2,
+      "container_prefix": "glm53", "index": 1,
+      "storage": "projects",
+      "description": "GLM-5.2 744B MoE+DSA, AWQ/compressed-tensors INT4 (~411 GB) — the 2-node TP=4+PP=2 path CLAUDE.md anticipated, now that the quant exists. Persistent tier, already cached. Runs on the glm53 (vLLM v0.27.1) container: the skip-topk indexer it needs is native there, not grafted"
+    },
+    "glm53": {
+      "aliases": ["glm-5.3", "glm5.3"],
+      "model": "zai-org/GLM-5.3-FP8",
+      "nodes": 3, "gpus": 4, "pp": 3,
+      "container_prefix": "glm52", "index": 1,
+      "storage": "work",
+      "description": "GLM-5.3 744B MoE+DSA, block-FP8, 3-node TP=4+PP=3 — GLM-5.2's base re-post-trained, so it REUSES the glm52 container (no rebuild). Weights unreleased as of 2026-08-17"
+    },
+    "glm53_v27": {
+      "aliases": ["glm53-v27", "glm-5.3-v27", "glm53v27"],
+      "model": "zai-org/GLM-5.3-FP8",
+      "nodes": 3, "gpus": 4, "pp": 3,
+      "container_prefix": "glm53", "index": 1,
+      "storage": "work",
+      "description": "GLM-5.3 on a modern vLLM release (v0.27.1 + NGC 26.07, no PR graft) — own container, the upgrade path off glm52's pinned-main build"
+    },
+    "borealis": {
+      "aliases": ["borealis-27b", "borealis27b", "nb-borealis"],
+      "model": "NbAiLab/borealis-27b",
+      "nodes": 1, "gpus": 1, "pp": 1,
+      "container_prefix": "glm53", "index": 1,
+      "storage": "projects",
+      "description": "Borealis 27B (National Library of Norway) Norwegian-centric instruct model, Gemma-3 arch, BF16 ~54 GB on a SINGLE GH200 (TP=1), multimodal SigLIP tower, 128K ctx. Shares the glm53 container"
+    },
+    "qwen38": {
+      "aliases": ["qwen3.8", "qwen38-27b", "qwen3.8-27b", "qwen38_gh200"],
+      "model": "Qwen/Qwen3.8-27B-FP8",
+      "nodes": 1, "gpus": 1, "pp": 1,
+      "container_prefix": "glm53", "index": 1,
+      "storage": "projects",
+      "description": "Qwen3.8 27B DENSE multimodal (Qwen3_5ForConditionalGeneration), block-FP8 ~30 GB on a SINGLE GH200 card (TP=1), hybrid linear+full attn, 262K ctx. Shares the glm53 container — vLLM v0.27.1 registers this arch natively"
+    },
     "glm47": {
       "aliases": ["glm-4.7"],
       "model": "QuantTrio/GLM-4.7-AWQ",

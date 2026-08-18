@@ -5,7 +5,7 @@ Build and run [vLLM](https://github.com/vllm-project/vllm) on NVIDIA GH200 ARM64
 ## Features
 
 - **Preserves NGC PyTorch** - Builds vLLM without overwriting NVIDIA's custom PyTorch
-- **Model Presets** - Build + serve recipes for GLM-4.7, GLM-5.1, GLM-5.2, Kimi K2.6/K2.7, Laguna M.1, Ornith 1.0, Gemma-4, Devstral, Llama, and Qwen
+- **Model Presets** - Build + serve recipes for GLM-4.7, GLM-5.1, GLM-5.2 (FP8 + INT4), GLM-5.3, Kimi K2.6/K2.7, Laguna M.1, Ornith 1.0, Qwen3.8-27B, Borealis-27B, Gemma-4, Devstral, Llama, and Qwen
 - **Multi-node serving** - TP=4 intra-node + pipeline parallel across nodes over Slingshot, with an auto-bootstrapped Ray cluster (GLM-5.1/5.2 and Kimi span 2–3 nodes)
 - **Reproducible builds** - Pin a vLLM commit and graft not-yet-released upstream PRs from committed snapshots (`VLLM_PATCHES`), so a container rebuilds byte-identically
 - **GH200 Optimizations** - NCCL/NVLink tuning, optimal GPU ordering, Flash Attention, DeepGEMM/FP8 paths
@@ -229,6 +229,11 @@ export ANTHROPIC_BASE_URL=http://localhost:8002 ANTHROPIC_AUTH_TOKEN=x && claude
 | `glm51_v19` (alias `glm51`) | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | `vllm-glm51-1` | TP=4 + PP=2, vLLM v0.19.0. Multi-node PP decode wedge → serve behind `anthropic_proxy.py` serialization |
 | `glm51_v20` | `cyankiwi/GLM-5.1-AWQ-4bit` | 8 (2 nodes × 4) | `vllm-glm51-2` | vLLM v0.20.0 + RayExecutorV2. **Quarantined** (same wedge) |
 | `glm52` | `RedHatAI/GLM-5.2-FP8` | 12 (3 nodes × 4) | `vllm-glm52-1` | TP=4 + PP=3, block-FP8 (~755 GB). vLLM main pinned `091386a` + PR#45895 snapshot. Eager; fp8 KV + DeepGEMM |
+| `glm52_awq` | `cyankiwi/GLM-5.2-AWQ-INT4` | **8 (2 nodes × 4)** | `vllm-glm53-1` | TP=4 + **PP=2**. AWQ/compressed-tensors INT4 (~411 GB) fits 8 GPUs — **8 GPU-h/hour vs the FP8's 12**. Same DSA skip-topk indexer, so it runs on the v0.27.1 container where PR#45895 is native. Weights on the **persistent** tier, already cached. **Not yet served** |
+| `glm53` | `zai-org/GLM-5.3-FP8` *(expected id)* | 12 (3 nodes × 4) | `vllm-glm52-1` (shared) | GLM-5.2's **same base, re-post-trained** → identical arch, so it reuses the glm52 container (no rebuild) and its whole runtime profile. **Weights not public yet** (announced 2026-08-14, open weights promised ~2 weeks out) — confirm repo id + license before prefetching |
+| `glm53_v27` | `zai-org/GLM-5.3-FP8` *(expected id)* | 12 (3 nodes × 4) | `vllm-glm53-1` | Same model on **vLLM v0.27.1 + NGC 26.07** (torch 2.13), no PR graft — PR#45895 merged upstream in v0.24.0. The upgrade path off glm52's pinned-main build; **unvalidated, not yet benchmarked** |
+| `borealis` | `NbAiLab/borealis-27b` | **1** | `vllm-glm53-1` (shared) | **Borealis 27B — National Library of Norway**, Norwegian-centric instruct. Gemma-3 arch (`Gemma3ForConditionalGeneration`), **BF16 ~54 GB, no quantized release**, SigLIP vision tower (served for text), 128K ctx. Single GH200 TP=1; shares the glm53 container. Backend must be **auto-selected, not FLASH_ATTN** (Gemma 3's vision tower makes it multimodal PrefixLM → `mm_prefix` wants FA4, unavailable on Hopper at this head size; forcing it killed engine init). No reasoning/tool parsers. |
+| `qwen38` | `Qwen/Qwen3.8-27B-FP8` | **1** | `vllm-glm53-1` (shared) | **Qwen3.8 27B dense multimodal on a SINGLE GH200** (TP=1). Block-FP8 ~29 GB, hybrid linear+full attn (48+16), 262K ctx, Apache 2.0. Arch `Qwen3_5ForConditionalGeneration` — native in vLLM v0.27.1, so it shares the glm53 container with no rebuild. **MTP head confirmed present** (22 `mtp.*` tensors) → `ENABLE_SPECULATIVE=1` is the obvious win. Weights cached on the persistent tier. **Not yet served** |
 | `glm47` | `QuantTrio/GLM-4.7-AWQ` | 4 | `vllm-glm47-1` | TP=4, MTP speculative |
 | `kimi` | `moonshotai/Kimi-K2.6` | 8 (2 nodes × 4) | `vllm-kimi-4` | TP=4 + PP=2, native int4, MLA, multimodal, vLLM 0.21. Eager. reasoning_tokens on chat/completions |
 | `kimi27` | `moonshotai/Kimi-K2.7-Code` | 8 (2 nodes × 4) | `vllm-kimi-4` (shared) | Same arch + container as K2.6 (no rebuild); thinking-only |
@@ -275,6 +280,40 @@ Concurrency sweep (`bench_sweep.py`, `max_tokens=256`, reasoning on, warm pass):
 
 **Three fixes were needed for the multi-node path** (all now codified): the EngineCoreActor on `251f7e4` computes physical GPU ids for the whole world (8) by indexing `CUDA_VISIBLE_DEVICES`, which is only the node-local 4 GPUs → `IndexError` — fixed by stripping CVD from the container with **`env -u CUDA_VISIBLE_DEVICES`** (+ `RAY_EXPERIMENTAL_NOSET`), so vLLM uses raw ids and Ray places the 8 workers itself (singularity leaks the host CVD, so omitting the `--env` wasn't enough). And the compressed-tensors **W8A8 FP8 cutlass** linear double-sets `weight_loader` when linear dims need 16-alignment padding (the 397B's do, the 35B's don't) → `AssertionError` — patched (redundant re-set dropped). Both the legacy and engine-as-actor Ray executors hit the device-index bug (v1 runs EngineCore as a Ray actor either way), so the fix is executor-independent. See CLAUDE.md.
 
+### Borealis 27B (`borealis`) — Norwegian-centric Gemma-3 on 1× GH200, BF16 · 2026-08-18
+`bench_sweep.py`, `max_tokens=512`, **warm pass** (warmup pass discarded).
+
+| Concurrency | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| Aggregate tok/s | 55.8 | 108.9 | 215.2 | 423.9 | 807.7 | 1535.1 | 2665.5 |
+| Per-stream tok/s | 55.8 | 54.5 | 53.8 | 53.0 | 51.4 | 49.3 | 42.4 |
+| p95 TTFT (s) | 0.03 | 0.04 | 0.05 | 0.04 | 0.05 | 0.07 | 0.12 |
+| Failures | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+
+**0 failures 1→64 and the flattest scaling curve of any preset here.** Per-stream barely moves from 1-way to 32-way (55.8 → 49.3, a 12% drop, versus qwen38's 86 → 61), and TTFT stays **under 0.12 s even at 64-way** — the lowest latency in this document. Aggregate scales 48× from 1→64. Single-stream ~55.8 tok/s is slower than qwen38's ~86, which is expected: this is **BF16** (no quantized release exists) against qwen38's block-FP8, and 62 dense layers. The trade is worth naming — Borealis gives up ~35% single-stream but holds concurrency far better, so on a shared card it overtakes on aggregate under load.
+
+Loaded in **45 s to healthy** — the fastest startup here, since BF16 skips dequant setup. Ordinary Gemma-3 attention captures CUDAGraphs cleanly. Runs on the shared `vllm-glm53-1` container (vLLM v0.27.1 + NGC 26.07), the **third** model on that one build.
+
+> ⚠️ **The attention backend must be auto-selected, never forced to `FLASH_ATTN`.** Job 2032118 died at engine init in 110 s with `ValueError: Selected backend AttentionBackendEnum.FLASH_ATTN is not valid ... Reason: ['mm_prefix (PrefixLM bidirectional attention) requires FlashAttention v4, which does not resolve for this head_size']`. Gemma 3's **text** path is ordinary sliding-window + full attention, but its **vision tower** makes the config multimodal PrefixLM — the image prefix gets bidirectional attention — and vLLM only serves that via FA4, an SM100/Blackwell path unavailable at this head size on Hopper. **This bites even though we only ever send text.** Fixed by leaving `VLLM_ATTENTION_BACKEND` unset.
+
+### Qwen3.8 27B (`qwen38`) — 27B dense on 1× GH200, block-FP8, PIECEWISE capture · 2026-08-18
+`bench_sweep.py`, `max_tokens=512`, **warm pass** (a discarded warmup pass runs first — see the JIT note below).
+
+| Concurrency | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| Aggregate tok/s | 85.9 | 162.7 | 318.0 | 613.9 | 1148.2 | 1960.8 | 3162.0 |
+| Per-stream tok/s | 86.0 | 81.4 | 79.5 | 76.8 | 71.8 | 61.4 | 49.5 |
+| p95 TTFT (s) | 0.07 | 0.14 | 0.11 | 0.16 | 0.17 | 0.28 | 0.48 |
+| Failures | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+
+**0 failures 1→64, sub-0.5 s TTFT throughout, aggregate scaling 37× from 1→64.** Single-stream **~86 tok/s** and per-stream degrades gently (86 → 49.5 at 64-way), so this is a genuinely good multi-user model on one card. For a *dense* 27B that compares well with the sparse models here — ornith_gh200's 35B MoE reaches ~174 tok/s but activates only ~3B/token, and Laguna's 225B MoE gets ~63 tok/s on 4× the GPUs. Weights **28.46 GiB in 21 s**; **KV cache 832,557 tokens** = 3.18× concurrency at the full 262,144-token context. **CUDAGraph PIECEWISE capture works** (51 graphs) — the hybrid linear+full attention captures cleanly like Ornith, unlike the GLM-5.x/Kimi MLA models that IMA. First workload ever run on the `vllm-glm53-1` container (vLLM v0.27.1 + NGC 26.07), so it also validates that build.
+
+> ⚠️ **Always discard a cold pass on this model.** The first-touch run reported *137.6* agg / *8.55 s* TTFT at c=4 and *208.7* / *13.10 s* at c=8 — pure Triton JIT stalls on fresh shapes, not throughput. Warm, those are **318.0 / 0.11 s** and **613.9 / 0.16 s**. A cold sweep makes this model look like it collapses at moderate concurrency when it does the opposite. Same effect the Ornith sweep saw; `sweep_when_ready.sh` now runs a warmup pass and discards it.
+
+**Not yet measured: MTP.** The checkpoint really ships the head (22 `mtp.*` tensors) and vLLM registers `Qwen3_5MTP`, so `ENABLE_SPECULATIVE=1` remains the likeliest large single-stream win.
+
+**Reasoning not observed.** `reasoning_content` was empty on every prompt, including with `chat_template_kwargs={"enable_thinking": true}` — the kwarg does reach the template (prompt tokens 87→83) and the template references `enable_thinking`/`<think>`, but the model answered directly with no `<think>` block. Parsers (`qwen3_xml`/`qwen3`) configured but unexercised. Answers correct, including the bat-and-ball trick question.
+
 ### Laguna M.1 (`laguna`) — 1 node × 4 GH200, FP8, CUDAGraph · 2026-06-20
 Concurrency sweep (`bench_sweep.py`, `max_tokens=512`), reasoning on (`enable_thinking=true`) vs off:
 
@@ -296,6 +335,11 @@ Concurrency sweep (`bench_sweep.py`, `max_tokens=256`, thinking on):
 | Per-stream tok/s | 5.6 | 5.6 | 5.6 | 5.4 | 5.1 | 4.1 | 4.7 | 6.6 |
 
 Stable 1→64 (0 failures, no decode wedge — RayExecutorV2). Single-stream is slow (~5.6 tok/s, eager) with high TTFT (~14 s, PP=3 prefill); strong batched throughput (~75× from 1→64). CUDAGraph capture IMAs on this NGC stack, so eager only.
+
+> **This table is also the A/B baseline for `glm53_v27`** (vLLM v0.27.1 + NGC 26.07). GLM-5.3 is GLM-5.2's base re-post-trained, so the new container can — and should — be validated on these same `RedHatAI/GLM-5.2-FP8` weights before GLM-5.3's weights are published. Re-run this exact sweep there and record it below; the number to watch is whether a newer torch/inductor lets `CUDAGRAPH_MODE=PIECEWISE` capture (which would move single-stream off ~5.6 tok/s).
+
+### GLM-5.3 (`glm53` / `glm53_v27`) — not yet run
+No allocation spent. GLM-5.3's weights were still unpublished as of 2026-08-17 (announced 2026-08-14, open weights promised ~2 weeks out), so neither preset has been prefetched, built, or served. `glm53` is expected to match the GLM-5.2 row above exactly — it is the same base on the same container.
 
 ### Kimi K2.7 / K2.6 — 2 nodes × 4 GH200, eager, native int4 · 2026-06-20
 Concurrency sweep (256 output tokens, distinct prompts):

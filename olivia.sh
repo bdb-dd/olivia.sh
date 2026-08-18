@@ -734,7 +734,7 @@ cmd_build() {
                 info "To build a new container:"
                 echo "    ./olivia.sh build <preset>" >&2
                 echo "" >&2
-                echo "Available presets: glm51_v19 (alias: glm51), glm51_v20, glm52, glm47, kimi, kimi27, laguna, ornith, ornith_gh200, devstral, llama, qwen, generic" >&2
+                echo "Available presets: glm51_v19 (alias: glm51), glm51_v20, glm52, glm53_v27, glm47, kimi, kimi27, laguna, ornith, ornith_gh200, devstral, llama, qwen, generic" >&2
                 exit 0
                 ;;
             --presets|-p)
@@ -754,6 +754,15 @@ cmd_build() {
                 echo "             vLLM: main + PR#45895 (skip-topk indexer); NO release yet"
                 echo "             FP8 ~755GB, 12 GPUs (3×4-GPU nodes, TP=4 + PP=3)"
                 echo "             RedHatAI/GLM-5.2-FP8 (== zai-org). Same PP wedge as glm51."
+                echo ""
+                echo "  glm53_v27  GLM-5.3 (744B/40B) FP8 on a TAGGED vLLM release"
+                echo "             vLLM: v0.27.1, transformers>=5.5.3, NGC 26.07 (torch 2.13)"
+                echo "             FP8, 12 GPUs (3×4-GPU nodes, TP=4 + PP=3), own container."
+                echo "             GLM-5.3 is GLM-5.2's base re-post-trained, so the plain"
+                echo "             'glm53' SERVE preset reuses the glm52 container and needs"
+                echo "             NO build. This one only retires the pinned-main + PR#45895"
+                echo "             graft (merged in v0.24.0). UNVALIDATED — try it on"
+                echo "             GLM-5.2-FP8 weights first."
                 echo ""
                 echo "  glm47      GLM-4.7 (358B) flagship model"
                 echo "             vLLM: main, transformers>=5.0.0rc0"
@@ -914,6 +923,15 @@ cmd_build() {
     # build glm52 on 26.03's inductor (which, unlike 26.05, may not miscompile
     # DSA CUDAGraph capture). build_vllm_gh200.sh resolves env > preset > default.
     [[ -n "${NGC_PYTORCH_TAG:-}" ]] && env_vars="${env_vars} NGC_PYTORCH_TAG=${NGC_PYTORCH_TAG}"
+    # Forward a walltime override. sbatch honours SBATCH_TIMELIMIT from the
+    # environment and it beats the `#SBATCH --time=02:00:00` baked into
+    # build_vllm_gh200.sh. Needed because 2 h is no longer generous: a modern
+    # vLLM (v0.27.1) spends ~15 min just unpacking a fresh NGC sandbox onto
+    # Lustre before the CUDA compile even starts. NB you cannot fix this after
+    # the fact — SLURM only lets a user *lower* a running job's limit
+    # ("Access/permission denied"), so set it at submit time:
+    #   BUILD_TIME_LIMIT=06:00:00 ./olivia.sh build glm53_v27
+    [[ -n "${BUILD_TIME_LIMIT:-}" ]] && env_vars="${env_vars} SBATCH_TIMELIMIT=${BUILD_TIME_LIMIT}"
 
     info "Submitting build job for '${model_id}'..."
     echo "    Environment: ${env_vars}" >&2
@@ -1226,6 +1244,9 @@ start_server_job() {
     # TimeLimit=HH:MM:SS.)
     if [[ -n "${TIME_LIMIT:-}" ]]; then
         sbatch_opts+=" --time=${TIME_LIMIT}"
+        echo "    walltime:    ${TIME_LIMIT} (TIME_LIMIT override)" >&2
+    else
+        echo "    walltime:    02:00:00 (run_vllm_server.sh default; set TIME_LIMIT to change)" >&2
     fi
 
     # Debug: echo the exact command being submitted so regressions like
@@ -1931,6 +1952,8 @@ Actions:
 Presets (with default models):
     glm51               GLM-5.1-AWQ (cyankiwi/GLM-5.1-AWQ-4bit) — 2 nodes × 4 GPUs, TP=4 + PP=2
     glm52               GLM-5.2-FP8 (RedHatAI/GLM-5.2-FP8) — 3 nodes × 4 GPUs, TP=4 + PP=3 (needs vLLM main + PR#45895)
+    glm53               GLM-5.3-FP8 (zai-org/GLM-5.3-FP8) — 3 nodes × 4 GPUs, TP=4 + PP=3; reuses the glm52 container (weights not public yet)
+    glm53_v27           Same model on the glm53 container (vLLM v0.27.1 + NGC 26.07, no PR graft) — the upgrade path, unvalidated
     glm47               GLM-4.7-AWQ (QuantTrio/GLM-4.7-AWQ)
     ornith              Ornith 1.0 397B MoE FP8 flagship (deepreinforce-ai/Ornith-1.0-397B-FP8) — 2 nodes × 4 GPUs, TP=4 + PP=2, native MTP (PP-gated), 256K
     ornith_gh200        Ornith 1.0 35B MoE FP8 — single GH200 card, TP=1, MTP, 256K (max single-user throughput)
@@ -2797,7 +2820,7 @@ for k in 4 3 2 1; do
     printf "    %s  %b%s%b%s %3d\n" "$label" "$color" "$bar" "$RST" "$pad" "$c"
 done
 [ "$any_free" -eq 0 ] && printf "    (no free slots on schedulable nodes)\n"
-# Multi-node feasibility callouts: glm51 (PP=2) needs 2 full nodes; glm52
+# Multi-node feasibility callouts: glm51 (PP=2) needs 2 full nodes; glm52/glm53
 # (PP=3) needs 3 full nodes.
 if [ "$full4" -ge 2 ]; then
     printf "    ${GRN}→${RST} 2-node × 4-GPU shape (glm51) can start now (%d full nodes available)\n" "$full4"
@@ -2805,9 +2828,9 @@ else
     printf "    ${YEL}→${RST} 2-node × 4-GPU shape (glm51) cannot start now (%d/2 full nodes available)\n" "$full4"
 fi
 if [ "$full4" -ge 3 ]; then
-    printf "    ${GRN}→${RST} 3-node × 4-GPU shape (glm52) can start now (%d full nodes available)\n" "$full4"
+    printf "    ${GRN}→${RST} 3-node × 4-GPU shape (glm52/glm53) can start now (%d full nodes available)\n" "$full4"
 else
-    printf "    ${YEL}→${RST} 3-node × 4-GPU shape (glm52) cannot start now (%d/3 full nodes available)\n" "$full4"
+    printf "    ${YEL}→${RST} 3-node × 4-GPU shape (glm52/glm53) cannot start now (%d/3 full nodes available)\n" "$full4"
 fi
 echo
 

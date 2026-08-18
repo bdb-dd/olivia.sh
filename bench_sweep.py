@@ -29,7 +29,7 @@ def one_request(url, model, prompt, max_tokens, idx, out, ctk=None, timeout=900)
     payload = json.dumps(body).encode()
     req = urllib.request.Request(f"{url}/v1/chat/completions", data=payload,
                                  headers={"Content-Type": "application/json"})
-    t0 = time.perf_counter(); ttft = None; toks = 0
+    t0 = time.perf_counter(); ttft = None; toks = 0; ptoks = 0
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             for raw in resp:
@@ -50,8 +50,10 @@ def one_request(url, model, prompt, max_tokens, idx, out, ctk=None, timeout=900)
                         ttft = time.perf_counter() - t0
                 if chunk.get("usage"):
                     toks = chunk["usage"].get("completion_tokens", toks)
+                    ptoks = chunk["usage"].get("prompt_tokens", ptoks)
         total = time.perf_counter() - t0
-        out[idx] = {"ok": True, "ttft": ttft or total, "total": total, "tokens": toks}
+        out[idx] = {"ok": True, "ttft": ttft or total, "total": total,
+                    "tokens": toks, "prompt_tokens": ptoks}
     except Exception as e:
         out[idx] = {"ok": False, "err": str(e), "total": time.perf_counter() - t0}
 
@@ -75,7 +77,8 @@ def run_level(url, model, prompt, max_tokens, concurrency, ctk=None, timeout=900
     med_ps = statistics.median(ps) if ps else 0
     med_ttft = statistics.median(ttfts) if ttfts else 0
     p95_ttft = ttfts[min(len(ttfts) - 1, int(0.95 * len(ttfts)))] if ttfts else 0
-    print(f"{concurrency},{agg:.1f},{med_ps:.1f},{med_ttft:.2f},{p95_ttft:.2f},{fail},{total_tokens},{wall:.1f}",
+    med_ptok = statistics.median([r.get("prompt_tokens", 0) for r in ok]) if ok else 0
+    print(f"{concurrency},{int(med_ptok)},{agg:.1f},{med_ps:.1f},{med_ttft:.2f},{p95_ttft:.2f},{fail},{total_tokens},{wall:.1f}",
           flush=True)
     errs = [r.get("err") for r in res if not r.get("ok")]
     if errs:
@@ -90,6 +93,14 @@ if __name__ == "__main__":
     ap.add_argument("--levels", default="1,2,4,8,16,32")
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--prompt", default=PROMPT)
+    ap.add_argument("--prompt-tokens", type=int, default=0,
+                    help="pad the prompt to roughly this many tokens so CONTEXT LENGTH "
+                         "becomes a measured axis. The built-in prompt is only ~35 "
+                         "tokens, so an unpadded sweep measures throughput at ~600 "
+                         "tokens of context and says nothing about long-context "
+                         "behaviour. Padding is filler prose (~4 chars/token); the "
+                         "ACTUAL prompt_tokens the server reports is emitted in the CSV, "
+                         "so the approximation never has to be trusted.")
     ap.add_argument("--chat-template-kwargs", default=None,
                     help='JSON dict passed as chat_template_kwargs, e.g. '
                          '\'{"enable_thinking": false}\' to disable reasoning')
@@ -98,7 +109,19 @@ if __name__ == "__main__":
                          "presets (e.g. glm51) so a hung level fails fast")
     a = ap.parse_args()
     ctk = json.loads(a.chat_template_kwargs) if a.chat_template_kwargs else None
-    print("concurrency,agg_tok_s,median_per_stream_tok_s,median_ttft_s,p95_ttft_s,failures,total_tokens,wall_s",
+    prompt = a.prompt
+    if a.prompt_tokens > 0:
+        # Deterministic, low-entropy filler. Numbered lines keep the text from
+        # being trivially prefix-cacheable across variants and stop the model
+        # short-circuiting on repetition.
+        filler, i = [], 0
+        approx_chars = a.prompt_tokens * 4
+        while sum(len(x) for x in filler) < approx_chars:
+            i += 1
+            filler.append(f"Record {i}: node {i*7 % 977} holds key {i*31 % 4093} "
+                          f"with fanout {i % 17 + 2} and depth {i % 5 + 1}. ")
+        prompt = ("".join(filler))[:approx_chars] + "\n\n" + a.prompt
+    print("concurrency,prompt_tokens,agg_tok_s,median_per_stream_tok_s,median_ttft_s,p95_ttft_s,failures,total_tokens,wall_s",
           flush=True)
     for lvl in [int(x) for x in a.levels.split(",")]:
-        run_level(a.url, a.model, a.prompt, a.max_tokens, lvl, ctk, a.timeout)
+        run_level(a.url, a.model, prompt, a.max_tokens, lvl, ctk, a.timeout)

@@ -736,10 +736,15 @@ serve the **27B** full release, `NbAiLab/borealis-27b`.
 | BF16 (open-licence variant) | `NbAiLab/borealis-open-27b` | ~54 GB | same shape; different licence terms |
 | GGUF | `NbAiLab/borealis-27b{,-open}-gguf` | varies | **No** — llama.cpp, not vLLM |
 
-**Runtime: deliberately almost nothing (`IS_BOREALIS`).** Gemma 3 is ordinary
-attention (sliding-window layers interleaved with full), so it keeps the
-**`FLASH_ATTN`** default and lets **CUDAGraph capture** run — no eager override, no
-auto-select backend. It is an instruct model that emits neither `<think>` blocks
+**Runtime (`IS_BOREALIS`).** ⚠️ **Do NOT force `FLASH_ATTN`** — verified the hard
+way on 2026-08-18 (job 2032118 died at engine init in 110 s with *`mm_prefix`
+(PrefixLM bidirectional attention) requires FlashAttention v4, which does not
+resolve for this head_size*). Gemma 3's **text** path is ordinary sliding-window +
+full attention, but the **vision tower** makes the config multimodal PrefixLM —
+giving the image prefix bidirectional attention — and vLLM only serves that
+through FA4, an SM100/Blackwell path unavailable at this head size on Hopper. The
+backend is therefore left **unset so vLLM auto-selects**, like the MLA/hybrid
+models. This bites even though we only ever send text. Otherwise it is an instruct model that emits neither `<think>` blocks
 nor a tool-call grammar vLLM has a parser for, so **no `--reasoning-parser`, no
 `--tool-call-parser`, no `--enable-auto-tool-choice`**. The single override is
 `MAX_MODEL_LEN=131072`: the generic fallback is 32768, which would silently

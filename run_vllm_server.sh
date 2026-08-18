@@ -467,13 +467,17 @@ fi
 #     131072 max_position_embeddings, torch_dtype bfloat16, NO quantization_config.
 #   - Multimodal: SigLIP vision tower (27 layers, 1152 hidden, 896x896 / patch 14).
 #     We serve it for TEXT; the encoder loads dormant.
-# Deliberately NOT given a parser/backend block: Gemma 3 is ordinary attention
-# (sliding-window + full), so it keeps the FLASH_ATTN default and lets CUDAGraph
-# capture run, and this is an instruct model that emits neither <think> blocks nor
+# No parser block: this is an instruct model that emits neither <think> blocks nor
 # a tool-call grammar vLLM has a parser for — so no --reasoning-parser, no
-# --tool-call-parser, no --enable-auto-tool-choice. The ONLY thing it needs from
-# us is a context default: the generic fallback is 32768, which would silently
-# throw away three quarters of the model's native window.
+# --tool-call-parser, no --enable-auto-tool-choice.
+# It DOES need two things from us:
+#   1. MAX_MODEL_LEN=131072 — the generic fallback is 32768, which would silently
+#      throw away three quarters of the model's native window.
+#   2. NO forced attention backend. Gemma 3's text path is ordinary
+#      sliding-window+full attention, but the VISION tower makes the config
+#      multimodal PrefixLM, and forcing FLASH_ATTN then fails engine init outright
+#      (mm_prefix wants FlashAttention v4, which does not resolve for this
+#      head_size on Hopper). See the attention-backend block below.
 IS_BOREALIS=0
 if [[ "${MODEL}" == *"borealis"* ]] || [[ "${MODEL}" == *"Borealis"* ]]; then
     IS_BOREALIS=1
@@ -711,9 +715,23 @@ fi
 # from whatever is installed — if nothing works, the error will tell us what
 # to install.
 if [[ -z "${VLLM_ATTENTION_BACKEND}" ]]; then
-    if [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_ORNITH}" == "1" || "${IS_QWEN38}" == "1" ]]; then
+    if [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_ORNITH}" == "1" || "${IS_QWEN38}" == "1" || "${IS_BOREALIS}" == "1" ]]; then
         # Don't force FLASH_ATTN — these need vLLM to auto-select a special backend:
         #   Qwen3.8  HYBRID, same as Ornith (48 linear-attn + 16 full layers).
+        #   Borealis (Gemma 3) MULTIMODAL PrefixLM. Forcing FLASH_ATTN here is a
+        #     HARD FAILURE, verified on-cluster 2026-08-18 (job 2032118 died at
+        #     engine init in 110 s):
+        #       ValueError: Selected backend AttentionBackendEnum.FLASH_ATTN is not
+        #       valid for this configuration. Reason: ['"'"'mm_prefix (PrefixLM
+        #       bidirectional attention) requires FlashAttention v4, which does not
+        #       resolve for this head_size'"'"']
+        #     Gemma 3 gives the image prefix BIDIRECTIONAL attention, and vLLM only
+        #     serves that through FA4 — an SM100/Blackwell path that does not
+        #     resolve for this head size on Hopper. Leaving the backend unset lets
+        #     vLLM pick one that does support mm_prefix. (So "Gemma 3 is ordinary
+        #     attention, keep FLASH_ATTN" was WRONG: it is ordinary for TEXT, but
+        #     the vision tower changes the attention contract even when we only
+        #     ever send text.)
         #   GLM-5.x  sparse-MLA (DSA); Kimi K2.6 standard MLA — FLASH_ATTN rejects MLA.
         #   Ornith   HYBRID (Gated-DeltaNet linear_attn + full self_attn) — the
         #            linear-attn layers use a mamba/GDN kernel + recurrent state, not

@@ -704,6 +704,18 @@ if [[ "${IS_DSV4}" == "1" && "${IS_AWQ}" == "0" ]]; then
         export VLLM_USE_DEEP_GEMM=1
     fi
     export VLLM_DEEP_GEMM_WARMUP="${VLLM_DEEP_GEMM_WARMUP:-skip}"
+    # fp8 KV cache is MANDATORY, not an optimisation. DeepSeek-V4's attention uses
+    # the fp8_ds_mla layout, which refuses anything else — verified on-cluster
+    # 2026-08-18 (job 2036910 died at worker start in 2m37s):
+    #   AssertionError: DeepseekV4 fp8_ds_mla layout only supports fp8 kv-cache,
+    #   got auto
+    # Note this is the EXACT OPPOSITE of GLM-5.2 on this hardware, where forcing
+    # fp8 KV makes the attention selector reject every backend (FLASHMLA_SPARSE
+    # on Hopper does not support it). Same MLA family, inverted requirement — so
+    # do not generalise a KV-dtype rule across the DSA/MLA models.
+    # Useful side effect: fp8 KV roughly halves per-token cache cost, which is
+    # what makes the long-context ladder reach further on this model.
+    KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 fi
 
 # --- GLM-5.2-family multi-node bits that are QUANT-INDEPENDENT --------------
@@ -821,14 +833,22 @@ elif [[ "${ENABLE_SPECULATIVE}" == "auto" ]]; then
         USE_SPECULATIVE=1
         echo "[INFO] Auto-enabling MTP speculative decoding for GLM MoE model"
     fi
-    # DeepSeek-V4-Flash: auto-ON, unlike Ornith below. The distinction is evidence,
-    # not optimism — its weight_map really contains the head (4705 `mtp.*` tensors
-    # of 72317, e.g. mtp.0.hc_attn_base) and vLLM registers DeepSeekV4MTPModel, so
-    # --speculative-config mtp has a draft to load. ENABLE_SPECULATIVE=0 to disable
-    # (e.g. to measure the no-MTP baseline for comparison).
-    if [[ "${IS_DSV4}" == "1" ]]; then
-        USE_SPECULATIVE=1
-        echo "[INFO] Auto-enabling MTP speculative decoding for DeepSeek-V4 (head verified in checkpoint)"
+    # DeepSeek-V4-Flash: MTP is OPT-IN, despite the head being present.
+    #
+    # The checkpoint genuinely ships it — 4705 `mtp.*` tensors of 72317 in the
+    # weight_map (mtp.0.hc_attn_base, ...) — and vLLM registers DeepSeekV4MTPModel.
+    # I auto-enabled it on that basis and it FAILED on-cluster 2026-08-18
+    # (job 2036966, 3m20s):
+    #     KeyError: 'model.layers.43.mtp_block.main_norm.weight'
+    # v0.27.1's loader expects the head at model.layers.<N>.mtp_block.*, but this
+    # 0731 checkpoint stores it as mtp.0.* — the weights are there, in a layout
+    # this vLLM cannot map. So TENSOR PRESENCE IS NECESSARY BUT NOT SUFFICIENT:
+    # Ornith taught that a config claim needs checking against the weight_map, and
+    # this teaches that the weight_map needs checking against the loader's naming.
+    # Re-test with ENABLE_SPECULATIVE=1 after a vLLM bump; if the KeyError persists
+    # the layouts have genuinely diverged and it needs an upstream fix.
+    if [[ "${IS_DSV4}" == "1" && "${ENABLE_SPECULATIVE}" == "auto" ]]; then
+        echo "[INFO] DeepSeek-V4: MTP OFF (head present as mtp.0.* but v0.27.1 expects model.layers.N.mtp_block.*). ENABLE_SPECULATIVE=1 to retry."
     fi
     # Ornith is intentionally NOT auto-on: its config declares mtp_num_hidden_layers=1
     # but the published FP8 checkpoints ship NO MTP weights (verified on-cluster),

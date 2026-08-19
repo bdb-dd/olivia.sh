@@ -13,6 +13,12 @@ JOB=$1; MODEL=$2; OUT=$3; CPT=${4:-5.8}; CTXS=${5:-16000,100000}; LEVELS=${6:-1,
 D=/cluster/work/projects/nn10104k/containers
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy
 cd "$D" || exit 1
+# ALWAYS cancel on the way out. The previous version only scancelled after the
+# final cell, so a crashed bench_sweep, a kill, or an early exit left the server
+# holding its full allocation -- the exact leak this script was written to stop.
+cleanup() { rc=$?; echo "[ladder] exiting (rc=$rc) -- cancelling job $JOB"; scancel "$JOB" 2>/dev/null; }
+trap cleanup EXIT
+
 job_alive() { squeue -j "$JOB" -h -o "%T" 2>/dev/null | grep -qE "RUNNING|PENDING|COMPLETING"; }
 for i in $(seq 1 240); do
   job_alive || { echo "JOB $JOB gone before start"; exit 1; }
@@ -34,5 +40,4 @@ for CTX in $(echo "$CTXS" | tr "," " "); do
       --levels "$LEVELS" --max-tokens 512 --prompt-tokens "$CTX" \
       --chars-per-token "$CPT" --timeout 1800 2>>"${OUT}_ctx.err" | tee -a "${OUT}_ctx.csv"
 done
-echo "=== LADDER COMPLETE - cancelling $JOB ==="
-scancel "$JOB"
+echo "=== LADDER COMPLETE ==="   # the EXIT trap does the cancel

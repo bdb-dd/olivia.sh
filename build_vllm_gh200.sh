@@ -972,6 +972,36 @@ PYPATCH_LL_BF16_QUACK
 # is redundant (already set above), so drop it. No-ops on vLLM without this file.
 # Idempotent.
 python3 << 'PYPATCH_CUTLASS_WEIGHTLOADER'
+
+# --- PYPATCH_HAS_CUTEDSL_QUACK ------------------------------------------------
+# vllm/utils/import_utils.py has_cutedsl() reports capability from `cutlass` alone,
+# but every cutedsl code path also imports `quack` -- e.g.
+# models/deepseek_v4/nvidia/ops/fused_indexer_q_cutedsl.py does
+# `from quack.compile_utils import make_fake_tensor`. On this container (cute-dsl
+# present, quack absent) the check returns True, the guarded lazy import then
+# raises ModuleNotFoundError INSIDE the attention forward, and every worker dies.
+# Verified on-cluster 2026-08-19 (job 2043640, DeepSeek-V4-Flash).
+#
+# Installing quack is not an option: quack-kernels 0.6.4 pins
+# nvidia-cutlass-dsl==4.6.2 while vLLM v0.27.1 pins 4.6.0 -- mutually
+# unsatisfiable, and bumping cutlass-dsl is what broke Ornith. Reporting the
+# capability honestly makes callers take their existing non-cutedsl fallback,
+# which is the same remedy as PYPATCH_LL_BF16_QUACK above.
+python3 - <<'PYEOF' || echo "  has_cutedsl patch skipped (anchor absent, OK on other vLLM versions)"
+import glob, sys
+hits = glob.glob('/usr/local/lib/python3.12/dist-packages/vllm/utils/import_utils.py')
+old = '    return _has_module("cutlass")'
+new = '    return _has_module("cutlass") and _has_module("quack")'
+for p in hits:
+    s = open(p).read()
+    if new in s:
+        print('  has_cutedsl already requires quack'); break
+    if old not in s:
+        print('  has_cutedsl anchor not found (OK)'); break
+    open(p, 'w').write(s.replace(old, new, 1))
+    print('  PYPATCH_HAS_CUTEDSL_QUACK: has_cutedsl() now also requires quack')
+PYEOF
+
 import os
 f = "/opt/vllm/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py"
 if not os.path.exists(f):

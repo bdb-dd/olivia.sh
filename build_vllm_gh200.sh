@@ -1551,7 +1551,11 @@ pip install --no-cache-dir --no-deps --root-user-action=ignore --no-build-isolat
 # mean a container that serves DeepSeek only if it happened to be built for it.
 echo ""
 echo "Installing tilelang (required by DeepSeek-V4 mhc attention)..."
-pip install --no-cache-dir --no-deps --root-user-action=ignore tilelang 2>&1 | tail -5 || {
+# PIN to the version vLLM asks for. v0.27.1 requires tilelang==0.1.12 exactly; an
+# unpinned install resolves 0.1.13 and pip then reports it as incompatible. Bump
+# this in step with VLLM_VERSION. TILELANG_REF overrides.
+TILELANG_REF="${TILELANG_REF:-0.1.12}"
+pip install --no-cache-dir --no-deps --root-user-action=ignore "tilelang==${TILELANG_REF}" 2>&1 | tail -5 || {
     echo "Warning: tilelang install failed. DeepSeek-V4 will not load (mhc path);"
     echo "         all other presets are unaffected."
 }

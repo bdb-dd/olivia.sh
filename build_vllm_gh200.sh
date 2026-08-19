@@ -1555,6 +1555,20 @@ echo "Installing tilelang (required by DeepSeek-V4 mhc attention)..."
 # unpinned install resolves 0.1.13 and pip then reports it as incompatible. Bump
 # this in step with VLLM_VERSION. TILELANG_REF overrides.
 TILELANG_REF="${TILELANG_REF:-0.1.12}"
+# apache-tvm-ffi must be pinned ALONGSIDE tilelang or the two disagree and the
+# workers abort at startup with a C++ terminate, not a Python traceback:
+#   terminate called after throwing an instance of 'tvm::ffi::Error'
+#     what(): TypeAttr `__ffi_repr__` is already registered for type index 130
+# (verified on-cluster 2026-08-19, job 2043587: weights loaded fine, then all four
+# workers died during model init). The container had drifted to 0.1.12, which
+# satisfies NEITHER vLLM v0.27.1 (requires ==0.1.11) NOR tilelang 0.1.12
+# (requires <=0.1.11). flashinfer accepts anything <0.2, so 0.1.11 is the single
+# version all three agree on — pinning it brings the container back INTO
+# compliance with vLLM's own requirement rather than away from it.
+TVM_FFI_REF="${TVM_FFI_REF:-0.1.11}"
+pip install --no-cache-dir --no-deps --root-user-action=ignore "apache-tvm-ffi==${TVM_FFI_REF}" 2>&1 | tail -3 || {
+    echo "Warning: apache-tvm-ffi pin failed; tilelang/DeepSeek-V4 may abort at worker init."
+}
 pip install --no-cache-dir --no-deps --root-user-action=ignore "tilelang==${TILELANG_REF}" 2>&1 | tail -5 || {
     echo "Warning: tilelang install failed. DeepSeek-V4 will not load (mhc path);"
     echo "         all other presets are unaffected."

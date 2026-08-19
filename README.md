@@ -310,19 +310,22 @@ Loaded in **45 s to healthy** — the fastest startup here, since BF16 skips deq
 
 **The fastest preset here: ~193 tok/s single-stream and 7751 tok/s aggregate at 128-way, 0 failures throughout, p95 TTFT ≤0.22 s.** For scale, qwen38 peaks at 3162 @64 and Borealis at 2666 @64 — though both are 1-GPU presets against this one's 4, so *per GPU* qwen38 is still ahead on aggregate. **128 is not the ceiling**: aggregate was still climbing (6362 → 7751) and per-stream fell only 8% from 96 to 128, so the top end has not saturated.
 
-**Context ladder (the number that matters), `--prompt-tokens` calibrated to the real tokenizer:**
+**Context ladder (the result that matters)**, `--prompt-tokens` calibrated to the real tokenizer, `MAX_MODEL_LEN=524288` for the 200K/500K rungs:
 
-| Context (actual prompt tokens) | c=1 agg | c=1 per-stream | c=1 TTFT | c=16 agg | c=16 per-stream | c=16 p95 TTFT |
-|---|---|---|---|---|---|---|
-| ~74 | 192.7 | 192.8 | 0.03 | 1867.9 | 116.9 | 0.05 |
-| 15,975 (16K) | 184.6 | 187.8 | 0.08 | 807.7 | 53.7 | 4.49 |
-| 99,474 (100K) | 69.8 | 91.8 | 2.73 | **118.3** | 11.9 | **36.95** |
+| Context (actual prompt tokens) | c=1 agg | c=1 per-stream | c=1 TTFT | c=16 agg | c=16 per-stream | c=16 p95 TTFT | fails |
+|---|---|---|---|---|---|---|---|
+| 74 | 192.7 | 192.8 | 0.03 s | 1867.9 | 116.9 | 0.05 s | 0 |
+| 15,975 (16K) | 184.6 | 187.8 | 0.08 s | 807.7 | 53.7 | 4.49 s | 0 |
+| 99,474 (100K) | 69.8 | 91.8 | 2.73 s | 118.3 | 11.9 | 36.95 s | 0 |
+| 198,873 (200K) | 29.9 | 47.0 | 7.86 s | 36.6 | 4.3 | 111.54 s | 0 |
+| 497,074 (500K) | 7.3 | 15.3 | 29.88 s | **7.6** | **1.1** | **465.62 s** | 0 |
 
-> 🔥 **Long context is brutally expensive, and it invalidates reading any short-context headline as a general result.** From ~74 to ~100K tokens: single-stream falls **64%** (192.7 → 69.8), 16-way aggregate falls **94%** (1867.9 → 118.3), and 16-way p95 TTFT rises **740×** (0.05 s → 36.95 s). Still 0 failures — it does not break, it just gets very slow. At 100K × 16 the model delivers ~118 tok/s aggregate with ~37 s to first token, which is a different service entirely from the 7751 tok/s the concurrency table advertises.
+> 🔥 **Context, not concurrency, is the dominant cost — and it invalidates reading any short-context headline as a general result.** Across the ladder at 16-way, aggregate throughput falls from **1867.9 → 7.6 tok/s** (246×) and p95 TTFT rises from **0.05 s → 465.6 s** (9300×, i.e. 7.8 minutes to first token). Single-stream falls 192.8 → 15.3 tok/s (−92%). The full spread between this preset's best number (7751 tok/s at 128-way, ~74 tokens) and its worst (7.6 tok/s at 16-way, 500K) is over **1000×**. **Zero failures anywhere** — it never breaks, it just degrades until it is a different service.
 
-**Capacity limits** (KV 3,190,414 tokens): 16K×16 = 256K ✓, 100K×16 = 1.6M ✓, **200K×16 = 3.2M ✗** (over by ~10K), **500K×16 = 8M ✗**. 200K and 500K at c=1 need `MAX_MODEL_LEN` raised above the `IS_LAGUNA` default of 131072 — otherwise requests are rejected with HTTP 400 rather than silently truncated.
-
-> ⚠️ **`--prompt-tokens` needs per-tokenizer calibration.** The first attempt used digit-heavy filler, which tokenises near one token per character: a requested 16K came back as **28,534** real tokens and a requested 100K resolved to ~178K, past the window, failing with HTTP 400. Switching to prose overshot the other way (5.8 chars/token here, not 4). `--chars-per-token 5.8` lands within **0.16%**. This is why the CSV reports the server's actual `prompt_tokens` on every row — never trust the target.
+> ⚠️ **"Maximum viable length" has three distinct answers, and only one is a hard limit.**
+> 1. **Window** — `max_model_len`. A request past it is **rejected with HTTP 400**, not truncated. This is the only genuine wall, and it is a *config* choice here: Laguna S is natively 1M, but the `IS_LAGUNA` default caps it at 131072, so a 100K-target request that tokenises to ~178K gets a 400 until you raise it.
+> 2. **KV capacity** — 4,024,015 tokens at a 512K window; vLLM reports "Maximum concurrency for 524,288 tokens per request: 7.68x". **This is NOT an admission limit.** I predicted 500K×16 (8M needed) was arithmetically impossible; it ran anyway, with 0 failures, because vLLM schedules the excess in waves rather than refusing it. The cost surfaces as queueing latency, not errors.
+> 3. **Latency tolerance** — the real operational limit. Laguna S will happily serve 500K×16 at 1.1 tok/s per stream with ~8 minutes to first token. Nothing fails; it is simply unusable for interactive work. Pick the rung by the latency you can accept, not by what the server will admit.
 
 ### Qwen3.8 27B (`qwen38`) — 27B dense on 1× GH200, block-FP8, PIECEWISE capture · 2026-08-18
 `bench_sweep.py`, `max_tokens=512`, **warm pass** (a discarded warmup pass runs first — see the JIT note below).

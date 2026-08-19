@@ -99,7 +99,7 @@
       "nodes": 1, "gpus": 4, "pp": 1,
       "container_prefix": "glm53", "index": 1,
       "storage": "work",
-      "description": "DeepSeek-V4-Flash-0731 MoE (256+1 experts, 6 active), block-FP8 ~167 GB, 1 node TP=4, 1M ctx via YaRN. NATIVE MTP (num_nextn_predict_layers=1) — vLLM registers DeepSeekV4MTPModel. Shares the glm53 container (v0.27.1)"
+      "description": "DeepSeek-V4-Flash-0731 MoE (256+1 experts, 6 active), block-FP8 ~167 GB, 1 node TP=4, 1M ctx via YaRN. ⚠️ BLOCKED on vLLM v0.27.1 + NGC 26.07: its compressor unconditionally uses cutedsl at head_dim=512 on CUDA, which needs `quack`, and quack-kernels pins nvidia-cutlass-dsl==4.6.2 against vLLM 4.6.0 — unsatisfiable. Preset kept for a future vLLM. See README"
     },
     "lagunas21": {
       "aliases": ["laguna-s-2.1", "laguna_s21", "lagunas", "laguna-s"],

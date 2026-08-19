@@ -296,6 +296,19 @@ Loaded in **45 s to healthy** — the fastest startup here, since BF16 skips deq
 
 > ⚠️ **The attention backend must be auto-selected, never forced to `FLASH_ATTN`.** Job 2032118 died at engine init in 110 s with `ValueError: Selected backend AttentionBackendEnum.FLASH_ATTN is not valid ... Reason: ['mm_prefix (PrefixLM bidirectional attention) requires FlashAttention v4, which does not resolve for this head_size']`. Gemma 3's **text** path is ordinary sliding-window + full attention, but its **vision tower** makes the config multimodal PrefixLM — the image prefix gets bidirectional attention — and vLLM only serves that via FA4, an SM100/Blackwell path unavailable at this head size on Hopper. **This bites even though we only ever send text.** Fixed by leaving `VLLM_ATTENTION_BACKEND` unset.
 
+### DeepSeek-V4-Flash-0731 (`dsv4flash`) — BLOCKED, does not serve on this stack · 2026-08-19
+Six attempts, five distinct blockers, ~1 GPU-h total. **It never served a token.** Recorded here because each blocker is real, four are fixed and committed, and the fifth is structural.
+
+| # | Blocker | Status |
+|---|---|---|
+| 1 | `AssertionError: DeepseekV4 fp8_ds_mla layout only supports fp8 kv-cache, got auto` | **Fixed** — `KV_CACHE_DTYPE=fp8` default. Note this is the *exact inverse* of GLM-5.2, which on Hopper cannot use fp8 KV at all |
+| 2 | `KeyError: 'model.layers.43.mtp_block.main_norm.weight'` | **Fixed** (MTP → opt-in). The head IS shipped — 4705 `mtp.*` tensors — but as `mtp.0.*` where v0.27.1 expects `model.layers.<N>.mtp_block.*`. **Tensor presence ≠ loadable** |
+| 3 | `ImportError: tilelang is required for mhc` | **Fixed** — `tilelang==0.1.12` pinned in the build |
+| 4 | `tvm::ffi::Error: TypeAttr __ffi_repr__ already registered` (C++ abort, no Python traceback) | **Fixed** — `apache-tvm-ffi==0.1.11`, the one version vLLM, tilelang and flashinfer all accept |
+| 5 | `ModuleNotFoundError: No module named 'quack'` | **UNFIXABLE HERE** |
+
+> 🚧 **Why blocker 5 is structural, not another patch.** There are two quack import paths. The first (`fused_indexer_q.py`) is guarded by `has_cutedsl()`, which under-reports — it checks `cutlass` but every cutedsl path also imports `quack` — so making the check honest routes it to an existing fallback (`PYPATCH_HAS_CUTEDSL_QUACK`, same bug class as Ornith's `ll_bf16` check). The second, `deepseek_v4/compressor.py:423`, has **no capability gate and no fallback**; its own comment states *"head=512 on CUDA always uses cutedsl"*. So quack is mandatory, and it cannot be installed: `quack-kernels` 0.6.4 pins `nvidia-cutlass-dsl==4.6.2`, vLLM v0.27.1 pins **4.6.0**, the container has **4.5.2**. No version satisfies all three, and bumping cutlass-dsl is what broke Ornith. **Retry on a vLLM release whose cutlass-dsl pin matches quack-kernels'** — the preset and all four fixes are committed and ready.
+
 ### Laguna S 2.1 (`lagunas21`) — 1 node × 4 GH200, FP8, TP=4 · 2026-08-18
 `bench_sweep.py`, `max_tokens=512`, **warm pass**. **KV cache 3,190,414 tokens.**
 

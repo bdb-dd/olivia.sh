@@ -1245,6 +1245,63 @@ if [[ "${ENABLE_PROXY}" == "1" ]]; then
     fi
 fi
 
+# =============================================================================
+# Idle watchdog — cancel this job if the server is up but nobody is using it
+# =============================================================================
+# THE most expensive failure mode on this cluster is not a crash. A crash dies in
+# 2-5 minutes and costs almost nothing. A server that comes up CORRECTLY and then
+# receives no requests holds 100% of its allocation at 0% utilisation until
+# walltime. Measured over 2026-08-17..19: six failed starts cost ~1.5 GPU-h in
+# total, while TWO healthy-but-unattended servers cost 11 GPU-h — roughly 63% of
+# all GPU time spent. Causes were mundane: an SSH master dropped mid-benchmark,
+# and a benchmark driven by hand from a session that was not attached.
+#
+# run_proxy.sh has had ROUTER_EMPTY_TIMEOUT auto-spindown for a while — on the CPU
+# router, which costs 2 CPUs. The GPU servers, at 4-12x the price, had nothing.
+# This closes that gap.
+#
+# The watchdog only starts counting AFTER /health returns 200, so a long model load
+# (Kimi and the 400 GB models take 10+ minutes) is never mistaken for idleness. It
+# tracks vLLM's monotonic generation-token counter plus the running-request gauge;
+# idle means both "no tokens produced since last check" and "nothing running".
+#
+#   IDLE_TIMEOUT=<seconds>   default 1200 (20 min). 0 DISABLES — use that for a
+#                            server deliberately left up for interactive work.
+IDLE_TIMEOUT="${IDLE_TIMEOUT:-1200}"
+if [[ "${IDLE_TIMEOUT}" =~ ^[0-9]+$ ]] && [[ "${IDLE_TIMEOUT}" -gt 0 ]] && [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    (
+        _wd_curl() { curl -s --noproxy '*' -m 5 "$@" 2>/dev/null; }
+        # Wait for readiness. Deliberately generous (90 min): a slow load must not
+        # be cancelled, and if the server never comes up the JOB dies by itself.
+        for _ in $(seq 1 540); do
+            [ "$(_wd_curl -o /dev/null -w '%{http_code}' "http://localhost:${PORT}/health")" = "200" ] && break
+            sleep 10
+        done
+        [ "$(_wd_curl -o /dev/null -w '%{http_code}' "http://localhost:${PORT}/health")" = "200" ] || exit 0
+        echo "[watchdog] server ready; will cancel job ${SLURM_JOB_ID} after ${IDLE_TIMEOUT}s with no activity"
+        _last_tokens=""; _idle=0
+        while sleep 60; do
+            _m=$(_wd_curl "http://localhost:${PORT}/metrics")
+            [ -z "${_m}" ] && continue   # transient scrape failure is not idleness
+            _tok=$(echo "${_m}" | awk '/^vllm:generation_tokens_total/{s+=$2} END{printf "%.0f", s+0}')
+            _run=$(echo "${_m}" | awk '/^vllm:num_requests_running/{s+=$2} END{printf "%.0f", s+0}')
+            if [ "${_tok}" != "${_last_tokens}" ] || [ "${_run}" != "0" ]; then
+                _idle=0; _last_tokens="${_tok}"
+            else
+                _idle=$((_idle + 60))
+                if [ "${_idle}" -ge "${IDLE_TIMEOUT}" ]; then
+                    echo "[watchdog] no activity for ${_idle}s — cancelling job ${SLURM_JOB_ID} to stop burning allocation"
+                    scancel "${SLURM_JOB_ID}"
+                    exit 0
+                fi
+            fi
+        done
+    ) &
+    echo "[$(date '+%H:%M:%S')] Idle watchdog armed (IDLE_TIMEOUT=${IDLE_TIMEOUT}s; set 0 to disable)"
+else
+    echo "[$(date '+%H:%M:%S')] Idle watchdog DISABLED (IDLE_TIMEOUT=${IDLE_TIMEOUT:-unset}) — job will hold its allocation until walltime"
+fi
+
 # Build shared singularity command array (used by both single-node and multi-node paths)
 SING_CMD=(
     singularity exec --nv

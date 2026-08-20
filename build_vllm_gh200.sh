@@ -972,6 +972,36 @@ PYPATCH_LL_BF16_QUACK
 # is redundant (already set above), so drop it. No-ops on vLLM without this file.
 # Idempotent.
 python3 << 'PYPATCH_CUTLASS_WEIGHTLOADER'
+
+# --- PYPATCH_HAS_CUTEDSL_QUACK ------------------------------------------------
+# vllm/utils/import_utils.py has_cutedsl() reports capability from `cutlass` alone,
+# but every cutedsl code path also imports `quack` -- e.g.
+# models/deepseek_v4/nvidia/ops/fused_indexer_q_cutedsl.py does
+# `from quack.compile_utils import make_fake_tensor`. On this container (cute-dsl
+# present, quack absent) the check returns True, the guarded lazy import then
+# raises ModuleNotFoundError INSIDE the attention forward, and every worker dies.
+# Verified on-cluster 2026-08-19 (job 2043640, DeepSeek-V4-Flash).
+#
+# Installing quack is not an option: quack-kernels 0.6.4 pins
+# nvidia-cutlass-dsl==4.6.2 while vLLM v0.27.1 pins 4.6.0 -- mutually
+# unsatisfiable, and bumping cutlass-dsl is what broke Ornith. Reporting the
+# capability honestly makes callers take their existing non-cutedsl fallback,
+# which is the same remedy as PYPATCH_LL_BF16_QUACK above.
+python3 - <<'PYEOF' || echo "  has_cutedsl patch skipped (anchor absent, OK on other vLLM versions)"
+import glob, sys
+hits = glob.glob('/usr/local/lib/python3.12/dist-packages/vllm/utils/import_utils.py')
+old = '    return _has_module("cutlass")'
+new = '    return _has_module("cutlass") and _has_module("quack")'
+for p in hits:
+    s = open(p).read()
+    if new in s:
+        print('  has_cutedsl already requires quack'); break
+    if old not in s:
+        print('  has_cutedsl anchor not found (OK)'); break
+    open(p, 'w').write(s.replace(old, new, 1))
+    print('  PYPATCH_HAS_CUTEDSL_QUACK: has_cutedsl() now also requires quack')
+PYEOF
+
 import os
 f = "/opt/vllm/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py"
 if not os.path.exists(f):
@@ -1539,6 +1569,39 @@ pip install --no-cache-dir --no-deps --root-user-action=ignore --no-build-isolat
     "git+${DEEPGEMM_REPO}@${DEEPGEMM_REF}" 2>&1 | tail -30 || {
     echo "Warning: DeepGEMM install failed. GLM-5.1 (DSA) will not be able to load;"
     echo "         other presets are unaffected. Override DEEPGEMM_REF/DEEPGEMM_REPO."
+}
+
+# tilelang — required by DeepSeek-V4's "mhc" (head-compression) attention path.
+# Without it the model loads and then dies at worker start with:
+#   ImportError: tilelang is required for mhc but is not installed.
+# (verified on-cluster 2026-08-18, job 2037091). It is a pure wheel on aarch64
+# (manylinux_2_34_aarch64 exists for 0.1.13), so this adds no compile time.
+# Installed unconditionally and failure-tolerated, exactly like DeepGEMM above:
+# it is additive for every other preset, and making it preset-conditional would
+# mean a container that serves DeepSeek only if it happened to be built for it.
+echo ""
+echo "Installing tilelang (required by DeepSeek-V4 mhc attention)..."
+# PIN to the version vLLM asks for. v0.27.1 requires tilelang==0.1.12 exactly; an
+# unpinned install resolves 0.1.13 and pip then reports it as incompatible. Bump
+# this in step with VLLM_VERSION. TILELANG_REF overrides.
+TILELANG_REF="${TILELANG_REF:-0.1.12}"
+# apache-tvm-ffi must be pinned ALONGSIDE tilelang or the two disagree and the
+# workers abort at startup with a C++ terminate, not a Python traceback:
+#   terminate called after throwing an instance of 'tvm::ffi::Error'
+#     what(): TypeAttr `__ffi_repr__` is already registered for type index 130
+# (verified on-cluster 2026-08-19, job 2043587: weights loaded fine, then all four
+# workers died during model init). The container had drifted to 0.1.12, which
+# satisfies NEITHER vLLM v0.27.1 (requires ==0.1.11) NOR tilelang 0.1.12
+# (requires <=0.1.11). flashinfer accepts anything <0.2, so 0.1.11 is the single
+# version all three agree on — pinning it brings the container back INTO
+# compliance with vLLM's own requirement rather than away from it.
+TVM_FFI_REF="${TVM_FFI_REF:-0.1.11}"
+pip install --no-cache-dir --no-deps --root-user-action=ignore "apache-tvm-ffi==${TVM_FFI_REF}" 2>&1 | tail -3 || {
+    echo "Warning: apache-tvm-ffi pin failed; tilelang/DeepSeek-V4 may abort at worker init."
+}
+pip install --no-cache-dir --no-deps --root-user-action=ignore "tilelang==${TILELANG_REF}" 2>&1 | tail -5 || {
+    echo "Warning: tilelang install failed. DeepSeek-V4 will not load (mhc path);"
+    echo "         all other presets are unaffected."
 }
 
 # vLLM main (post-v0.20) ships a Rust frontend under vllm/vllm-rs (tokenizer,

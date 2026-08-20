@@ -93,6 +93,22 @@
       "storage": "projects",
       "description": "Borealis 27B (National Library of Norway) Norwegian-centric instruct model, Gemma-3 arch, BF16 ~54 GB on a SINGLE GH200 (TP=1), multimodal SigLIP tower, 128K ctx. Shares the glm53 container"
     },
+    "dsv4flash": {
+      "aliases": ["deepseek-v4-flash", "dsv4", "deepseek_v4_flash", "v4flash"],
+      "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+      "nodes": 1, "gpus": 4, "pp": 1,
+      "container_prefix": "glm53", "index": 1,
+      "storage": "work",
+      "description": "DeepSeek-V4-Flash-0731 MoE (256+1 experts, 6 active), block-FP8 ~167 GB, 1 node TP=4, 1M ctx via YaRN. ⚠️ BLOCKED on vLLM v0.27.1 + NGC 26.07: its compressor unconditionally uses cutedsl at head_dim=512 on CUDA, which needs `quack`, and quack-kernels pins nvidia-cutlass-dsl==4.6.2 against vLLM 4.6.0 — unsatisfiable. Preset kept for a future vLLM. See README"
+    },
+    "lagunas21": {
+      "aliases": ["laguna-s-2.1", "laguna_s21", "lagunas", "laguna-s"],
+      "model": "poolside/Laguna-S-2.1-FP8",
+      "nodes": 1, "gpus": 4, "pp": 1,
+      "container_prefix": "glm53", "index": 1,
+      "storage": "work",
+      "description": "Laguna S 2.1 (Poolside) MoE (256 experts, 10 active), FP8 ~131 GB, 1 node TP=4, 1M ctx, alternating full/sliding-window attn. Speculative decode via the separate DFlash draft (vLLM registers DFlashLagunaForCausalLM). Shares the glm53 container"
+    },
     "qwen38": {
       "aliases": ["qwen3.8", "qwen38-27b", "qwen3.8-27b", "qwen38_gh200"],
       "model": "Qwen/Qwen3.8-27B-FP8",

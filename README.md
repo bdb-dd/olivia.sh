@@ -296,6 +296,50 @@ Loaded in **45 s to healthy** — the fastest startup here, since BF16 skips deq
 
 > ⚠️ **The attention backend must be auto-selected, never forced to `FLASH_ATTN`.** Job 2032118 died at engine init in 110 s with `ValueError: Selected backend AttentionBackendEnum.FLASH_ATTN is not valid ... Reason: ['mm_prefix (PrefixLM bidirectional attention) requires FlashAttention v4, which does not resolve for this head_size']`. Gemma 3's **text** path is ordinary sliding-window + full attention, but its **vision tower** makes the config multimodal PrefixLM — the image prefix gets bidirectional attention — and vLLM only serves that via FA4, an SM100/Blackwell path unavailable at this head size on Hopper. **This bites even though we only ever send text.** Fixed by leaving `VLLM_ATTENTION_BACKEND` unset.
 
+### DeepSeek-V4-Flash-0731 (`dsv4flash`) — BLOCKED, does not serve on this stack · 2026-08-19
+Six attempts, five distinct blockers, ~1 GPU-h total. **It never served a token.** Recorded here because each blocker is real, four are fixed and committed, and the fifth is structural.
+
+| # | Blocker | Status |
+|---|---|---|
+| 1 | `AssertionError: DeepseekV4 fp8_ds_mla layout only supports fp8 kv-cache, got auto` | **Fixed** — `KV_CACHE_DTYPE=fp8` default. Note this is the *exact inverse* of GLM-5.2, which on Hopper cannot use fp8 KV at all |
+| 2 | `KeyError: 'model.layers.43.mtp_block.main_norm.weight'` | **Fixed** (MTP → opt-in). The head IS shipped — 4705 `mtp.*` tensors — but as `mtp.0.*` where v0.27.1 expects `model.layers.<N>.mtp_block.*`. **Tensor presence ≠ loadable** |
+| 3 | `ImportError: tilelang is required for mhc` | **Fixed** — `tilelang==0.1.12` pinned in the build |
+| 4 | `tvm::ffi::Error: TypeAttr __ffi_repr__ already registered` (C++ abort, no Python traceback) | **Fixed** — `apache-tvm-ffi==0.1.11`, the one version vLLM, tilelang and flashinfer all accept |
+| 5 | `ModuleNotFoundError: No module named 'quack'` | **UNFIXABLE HERE** |
+
+> 🚧 **Why blocker 5 is structural, not another patch.** There are two quack import paths. The first (`fused_indexer_q.py`) is guarded by `has_cutedsl()`, which under-reports — it checks `cutlass` but every cutedsl path also imports `quack` — so making the check honest routes it to an existing fallback (`PYPATCH_HAS_CUTEDSL_QUACK`, same bug class as Ornith's `ll_bf16` check). The second, `deepseek_v4/compressor.py:423`, has **no capability gate and no fallback**; its own comment states *"head=512 on CUDA always uses cutedsl"*. So quack is mandatory, and it cannot be installed: `quack-kernels` 0.6.4 pins `nvidia-cutlass-dsl==4.6.2`, vLLM v0.27.1 pins **4.6.0**, the container has **4.5.2**. No version satisfies all three, and bumping cutlass-dsl is what broke Ornith. **Retry on a vLLM release whose cutlass-dsl pin matches quack-kernels'** — the preset and all four fixes are committed and ready.
+
+### Laguna S 2.1 (`lagunas21`) — 1 node × 4 GH200, FP8, TP=4 · 2026-08-18
+`bench_sweep.py`, `max_tokens=512`, **warm pass**. **KV cache 3,190,414 tokens.**
+
+**Concurrency at short context (~74 prompt tokens):**
+
+| Concurrency | 1 | 2 | 4 | 8 | 16 | 32 | 64 | 96 | 128 |
+|---|---|---|---|---|---|---|---|---|---|
+| Aggregate tok/s | 192.7 | 339.0 | 614.8 | 1105.1 | 1867.9 | 3132.4 | 5229.5 | 6362.3 | **7750.9** |
+| Per-stream tok/s | 192.8 | 169.7 | 153.8 | 138.3 | 116.9 | 98.2 | 82.3 | 66.9 | 61.6 |
+| p95 TTFT (s) | 0.03 | 0.04 | 0.04 | 0.04 | 0.05 | 0.07 | 0.11 | 0.14 | 0.22 |
+| Failures | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+
+**The fastest preset here: ~193 tok/s single-stream and 7751 tok/s aggregate at 128-way, 0 failures throughout, p95 TTFT ≤0.22 s.** For scale, qwen38 peaks at 3162 @64 and Borealis at 2666 @64 — though both are 1-GPU presets against this one's 4, so *per GPU* qwen38 is still ahead on aggregate. **128 is not the ceiling**: aggregate was still climbing (6362 → 7751) and per-stream fell only 8% from 96 to 128, so the top end has not saturated.
+
+**Context ladder (the result that matters)**, `--prompt-tokens` calibrated to the real tokenizer, `MAX_MODEL_LEN=524288` for the 200K/500K rungs:
+
+| Context (actual prompt tokens) | c=1 agg | c=1 per-stream | c=1 TTFT | c=16 agg | c=16 per-stream | c=16 p95 TTFT | fails |
+|---|---|---|---|---|---|---|---|
+| 74 | 192.7 | 192.8 | 0.03 s | 1867.9 | 116.9 | 0.05 s | 0 |
+| 15,975 (16K) | 184.6 | 187.8 | 0.08 s | 807.7 | 53.7 | 4.49 s | 0 |
+| 99,474 (100K) | 69.8 | 91.8 | 2.73 s | 118.3 | 11.9 | 36.95 s | 0 |
+| 198,873 (200K) | 29.9 | 47.0 | 7.86 s | 36.6 | 4.3 | 111.54 s | 0 |
+| 497,074 (500K) | 7.3 | 15.3 | 29.88 s | **7.6** | **1.1** | **465.62 s** | 0 |
+
+> 🔥 **Context, not concurrency, is the dominant cost — and it invalidates reading any short-context headline as a general result.** Across the ladder at 16-way, aggregate throughput falls from **1867.9 → 7.6 tok/s** (246×) and p95 TTFT rises from **0.05 s → 465.6 s** (9300×, i.e. 7.8 minutes to first token). Single-stream falls 192.8 → 15.3 tok/s (−92%). The full spread between this preset's best number (7751 tok/s at 128-way, ~74 tokens) and its worst (7.6 tok/s at 16-way, 500K) is over **1000×**. **Zero failures anywhere** — it never breaks, it just degrades until it is a different service.
+
+> ⚠️ **"Maximum viable length" has three distinct answers, and only one is a hard limit.**
+> 1. **Window** — `max_model_len`. A request past it is **rejected with HTTP 400**, not truncated. This is the only genuine wall, and it is a *config* choice here: Laguna S is natively 1M, but the `IS_LAGUNA` default caps it at 131072, so a 100K-target request that tokenises to ~178K gets a 400 until you raise it.
+> 2. **KV capacity** — 4,024,015 tokens at a 512K window; vLLM reports "Maximum concurrency for 524,288 tokens per request: 7.68x". **This is NOT an admission limit.** I predicted 500K×16 (8M needed) was arithmetically impossible; it ran anyway, with 0 failures, because vLLM schedules the excess in waves rather than refusing it. The cost surfaces as queueing latency, not errors.
+> 3. **Latency tolerance** — the real operational limit. Laguna S will happily serve 500K×16 at 1.1 tok/s per stream with ~8 minutes to first token. Nothing fails; it is simply unusable for interactive work. Pick the rung by the latency you can accept, not by what the server will admit.
+
 ### Qwen3.8 27B (`qwen38`) — 27B dense on 1× GH200, block-FP8, PIECEWISE capture · 2026-08-18
 `bench_sweep.py`, `max_tokens=512`, **warm pass** (a discarded warmup pass runs first — see the JIT note below).
 

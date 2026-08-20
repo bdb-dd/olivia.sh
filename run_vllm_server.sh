@@ -162,6 +162,16 @@ QWEN38_REASONING_PARSER="${QWEN38_REASONING_PARSER:-qwen3}"
 # Set QWEN38_GDN_PREFILL_BACKEND=triton to force the in-tree Triton/FLA kernel if
 # the flashinfer GDN path misbehaves — that is the known-good Ornith fallback.
 QWEN38_GDN_PREFILL_BACKEND="${QWEN38_GDN_PREFILL_BACKEND:-}"
+# --- DeepSeek-V4-Flash (deepseek-ai, MIT) ---------------------------------
+# vLLM v0.27.1 ships DEDICATED deepseek_v4 tool + reasoning parsers (verified in
+# the installed container, not guessed).
+DSV4_TOOL_PARSER="${DSV4_TOOL_PARSER:-deepseek_v4}"
+DSV4_REASONING_PARSER="${DSV4_REASONING_PARSER:-deepseek_v4}"
+# MTP draft depth. The checkpoint REALLY ships the head — 4705 `mtp.*` tensors of
+# 72317 verified in the downloaded weight_map (e.g. mtp.0.hc_attn_base) — and
+# config declares num_nextn_predict_layers=1, so unlike Ornith this is not a
+# config-only claim. Tune 1-3 and watch the accept rate.
+DSV4_MTP_SPECULATIVE_TOKENS="${DSV4_MTP_SPECULATIVE_TOKENS:-2}"
 # ENABLE_AUTO_TOOL_CHOICE default is model-dependent and gets resolved after
 # GLM detection below: 1 for GLM MoE models (tool parser is always set),
 # 0 elsewhere. Users can still override explicitly.
@@ -483,6 +493,24 @@ if [[ "${MODEL}" == *"borealis"* ]] || [[ "${MODEL}" == *"Borealis"* ]]; then
     IS_BOREALIS=1
 fi
 
+# Detect DeepSeek-V4-Flash. VERIFIED from the published config + the downloaded
+# checkpoint (2026-08-18), not the model card:
+#   - arch `DeepseekV4ForCausalLM`, model_type `deepseek_v4`, 43 layers, MoE with
+#     256 routed + 1 shared expert, 6 active per token. Registered natively in
+#     vLLM v0.27.1, so no build is needed.
+#   - 1,048,576 context via YaRN (factor 16 over a 65,536 base).
+#   - Quant is DeepSeek-style BLOCK-FP8 ([128,128] e4m3 dynamic) → DeepGEMM lane,
+#     same as glm52, NOT Ornith's channel/token W8A8.
+#   - MLA attention → must NOT force FLASH_ATTN; vLLM auto-selects.
+#   - MTP head genuinely SHIPPED: 4705 `mtp.*` tensors of 72317 in the weight_map
+#     (mtp.0.hc_attn_base, ...), and vLLM registers DeepSeekV4MTPModel. This is a
+#     verified-present head, so MTP is left ON by default here — the opposite call
+#     from Ornith, whose FP8 declared MTP and shipped nothing.
+IS_DSV4=0
+if [[ "${MODEL}" == *"DeepSeek-V4"* ]] || [[ "${MODEL}" == *"deepseek-v4"* ]]; then
+    IS_DSV4=1
+fi
+
 # Kimi K2.6's fused MLA op (vllm.min_latency_fused_qkv_a_proj) has no fake/meta
 # dispatch, so vLLM's torch.compile/CUDAGraph path fails during profile_run on
 # this multi-node PP setup ("Multiple dispatch failed ... NotImplemented", from
@@ -541,7 +569,7 @@ fi
 # any OpenAI tool-using client (Claude Code via anthropic_proxy.py, etc.).
 # ``${VAR+x}`` distinguishes "user explicitly set (even to 0)" from "unset".
 if [[ -z "${ENABLE_AUTO_TOOL_CHOICE+x}" ]]; then
-    if [[ "${IS_GLM_MOE}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" || "${IS_ORNITH}" == "1" || "${IS_QWEN38}" == "1" ]]; then
+    if [[ "${IS_GLM_MOE}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" || "${IS_ORNITH}" == "1" || "${IS_QWEN38}" == "1" || "${IS_DSV4}" == "1" ]]; then
         ENABLE_AUTO_TOOL_CHOICE=1
     else
         ENABLE_AUTO_TOOL_CHOICE=0
@@ -553,7 +581,12 @@ fi
 # matches typical Claude Code usage (which requests max_tokens=32000).
 # Other models keep the conservative 32K default.
 if [[ -z "${MAX_MODEL_LEN+x}" ]]; then
-    if [[ "${IS_BOREALIS}" == "1" ]]; then
+    if [[ "${IS_DSV4}" == "1" ]]; then
+        # Native window is 1,048,576 (YaRN x16). Default to 131072: the full 1M
+        # would consume the entire KV budget for a single sequence. Raise it
+        # explicitly for long-context runs (the context ladder does exactly that).
+        MAX_MODEL_LEN=131072
+    elif [[ "${IS_BOREALIS}" == "1" ]]; then
         # Gemma-3 27B BF16 is ~54 GB of a 96 GB card, and Gemma 3 interleaves
         # sliding-window layers with full-attention ones so the KV cache stays
         # modest — the full native 131072 window fits comfortably. Lower this if
@@ -665,6 +698,26 @@ if [[ "${IS_QWEN38}" == "1" && "${IS_AWQ}" == "0" ]]; then
     export VLLM_USE_FLASHINFER_MOE_FP8=0
 fi
 
+# DeepSeek-V4-Flash block-FP8: same DeepGEMM lane as glm52/qwen38.
+if [[ "${IS_DSV4}" == "1" && "${IS_AWQ}" == "0" ]]; then
+    if [[ "${VLLM_USE_DEEP_GEMM_EXPLICIT}" == "0" ]]; then
+        export VLLM_USE_DEEP_GEMM=1
+    fi
+    export VLLM_DEEP_GEMM_WARMUP="${VLLM_DEEP_GEMM_WARMUP:-skip}"
+    # fp8 KV cache is MANDATORY, not an optimisation. DeepSeek-V4's attention uses
+    # the fp8_ds_mla layout, which refuses anything else — verified on-cluster
+    # 2026-08-18 (job 2036910 died at worker start in 2m37s):
+    #   AssertionError: DeepseekV4 fp8_ds_mla layout only supports fp8 kv-cache,
+    #   got auto
+    # Note this is the EXACT OPPOSITE of GLM-5.2 on this hardware, where forcing
+    # fp8 KV makes the attention selector reject every backend (FLASHMLA_SPARSE
+    # on Hopper does not support it). Same MLA family, inverted requirement — so
+    # do not generalise a KV-dtype rule across the DSA/MLA models.
+    # Useful side effect: fp8 KV roughly halves per-token cache cost, which is
+    # what makes the long-context ladder reach further on this model.
+    KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+fi
+
 # --- GLM-5.2-family multi-node bits that are QUANT-INDEPENDENT --------------
 # These two used to live inside the `IS_AWQ == 0` branch above, which was fine
 # while block-FP8 was the only GLM-5.2 quant. It no longer is: a complete
@@ -715,7 +768,7 @@ fi
 # from whatever is installed — if nothing works, the error will tell us what
 # to install.
 if [[ -z "${VLLM_ATTENTION_BACKEND}" ]]; then
-    if [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_ORNITH}" == "1" || "${IS_QWEN38}" == "1" || "${IS_BOREALIS}" == "1" ]]; then
+    if [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_ORNITH}" == "1" || "${IS_QWEN38}" == "1" || "${IS_BOREALIS}" == "1" || "${IS_DSV4}" == "1" ]]; then
         # Don't force FLASH_ATTN — these need vLLM to auto-select a special backend:
         #   Qwen3.8  HYBRID, same as Ornith (48 linear-attn + 16 full layers).
         #   Borealis (Gemma 3) MULTIMODAL PrefixLM. Forcing FLASH_ATTN here is a
@@ -779,6 +832,23 @@ elif [[ "${ENABLE_SPECULATIVE}" == "auto" ]]; then
     if [[ "${IS_GLM_MOE}" == "1" ]]; then
         USE_SPECULATIVE=1
         echo "[INFO] Auto-enabling MTP speculative decoding for GLM MoE model"
+    fi
+    # DeepSeek-V4-Flash: MTP is OPT-IN, despite the head being present.
+    #
+    # The checkpoint genuinely ships it — 4705 `mtp.*` tensors of 72317 in the
+    # weight_map (mtp.0.hc_attn_base, ...) — and vLLM registers DeepSeekV4MTPModel.
+    # I auto-enabled it on that basis and it FAILED on-cluster 2026-08-18
+    # (job 2036966, 3m20s):
+    #     KeyError: 'model.layers.43.mtp_block.main_norm.weight'
+    # v0.27.1's loader expects the head at model.layers.<N>.mtp_block.*, but this
+    # 0731 checkpoint stores it as mtp.0.* — the weights are there, in a layout
+    # this vLLM cannot map. So TENSOR PRESENCE IS NECESSARY BUT NOT SUFFICIENT:
+    # Ornith taught that a config claim needs checking against the weight_map, and
+    # this teaches that the weight_map needs checking against the loader's naming.
+    # Re-test with ENABLE_SPECULATIVE=1 after a vLLM bump; if the KeyError persists
+    # the layouts have genuinely diverged and it needs an upstream fix.
+    if [[ "${IS_DSV4}" == "1" && "${ENABLE_SPECULATIVE}" == "auto" ]]; then
+        echo "[INFO] DeepSeek-V4: MTP OFF (head present as mtp.0.* but v0.27.1 expects model.layers.N.mtp_block.*). ENABLE_SPECULATIVE=1 to retry."
     fi
     # Ornith is intentionally NOT auto-on: its config declares mtp_num_hidden_layers=1
     # but the published FP8 checkpoints ship NO MTP weights (verified on-cluster),
@@ -1158,6 +1228,9 @@ if [[ "${USE_SPECULATIVE}" == "1" ]]; then
     if [[ "${IS_GLM_MOE}" == "1" ]]; then
         # GLM-4.7/GLM-5.1 use MTP (Multi-Token Prediction) speculative decoding
         SPEC_CONFIG='{"method": "mtp", "num_speculative_tokens": '${MTP_SPECULATIVE_TOKENS}'}'
+    elif [[ "${IS_DSV4}" == "1" ]]; then
+        # DeepSeek-V4 native MTP head (verified present in the checkpoint).
+        SPEC_CONFIG='{"method": "mtp", "num_speculative_tokens": '${DSV4_MTP_SPECULATIVE_TOKENS}'}'
     elif [[ "${IS_ORNITH}" == "1" ]]; then
         # Ornith (qwen3_5_moe) ships a native MTP module — vLLM's generic "mtp"
         # method loads it and drafts from the model's own head, no draft model.
@@ -1286,6 +1359,15 @@ if [[ "${IS_ORNITH}" == "1" ]]; then
     if [[ -n "${ORNITH_GDN_PREFILL_BACKEND}" ]]; then
         VLLM_ARGS+=("--additional-config" "{\"gdn_prefill_backend\": \"${ORNITH_GDN_PREFILL_BACKEND}\"}")
     fi
+fi
+
+# DeepSeek-V4-Flash serve arguments.
+if [[ "${IS_DSV4}" == "1" ]]; then
+    [[ -n "${DSV4_TOOL_PARSER}" ]] && VLLM_ARGS+=("--tool-call-parser" "${DSV4_TOOL_PARSER}")
+    [[ -n "${DSV4_REASONING_PARSER}" ]] && VLLM_ARGS+=("--reasoning-parser" "${DSV4_REASONING_PARSER}")
+    [[ "${ENABLE_AUTO_TOOL_CHOICE}" == "1" ]] && VLLM_ARGS+=("--enable-auto-tool-choice")
+    [[ -n "${SERVED_MODEL_NAME}" ]] && VLLM_ARGS+=("--served-model-name" "${SERVED_MODEL_NAME}")
+    VLLM_ARGS+=("--trust-remote-code")
 fi
 
 # Qwen3.8 27B dense — same Qwen3.5 parser family as Ornith, different shape.
@@ -1515,6 +1597,63 @@ if [[ "${MULTINODE_UNSET_CVD:-0}" == "1" ]]; then
 else
     _CVD_ENV=(--env "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}")
     _SING_PREFIX=()
+fi
+
+# =============================================================================
+# Idle watchdog — cancel this job if the server is up but nobody is using it
+# =============================================================================
+# THE most expensive failure mode on this cluster is not a crash. A crash dies in
+# 2-5 minutes and costs almost nothing. A server that comes up CORRECTLY and then
+# receives no requests holds 100% of its allocation at 0% utilisation until
+# walltime. Measured over 2026-08-17..19: six failed starts cost ~1.5 GPU-h in
+# total, while TWO healthy-but-unattended servers cost 11 GPU-h — roughly 63% of
+# all GPU time spent. Causes were mundane: an SSH master dropped mid-benchmark,
+# and a benchmark driven by hand from a session that was not attached.
+#
+# run_proxy.sh has had ROUTER_EMPTY_TIMEOUT auto-spindown for a while — on the CPU
+# router, which costs 2 CPUs. The GPU servers, at 4-12x the price, had nothing.
+# This closes that gap.
+#
+# The watchdog only starts counting AFTER /health returns 200, so a long model load
+# (Kimi and the 400 GB models take 10+ minutes) is never mistaken for idleness. It
+# tracks vLLM's monotonic generation-token counter plus the running-request gauge;
+# idle means both "no tokens produced since last check" and "nothing running".
+#
+#   IDLE_TIMEOUT=<seconds>   default 1200 (20 min). 0 DISABLES — use that for a
+#                            server deliberately left up for interactive work.
+IDLE_TIMEOUT="${IDLE_TIMEOUT:-1200}"
+if [[ "${IDLE_TIMEOUT}" =~ ^[0-9]+$ ]] && [[ "${IDLE_TIMEOUT}" -gt 0 ]] && [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    (
+        _wd_curl() { curl -s --noproxy '*' -m 5 "$@" 2>/dev/null; }
+        # Wait for readiness. Deliberately generous (90 min): a slow load must not
+        # be cancelled, and if the server never comes up the JOB dies by itself.
+        for _ in $(seq 1 540); do
+            [ "$(_wd_curl -o /dev/null -w '%{http_code}' "http://localhost:${PORT}/health")" = "200" ] && break
+            sleep 10
+        done
+        [ "$(_wd_curl -o /dev/null -w '%{http_code}' "http://localhost:${PORT}/health")" = "200" ] || exit 0
+        echo "[watchdog] server ready; will cancel job ${SLURM_JOB_ID} after ${IDLE_TIMEOUT}s with no activity"
+        _last_tokens=""; _idle=0
+        while sleep 60; do
+            _m=$(_wd_curl "http://localhost:${PORT}/metrics")
+            [ -z "${_m}" ] && continue   # transient scrape failure is not idleness
+            _tok=$(echo "${_m}" | awk '/^vllm:generation_tokens_total/{s+=$2} END{printf "%.0f", s+0}')
+            _run=$(echo "${_m}" | awk '/^vllm:num_requests_running/{s+=$2} END{printf "%.0f", s+0}')
+            if [ "${_tok}" != "${_last_tokens}" ] || [ "${_run}" != "0" ]; then
+                _idle=0; _last_tokens="${_tok}"
+            else
+                _idle=$((_idle + 60))
+                if [ "${_idle}" -ge "${IDLE_TIMEOUT}" ]; then
+                    echo "[watchdog] no activity for ${_idle}s — cancelling job ${SLURM_JOB_ID} to stop burning allocation"
+                    scancel "${SLURM_JOB_ID}"
+                    exit 0
+                fi
+            fi
+        done
+    ) &
+    echo "[$(date '+%H:%M:%S')] Idle watchdog armed (IDLE_TIMEOUT=${IDLE_TIMEOUT}s; set 0 to disable)"
+else
+    echo "[$(date '+%H:%M:%S')] Idle watchdog DISABLED (IDLE_TIMEOUT=${IDLE_TIMEOUT:-unset}) — job will hold its allocation until walltime"
 fi
 
 # Build shared singularity command array (used by both single-node and multi-node paths)

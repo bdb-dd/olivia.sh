@@ -38,103 +38,322 @@
   },
   "presets": {
     "glm51_v19": {
-      "aliases": ["glm51", "glm-5.1", "glm5.1"],
+      "aliases": [
+        "glm51",
+        "glm-5.1",
+        "glm5.1"
+      ],
       "model": "cyankiwi/GLM-5.1-AWQ-4bit",
-      "nodes": 2, "gpus": 4, "pp": 2,
-      "container_prefix": "glm51", "index": 1,
+      "nodes": 2,
+      "gpus": 4,
+      "pp": 2,
+      "container_prefix": "glm51",
+      "index": 1,
       "storage": "work",
       "description": "GLM-5.1 744B MoE+DSA, AWQ-4bit, vLLM v0.19.0 (recipe default)"
     },
     "glm51_v20": {
       "aliases": [],
       "model": "cyankiwi/GLM-5.1-AWQ-4bit",
-      "nodes": 2, "gpus": 4, "pp": 2,
-      "container_prefix": "glm51", "index": 2,
+      "nodes": 2,
+      "gpus": 4,
+      "pp": 2,
+      "container_prefix": "glm51",
+      "index": 2,
       "storage": "work",
       "description": "GLM-5.1 on vLLM v0.20.0 + RayExecutorV2 (quarantined; same wedge)"
     },
     "glm52": {
-      "aliases": ["glm-5.2", "glm5.2"],
+      "aliases": [
+        "glm-5.2",
+        "glm5.2"
+      ],
       "model": "RedHatAI/GLM-5.2-FP8",
-      "nodes": 3, "gpus": 4, "pp": 3,
-      "container_prefix": "glm52", "index": 1,
+      "nodes": 3,
+      "gpus": 4,
+      "pp": 3,
+      "container_prefix": "glm52",
+      "index": 1,
       "storage": "work",
       "description": "GLM-5.2 744B MoE+DSA, block-FP8, 3-node TP=4+PP=3"
     },
+    "glm52_awq": {
+      "aliases": [
+        "glm-5.2-awq",
+        "glm5.2-awq",
+        "glm52-awq",
+        "glm52awq"
+      ],
+      "model": "cyankiwi/GLM-5.2-AWQ-INT4",
+      "nodes": 2,
+      "gpus": 4,
+      "pp": 2,
+      "container_prefix": "glm52",
+      "index": 1,
+      "storage": "projects",
+      "description": "GLM-5.2 744B MoE+DSA, AWQ-INT4 (~415 GiB), 2-node TP=4+PP=2 (reuses the glm52 container; persistent tier). VALIDATED on the glm52 container; the glm53/v0.27.1 container is an untested alternative (PR#45895 native there rather than grafted)."
+    },
+    "glm53": {
+      "aliases": [
+        "glm-5.3",
+        "glm5.3"
+      ],
+      "model": "zai-org/GLM-5.3-FP8",
+      "nodes": 3,
+      "gpus": 4,
+      "pp": 3,
+      "container_prefix": "glm52",
+      "index": 1,
+      "storage": "work",
+      "description": "GLM-5.3 744B MoE+DSA, block-FP8, 3-node TP=4+PP=3 — GLM-5.2's base re-post-trained, so it REUSES the glm52 container (no rebuild). Weights unreleased as of 2026-08-17"
+    },
+    "glm53_v27": {
+      "aliases": [
+        "glm53-v27",
+        "glm-5.3-v27",
+        "glm53v27"
+      ],
+      "model": "zai-org/GLM-5.3-FP8",
+      "nodes": 3,
+      "gpus": 4,
+      "pp": 3,
+      "container_prefix": "glm53",
+      "index": 1,
+      "storage": "work",
+      "description": "GLM-5.3 on a modern vLLM release (v0.27.1 + NGC 26.07, no PR graft) — own container, the upgrade path off glm52's pinned-main build"
+    },
+    "borealis": {
+      "aliases": [
+        "borealis-27b",
+        "borealis27b",
+        "nb-borealis"
+      ],
+      "model": "NbAiLab/borealis-27b",
+      "nodes": 1,
+      "gpus": 1,
+      "pp": 1,
+      "container_prefix": "glm53",
+      "index": 1,
+      "storage": "projects",
+      "description": "Borealis 27B (National Library of Norway) Norwegian-centric instruct model, Gemma-3 arch, BF16 ~54 GB on a SINGLE GH200 (TP=1), multimodal SigLIP tower, 128K ctx. Shares the glm53 container"
+    },
+    "dsv4flash": {
+      "aliases": [
+        "deepseek-v4-flash",
+        "dsv4",
+        "deepseek_v4_flash",
+        "v4flash"
+      ],
+      "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+      "nodes": 1,
+      "gpus": 4,
+      "pp": 1,
+      "container_prefix": "glm53",
+      "index": 1,
+      "storage": "work",
+      "description": "DeepSeek-V4-Flash-0731 MoE (256+1 experts, 6 active), block-FP8 ~167 GB, 1 node TP=4, 1M ctx via YaRN. ⚠️ BLOCKED on vLLM v0.27.1 + NGC 26.07: its compressor unconditionally uses cutedsl at head_dim=512 on CUDA, which needs `quack`, and quack-kernels pins nvidia-cutlass-dsl==4.6.2 against vLLM 4.6.0 — unsatisfiable. Preset kept for a future vLLM. See README"
+    },
+    "lagunas21": {
+      "aliases": [
+        "laguna-s-2.1",
+        "laguna_s21",
+        "lagunas",
+        "laguna-s"
+      ],
+      "model": "poolside/Laguna-S-2.1-FP8",
+      "nodes": 1,
+      "gpus": 4,
+      "pp": 1,
+      "container_prefix": "glm53",
+      "index": 1,
+      "storage": "work",
+      "description": "Laguna S 2.1 (Poolside) MoE (256 experts, 10 active), FP8 ~131 GB, 1 node TP=4, 1M ctx, alternating full/sliding-window attn. Speculative decode via the separate DFlash draft (vLLM registers DFlashLagunaForCausalLM). Shares the glm53 container"
+    },
+    "qwen38": {
+      "aliases": [
+        "qwen3.8",
+        "qwen38-27b",
+        "qwen3.8-27b",
+        "qwen38_gh200"
+      ],
+      "model": "Qwen/Qwen3.8-27B-FP8",
+      "nodes": 1,
+      "gpus": 1,
+      "pp": 1,
+      "container_prefix": "glm53",
+      "index": 1,
+      "storage": "projects",
+      "description": "Qwen3.8 27B DENSE multimodal (Qwen3_5ForConditionalGeneration), block-FP8 ~30 GB on a SINGLE GH200 card (TP=1), hybrid linear+full attn, 262K ctx. Shares the glm53 container — vLLM v0.27.1 registers this arch natively"
+    },
     "glm47": {
-      "aliases": ["glm-4.7"],
+      "aliases": [
+        "glm-4.7"
+      ],
       "model": "QuantTrio/GLM-4.7-AWQ",
-      "nodes": 1, "gpus": 4, "pp": 1,
-      "container_prefix": "glm47", "index": 1,
+      "nodes": 1,
+      "gpus": 4,
+      "pp": 1,
+      "container_prefix": "glm47",
+      "index": 1,
       "description": "GLM-4.7 358B, AWQ, single-node TP=4"
     },
     "kimi": {
-      "aliases": ["kimi26", "kimi-k2.6", "kimi_k26"],
+      "aliases": [
+        "kimi26",
+        "kimi-k2.6",
+        "kimi_k26"
+      ],
       "model": "moonshotai/Kimi-K2.6",
-      "nodes": 2, "gpus": 4, "pp": 2,
-      "container_prefix": "kimi", "index": 4,
+      "nodes": 2,
+      "gpus": 4,
+      "pp": 2,
+      "container_prefix": "kimi",
+      "index": 4,
       "storage": "work",
       "description": "Kimi K2.6 1T MoE (32B active), native int4, MLA, multimodal"
     },
     "kimi27": {
-      "aliases": ["kimi-k2.7", "kimi_k27", "kimi-k2.7-code", "kimi27code"],
+      "aliases": [
+        "kimi-k2.7",
+        "kimi_k27",
+        "kimi-k2.7-code",
+        "kimi27code"
+      ],
       "model": "moonshotai/Kimi-K2.7-Code",
-      "nodes": 2, "gpus": 4, "pp": 2,
-      "container_prefix": "kimi", "index": 4,
+      "nodes": 2,
+      "gpus": 4,
+      "pp": 2,
+      "container_prefix": "kimi",
+      "index": 4,
       "storage": "work",
       "description": "Kimi K2.7-Code 1T MoE (32B active), native int4 (reuses kimi container)"
     },
     "laguna": {
-      "aliases": ["laguna-m1", "laguna_m1", "lagunam1", "laguna-m.1", "laguna_m.1"],
+      "aliases": [
+        "laguna-m1",
+        "laguna_m1",
+        "lagunam1",
+        "laguna-m.1",
+        "laguna_m.1"
+      ],
       "model": "poolside/Laguna-M.1-FP8",
-      "nodes": 1, "gpus": 4, "pp": 1,
-      "container_prefix": "laguna", "index": 1,
+      "nodes": 1,
+      "gpus": 4,
+      "pp": 1,
+      "container_prefix": "laguna",
+      "index": 1,
       "storage": "projects",
       "description": "Laguna M.1 225B MoE (23B active), block-FP8, single-node TP=4, CUDAGraph on"
     },
     "ornith": {
-      "aliases": ["ornith-397b", "ornith-1.0-397b", "ornith397b", "ornith-1.0", "ornith-flagship"],
+      "aliases": [
+        "ornith-397b",
+        "ornith-1.0-397b",
+        "ornith397b",
+        "ornith-1.0",
+        "ornith-flagship"
+      ],
       "model": "deepreinforce-ai/Ornith-1.0-397B-FP8",
-      "nodes": 2, "gpus": 4, "pp": 2,
-      "container_prefix": "ornith", "index": 1,
+      "nodes": 2,
+      "gpus": 4,
+      "pp": 2,
+      "container_prefix": "ornith",
+      "index": 1,
       "storage": "work",
       "description": "Ornith 1.0 397B MoE (Qwen3.5) flagship, block-FP8 (~400 GB), 2-node TP=4+PP=2, native MTP (PP-gated), 256K ctx"
     },
     "ornith_gh200": {
-      "aliases": ["ornith-gh200", "ornith-1gpu", "ornith-solo", "ornith-35b", "ornith-1.0-35b", "ornith35b"],
+      "aliases": [
+        "ornith-gh200",
+        "ornith-1gpu",
+        "ornith-solo",
+        "ornith-35b",
+        "ornith-1.0-35b",
+        "ornith35b"
+      ],
       "model": "deepreinforce-ai/Ornith-1.0-35B-FP8",
-      "nodes": 1, "gpus": 1, "pp": 1,
-      "container_prefix": "ornith", "index": 1,
+      "nodes": 1,
+      "gpus": 1,
+      "pp": 1,
+      "container_prefix": "ornith",
+      "index": 1,
       "storage": "projects",
       "description": "Ornith 1.0 35B MoE (Qwen3.5, ~3B active) FP8 on a SINGLE GH200 card (TP=1), MTP on, 256K ctx — max single-user throughput (shares the ornith container)"
     },
     "devstral": {
-      "aliases": ["mistral"],
+      "aliases": [
+        "mistral"
+      ],
       "model": "mistralai/Devstral-2-123B-Instruct-2512",
-      "nodes": 1, "gpus": 4, "pp": 1,
-      "container_prefix": "devstral", "index": 1,
+      "nodes": 1,
+      "gpus": 4,
+      "pp": 1,
+      "container_prefix": "devstral",
+      "index": 1,
       "description": "Devstral 2 123B, single-node TP=4"
     },
     "llama": {
-      "aliases": ["llama3"],
+      "aliases": [
+        "llama3"
+      ],
       "model": "meta-llama/Llama-3.3-70B-Instruct",
-      "nodes": 1, "gpus": 4, "pp": 1,
-      "container_prefix": "llama", "index": 1,
+      "nodes": 1,
+      "gpus": 4,
+      "pp": 1,
+      "container_prefix": "llama",
+      "index": 1,
       "description": "Llama 3.3 70B Instruct, single-node TP=4"
     },
     "qwen": {
-      "aliases": ["qwen2"],
+      "aliases": [
+        "qwen2"
+      ],
       "model": "Qwen/Qwen2.5-72B-Instruct",
-      "nodes": 1, "gpus": 4, "pp": 1,
-      "container_prefix": "qwen", "index": 1,
+      "nodes": 1,
+      "gpus": 4,
+      "pp": 1,
+      "container_prefix": "qwen",
+      "index": 1,
       "description": "Qwen 2.5 72B Instruct, single-node TP=4"
     },
     "generic": {
       "aliases": [],
       "model": "",
-      "nodes": 1, "gpus": 4, "pp": 1,
-      "container_prefix": "generic", "index": 1,
+      "nodes": 1,
+      "gpus": 4,
+      "pp": 1,
+      "container_prefix": "generic",
+      "index": 1,
       "description": "Generic build defaults (no default model)"
+    },
+    "glm52_awq_1n": {
+      "aliases": [
+        "glm52awq1n",
+        "glm-5.2-awq-1n"
+      ],
+      "model": "cyankiwi/GLM-5.2-AWQ-INT4",
+      "nodes": 1,
+      "gpus": 4,
+      "pp": 1,
+      "container_prefix": "glm52",
+      "index": 1,
+      "storage": "projects",
+      "description": "GLM-5.2 AWQ-INT4 SINGLE-node TP=4 via Grace weight offload (--cpu-offload-gb); no PP wedge, long-context experiment. Requires CPU_OFFLOAD_GB (auto-defaults 40)."
+    },
+    "glm52_awq_mtp": {
+      "aliases": [
+        "glm52-awq-mtp",
+        "glm52awqmtp"
+      ],
+      "model": "/cluster/projects/nn10104k/models/GLM-5.2-AWQ-INT4-MTP-FP8",
+      "served_model_name": "glm52-awq-mtp",
+      "nodes": 1,
+      "gpus": 4,
+      "pp": 1,
+      "container_prefix": "glm52",
+      "index": 1,
+      "storage": "projects",
+      "description": "GLM-5.2 AWQ-INT4 body + grafted FP8 MTP layer-78 (dnhkng graft of GLM-5.2-FP8). LOCAL-PATH model. Single-node TP=4 + Grace offload + MTP spec-decode (auto-on via 'MTP' in path). Container vLLM MUST carry patches/vllm-awq-fp8-mtp-quant-config.patch (live-patch or rebuild)."
     }
   }
 }

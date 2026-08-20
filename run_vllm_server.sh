@@ -3,7 +3,18 @@
 #SBATCH --partition=accel
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=0
-#SBATCH --time=08:00:00
+#SBATCH --time=02:00:00
+# Walltime default is deliberately CONSERVATIVE (2 h), not the old 8 h.
+# An interactive serve session bills every allocated hour whether or not a
+# request ever arrives, and 8 h is long enough that an unattended job wastes
+# most of it: qwen38 job 2022174 (2026-08-17) lost the SSH master mid-bench and
+# then sat idle to the full 8 h TIMEOUT, burning ~8 GPU-hours to produce nothing.
+# Pick the limit to fit the task and pass TIME_LIMIT for anything longer:
+#   TIME_LIMIT=00:45:00 ./olivia.sh server start qwen38   # serve + one sweep
+#   TIME_LIMIT=06:00:00 ./olivia.sh server start glm52    # long soak
+# NB SLURM only lets a user LOWER a running job's limit, so raising it after
+# submit is impossible — but `scontrol update jobid=N TimeLimit=..` to shorten
+# an over-long job still works and is worth doing the moment you know.
 #SBATCH --output=logs/vllm_server_%j.log
 #SBATCH --error=logs/vllm_server_%j.log
 # NOTE: Neither --ntasks nor --gpus/--gpus-per-node are set here as #SBATCH
@@ -65,6 +76,8 @@ TP_SIZE="${TP_SIZE:-4}"                    # Tensor parallel size (per-node for 
 PP_SIZE="${PP_SIZE:-1}"                    # Pipeline parallel size (1=single-node, 2=across nodes)
 NUM_NODES="${NUM_NODES:-1}"                # Number of nodes to use (1 or 2)
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"       # GPU memory utilization
+CPU_OFFLOAD_GB="${CPU_OFFLOAD_GB:-}"       # Per-GPU weight offload to CPU/Grace LPDDR5X (GiB); empty=none
+KV_OFFLOAD_GB="${KV_OFFLOAD_GB:-}"         # Native CPU KV-cache tier (GiB, total across TP ranks); empty=none. Auto-drops expandable_segments
 # Ray compiled-DAG step timeout (seconds). Ray v2's default of 300s is too
 # short for multi-node PP inference over Slingshot: a single engine step can
 # run longer than that during big generations, and the raylet hits an
@@ -139,6 +152,28 @@ ORNITH_MTP_SPECULATIVE_TOKENS="${ORNITH_MTP_SPECULATIVE_TOKENS:-2}"
 # in-tree Triton/FLA GDN kernel so Ornith serves with NO flashinfer dependency.
 # (Verified on-cluster 2026-07-16: triton path serves; flashinfer path does not.)
 ORNITH_GDN_PREFILL_BACKEND="${ORNITH_GDN_PREFILL_BACKEND:-triton}"
+# --- Qwen3.8 27B (Alibaba, open-weighted 2026-08-13/14, Apache 2.0) -----------
+# Same Qwen 3.5 lineage as Ornith and therefore the same parser family, but a
+# DENSE 27B rather than a MoE, so it gets its own knobs.
+QWEN38_TOOL_PARSER="${QWEN38_TOOL_PARSER:-qwen3_xml}"
+QWEN38_REASONING_PARSER="${QWEN38_REASONING_PARSER:-qwen3}"
+# GDN prefill backend. Ornith is pinned to "triton" because its container had a
+# BROKEN flashinfer that the build uninstalled. That is NOT the situation here:
+# the glm53/v0.27.1 container carries a working flashinfer 0.6.17 ("imports
+# cleanly — keeping" in the build log), so leave this EMPTY and let vLLM pick.
+# Set QWEN38_GDN_PREFILL_BACKEND=triton to force the in-tree Triton/FLA kernel if
+# the flashinfer GDN path misbehaves — that is the known-good Ornith fallback.
+QWEN38_GDN_PREFILL_BACKEND="${QWEN38_GDN_PREFILL_BACKEND:-}"
+# --- DeepSeek-V4-Flash (deepseek-ai, MIT) ---------------------------------
+# vLLM v0.27.1 ships DEDICATED deepseek_v4 tool + reasoning parsers (verified in
+# the installed container, not guessed).
+DSV4_TOOL_PARSER="${DSV4_TOOL_PARSER:-deepseek_v4}"
+DSV4_REASONING_PARSER="${DSV4_REASONING_PARSER:-deepseek_v4}"
+# MTP draft depth. The checkpoint REALLY ships the head — 4705 `mtp.*` tensors of
+# 72317 verified in the downloaded weight_map (e.g. mtp.0.hc_attn_base) — and
+# config declares num_nextn_predict_layers=1, so unlike Ornith this is not a
+# config-only claim. Tune 1-3 and watch the accept rate.
+DSV4_MTP_SPECULATIVE_TOKENS="${DSV4_MTP_SPECULATIVE_TOKENS:-2}"
 # ENABLE_AUTO_TOOL_CHOICE default is model-dependent and gets resolved after
 # GLM detection below: 1 for GLM MoE models (tool parser is always set),
 # 0 elsewhere. Users can still override explicitly.
@@ -273,8 +308,21 @@ export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-NVL}"        # Use NVLink for P2P
 export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-PHB}" # GPU Direct RDMA level
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"         # Enable InfiniBand if available
 
-# Memory optimizations
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+# Memory optimizations. Override-respecting so a KV-offload run can drop it (below).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+# KV-offload experiment (queue item (b), plans/proposed/glm52_kv_tiering.md). vLLM
+# HARD-REJECTS any KV connector (--kv-offloading-size / --kv-transfer-config) when
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True — its CUDA VMM allocator can remap
+# KV pages, invalidating pinned/registered KV memory (ValueError at config validation,
+# before load). Set KV_OFFLOAD_EXPERIMENT=1 to drop expandable_segments so the native
+# CPU KV-offload path can start. TRADE-OFF: expandable_segments is our anti-
+# fragmentation guard on the tight-HBM offload path — watch for fragmentation OOM; the
+# alternative (keep it + enable the cumem allocator) is heavier. Forwarded by olivia.sh.
+if [[ "${KV_OFFLOAD_EXPERIMENT:-0}" == "1" || -n "${KV_OFFLOAD_GB:-}" ]]; then
+    export PYTORCH_CUDA_ALLOC_CONF=""
+    echo "[INFO] KV offload requested: dropped PYTORCH_CUDA_ALLOC_CONF=expandable_segments (required for KV connectors; watch for fragmentation OOM)"
+fi
 
 # Logging configuration
 # Set VERBOSE=1 for detailed vLLM + Ray + NCCL logging. Useful when debugging
@@ -340,10 +388,28 @@ if [[ "${MODEL}" == *"GLM-5.2"* ]] || [[ "${MODEL}" == *"glm-5.2"* ]]; then
     IS_GLM52=1
 fi
 
-# GLM-5.x family: everything 5.1 and 5.2 share — sparse-MLA attention backend,
-# --trust-remote-code, and the generous 128K default context. (5.1-only and
-# 5.2-only specifics, e.g. the cyankiwi chat-template fix or the FP8 DeepGEMM
-# path, stay keyed on IS_GLM51 / IS_GLM52 individually.)
+# Detect GLM-5.3. It is NOT a new architecture and NOT a new pretrain: Z.ai
+# re-post-trained GLM-5.2's *same 744B base* ("every reported gain comes from
+# scaled post-training"), so the checkpoint is byte-compatible in every way that
+# matters to a serving stack — same GlmMoeDsaForCausalLM, same ~40B active, same
+# skip-topk DSA indexer, same 1M native context, same block-FP8 quant.
+#
+# It therefore wants the ENTIRE GLM-5.2 runtime profile: eager CUDAGraph (capture
+# IMAs on this NGC stack), the DeepGEMM block-FP8 path, RayExecutorV2, the PP=3
+# layer partition, no bf16 KV override. Rather than duplicate ~5 blocks, we light
+# IS_GLM52 as the "5.2-family profile" flag and keep IS_GLM53 for reporting and
+# for any future 5.3-only divergence. If Z.ai ever ships a 5.3 that ISN'T the 5.2
+# base, split them here first.
+IS_GLM53=0
+if [[ "${MODEL}" == *"GLM-5.3"* ]] || [[ "${MODEL}" == *"glm-5.3"* ]]; then
+    IS_GLM53=1
+    IS_GLM52=1
+fi
+
+# GLM-5.x family: everything 5.1, 5.2 and 5.3 share — sparse-MLA attention
+# backend, --trust-remote-code, and the generous 128K default context. (5.1-only
+# and 5.2-family-only specifics, e.g. the cyankiwi chat-template fix or the FP8
+# DeepGEMM path, stay keyed on IS_GLM51 / IS_GLM52 individually.)
 IS_GLM5=0
 if [[ "${IS_GLM51}" == "1" || "${IS_GLM52}" == "1" ]]; then
     IS_GLM5=1
@@ -389,6 +455,77 @@ if [[ "${MODEL}" == *"Ornith"* ]] || [[ "${MODEL}" == *"ornith"* ]]; then
     IS_ORNITH=1
 fi
 
+# Detect Qwen3.8 (Alibaba, open weights 2026-08-13/14, Apache 2.0). VERIFIED from
+# the published Qwen/Qwen3.8-27B-FP8 config.json, NOT from the model card:
+#   - arch `Qwen3_5ForConditionalGeneration`, model_type `qwen3_5` — the SAME
+#     Qwen 3.5 family as Ornith, but DENSE (Ornith is ...MoeForConditionalGeneration).
+#     Registered natively in vLLM v0.27.1 (registry.py:581), so no new build.
+#   - 27B dense, 64 layers, hidden 5120, 24 q-heads / 4 KV-heads, 262144 ctx.
+#   - HYBRID attention like Ornith: 48 linear-attn layers + 16 full, full every
+#     4th. So do NOT force FLASH_ATTN — vLLM must auto-select (mamba/GDN kernels
+#     + recurrent state for the linear layers).
+#   - MULTIMODAL: 27-layer vision tower (hidden 1152, patch 16). We serve it for
+#     TEXT; the encoder just loads.
+#   - Quant is DeepSeek-style BLOCK-FP8 ([128,128] e4m3, dynamic) — note this
+#     DIFFERS from Ornith, which is compressed-tensors channel/token W8A8. Block
+#     FP8 means this one DOES ride the DeepGEMM path (glm52's lane, not Ornith's).
+#   - MTP: the head is REALLY THERE. Verified against the downloaded checkpoint's
+#     weight_map (2026-08-17): 22 `mtp.*` tensors — mtp.fc.weight,
+#     mtp.layers.0.{input_layernorm,mlp.*,...} — out of 1606 total, alongside 333
+#     vision tensors and language layers 0-63. This is the OPPOSITE of Ornith,
+#     whose FP8 export declared mtp_num_hidden_layers=1 but shipped ZERO mtp
+#     tensors, and vLLM v0.27.1 registers Qwen3_5MTP (registry.py:660). So MTP
+#     speculative decode should genuinely work here — likely the single biggest
+#     decode win available on a 1-GPU dense model.
+#     Left OFF by default only because nothing has been SERVED yet; flipping an
+#     untested spec-decode config on by default would turn a first-serve smoke
+#     test into a confusing failure. `ENABLE_SPECULATIVE=1` is the first thing to
+#     try once it serves clean.
+IS_QWEN38=0
+if [[ "${MODEL}" == *"Qwen3.8"* ]] || [[ "${MODEL}" == *"qwen3.8"* ]]; then
+    IS_QWEN38=1
+fi
+
+# Detect Borealis (NbAiLab / National Library of Norway) — Norwegian-centric
+# instruct family. VERIFIED from NbAiLab/borealis-27b config.json:
+#   - arch `Gemma3ForConditionalGeneration`, model_type `gemma3`, 62 layers,
+#     131072 max_position_embeddings, torch_dtype bfloat16, NO quantization_config.
+#   - Multimodal: SigLIP vision tower (27 layers, 1152 hidden, 896x896 / patch 14).
+#     We serve it for TEXT; the encoder loads dormant.
+# No parser block: this is an instruct model that emits neither <think> blocks nor
+# a tool-call grammar vLLM has a parser for — so no --reasoning-parser, no
+# --tool-call-parser, no --enable-auto-tool-choice.
+# It DOES need two things from us:
+#   1. MAX_MODEL_LEN=131072 — the generic fallback is 32768, which would silently
+#      throw away three quarters of the model's native window.
+#   2. NO forced attention backend. Gemma 3's text path is ordinary
+#      sliding-window+full attention, but the VISION tower makes the config
+#      multimodal PrefixLM, and forcing FLASH_ATTN then fails engine init outright
+#      (mm_prefix wants FlashAttention v4, which does not resolve for this
+#      head_size on Hopper). See the attention-backend block below.
+IS_BOREALIS=0
+if [[ "${MODEL}" == *"borealis"* ]] || [[ "${MODEL}" == *"Borealis"* ]]; then
+    IS_BOREALIS=1
+fi
+
+# Detect DeepSeek-V4-Flash. VERIFIED from the published config + the downloaded
+# checkpoint (2026-08-18), not the model card:
+#   - arch `DeepseekV4ForCausalLM`, model_type `deepseek_v4`, 43 layers, MoE with
+#     256 routed + 1 shared expert, 6 active per token. Registered natively in
+#     vLLM v0.27.1, so no build is needed.
+#   - 1,048,576 context via YaRN (factor 16 over a 65,536 base).
+#   - Quant is DeepSeek-style BLOCK-FP8 ([128,128] e4m3 dynamic) → DeepGEMM lane,
+#     same as glm52, NOT Ornith's channel/token W8A8.
+#   - MLA attention → must NOT force FLASH_ATTN; vLLM auto-selects.
+#   - MTP head genuinely SHIPPED: 4705 `mtp.*` tensors of 72317 in the weight_map
+#     (mtp.0.hc_attn_base, ...), and vLLM registers DeepSeekV4MTPModel. This is a
+#     verified-present head, so MTP is left ON by default here — the opposite call
+#     from Ornith, whose FP8 declared MTP and shipped nothing.
+IS_DSV4=0
+if [[ "${MODEL}" == *"DeepSeek-V4"* ]] || [[ "${MODEL}" == *"deepseek-v4"* ]]; then
+    IS_DSV4=1
+fi
+
 # Kimi K2.6's fused MLA op (vllm.min_latency_fused_qkv_a_proj) has no fake/meta
 # dispatch, so vLLM's torch.compile/CUDAGraph path fails during profile_run on
 # this multi-node PP setup ("Multiple dispatch failed ... NotImplemented", from
@@ -403,8 +540,10 @@ fi
 # (the same eager-only story as Kimi — verified 2026-06-18, job 1308936 died with
 # "CUDA error: an illegal memory access" under <auto-select>). Default to eager
 # (mode=NONE) when unset so `./olivia.sh server start glm52` works out of the box;
-# override CUDAGRAPH_MODE=PIECEWISE etc. to retry capture. Scoped to 5.2 only —
-# glm51 keeps its own capture experiment (see its CUDAGraph TODO).
+# override CUDAGRAPH_MODE=PIECEWISE etc. to retry capture. Scoped to the 5.2
+# FAMILY (so GLM-5.3 inherits it — same base, same capture behaviour expected);
+# glm51 keeps its own capture experiment (see its CUDAGraph TODO). Worth retrying
+# on the glm53_v27 container: a newer torch/inductor may not miscompile.
 if [[ "${IS_GLM52}" == "1" && -z "${CUDAGRAPH_MODE}" ]]; then
     CUDAGRAPH_MODE="NONE"
 fi
@@ -445,7 +584,7 @@ fi
 # any OpenAI tool-using client (Claude Code via anthropic_proxy.py, etc.).
 # ``${VAR+x}`` distinguishes "user explicitly set (even to 0)" from "unset".
 if [[ -z "${ENABLE_AUTO_TOOL_CHOICE+x}" ]]; then
-    if [[ "${IS_GLM_MOE}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" || "${IS_ORNITH}" == "1" ]]; then
+    if [[ "${IS_GLM_MOE}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" || "${IS_ORNITH}" == "1" || "${IS_QWEN38}" == "1" || "${IS_DSV4}" == "1" ]]; then
         ENABLE_AUTO_TOOL_CHOICE=1
     else
         ENABLE_AUTO_TOOL_CHOICE=0
@@ -457,7 +596,23 @@ fi
 # matches typical Claude Code usage (which requests max_tokens=32000).
 # Other models keep the conservative 32K default.
 if [[ -z "${MAX_MODEL_LEN+x}" ]]; then
-    if [[ "${IS_ORNITH}" == "1" ]]; then
+    if [[ "${IS_DSV4}" == "1" ]]; then
+        # Native window is 1,048,576 (YaRN x16). Default to 131072: the full 1M
+        # would consume the entire KV budget for a single sequence. Raise it
+        # explicitly for long-context runs (the context ladder does exactly that).
+        MAX_MODEL_LEN=131072
+    elif [[ "${IS_BOREALIS}" == "1" ]]; then
+        # Gemma-3 27B BF16 is ~54 GB of a 96 GB card, and Gemma 3 interleaves
+        # sliding-window layers with full-attention ones so the KV cache stays
+        # modest — the full native 131072 window fits comfortably. Lower this if
+        # you want more concurrent sequences instead of more context.
+        MAX_MODEL_LEN=131072
+    elif [[ "${IS_QWEN38}" == "1" ]]; then
+        # Qwen3.8-27B is 262144 native (1M via YaRN, not enabled here). Dense 27B
+        # block-FP8 is only ~30 GB on a 96 GB card, so the full window fits with
+        # room to spare — no reason to clip it like the big multi-node models.
+        MAX_MODEL_LEN=262144
+    elif [[ "${IS_ORNITH}" == "1" ]]; then
         # Ornith serves the whole 256K native window on both shapes:
         #   ornith_gh200 (35B, 1 card)  — ~35 GB weights + ~10 GB KV @256K single-user
         #   ornith       (397B, 2 nodes) — ~400 GB weights across 8×GH200 leaves
@@ -465,7 +620,7 @@ if [[ -z "${MAX_MODEL_LEN+x}" ]]; then
         #                 concurrency, lower this or set KV_CACHE_DTYPE=fp8_e4m3.
         MAX_MODEL_LEN=262144
     elif [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" ]]; then
-        # GLM-5.1 ~205K, GLM-5.2 ~1M, Kimi K2.6 ~256K, Laguna M.1 ~256K native —
+        # GLM-5.1 ~205K, GLM-5.2/5.3 ~1M, Kimi K2.6 ~256K, Laguna M.1 ~256K native —
         # all ship far larger windows, but 128K is the safe default within budget.
         # On glm52's 3-node FP8 (~18 GB/GPU KV), 128K holds a few concurrent
         # sequences; raise with --kv-cache-dtype fp8 (see KV_CACHE_DTYPE) or
@@ -510,9 +665,42 @@ fi
 
 # GLM-5.1 AWQ: swap the MoE flashinfer kernel variant
 # (QuantTrio recipe uses MOE_FP16 for GLM-5-AWQ, not MOE_FP8 like GLM-4.7-AWQ)
-if [[ "${IS_GLM51}" == "1" && "${IS_AWQ}" == "1" ]]; then
+# Applies to the whole GLM-5.x AWQ lineage, not just 5.1: cyankiwi publishes both
+# GLM-5.1-AWQ-4bit and GLM-5.2-AWQ-INT4, same GlmMoeDsaForCausalLM, same 4-bit
+# weight-only MoE. Leaving the global FLASHINFER_MOE_FP8=1 default on for a 4-bit
+# checkpoint points vLLM at an FP8 MoE kernel the weights cannot feed — and on
+# containers where the build uninstalled a version-skewed flashinfer (the Ornith
+# lesson, likely on the v0.27.1/glm53 container too) there is no flashinfer at all.
+if [[ "${IS_GLM5}" == "1" && "${IS_AWQ}" == "1" ]]; then
     export VLLM_USE_FLASHINFER_MOE_FP8=0
     export VLLM_USE_FLASHINFER_MOE_FP16=1
+fi
+
+# Single-node GLM-5.2 AWQ CANNOT load without weight offload: the ~415 GiB AWQ
+# checkpoint is ~104 GB/GPU across 4 GH200, over the 96 GB HBM before any KV. So
+# default a conservative per-GPU offload when running single-node AWQ GLM-5.2 and
+# the user hasn't pinned one — otherwise the job OOMs at load. The offload SWEEP
+# (plans/proposed/glm52_awq_1n_offload.md) refines this value; 40 is a safe start
+# (~64 GB/GPU resident weights, ~32 GB/GPU freed for bf16 KV).
+if [[ "${IS_GLM52}" == "1" && "${IS_AWQ}" == "1" && "${NUM_NODES}" -le 1 && -z "${CPU_OFFLOAD_GB:-}" ]]; then
+    CPU_OFFLOAD_GB=40
+    echo "[INFO] single-node GLM-5.2 AWQ: defaulting CPU_OFFLOAD_GB=${CPU_OFFLOAD_GB} (weights exceed HBM without offload)"
+fi
+
+# GLM-5.2 cold load is vLLM-pipeline-bound, not I/O-bound: the default loader
+# takes ~56 min for the ~415 GiB AWQ checkpoint (and MTP double-loads to ~84 min).
+# The Run:ai Model Streamer parallelizes the safetensors read ~6x — VALIDATED at
+# ~9.5 min on glm52_awq_1n (loads, serves, decodes cleanly). It ships as a pip
+# package we can't install offline into the container, so it's staged under the
+# persistent (projects) HF_HOME and imported via PYTHONPATH (CONTAINER_PYTHONPATH).
+# Default it on for GLM-5.2 when that staged package is present next to HF_HOME;
+# no-op (fall back to the default loader) when it's absent — e.g. the FP8 preset
+# resolves HF_HOME to the work tier where the pkg isn't staged. Fully overridable
+# via LOAD_FORMAT / CONTAINER_PYTHONPATH.
+if [[ "${IS_GLM52}" == "1" && -z "${LOAD_FORMAT:-}" && -d "${HF_HOME:-}/runai-pkg" ]]; then
+    LOAD_FORMAT=runai_streamer
+    CONTAINER_PYTHONPATH="${CONTAINER_PYTHONPATH:-${HF_HOME}/runai-pkg}"
+    echo "[INFO] GLM-5.2: defaulting LOAD_FORMAT=runai_streamer (staged pkg at ${HF_HOME}/runai-pkg; ~6x faster cold load)"
 fi
 
 # GLM-5.2 FP8: block-wise FP8 ([128,128], e4m3) is the DeepSeek-style quant, so
@@ -536,6 +724,51 @@ if [[ "${IS_GLM52}" == "1" && "${IS_AWQ}" == "0" ]]; then
     #   FLASHMLA_SPARSE: [kv_cache_dtype not supported]
     # Override KV_CACHE_DTYPE explicitly only if you know your backend supports it.
     : # (no fp8 KV default for glm52 on GH200)
+fi
+
+# Qwen3.8 block-FP8: [128,128] e4m3 dynamic is the DeepSeek-style blocked quant,
+# the same GEMM lane GLM-5.2 uses — so it wants DeepGEMM on Hopper, NOT the
+# flashinfer FP8-MoE kernel (and it is dense anyway, so there is no MoE kernel to
+# pick). This is the one place Qwen3.8 diverges from Ornith, whose channel/token
+# W8A8 never touches DeepGEMM. Skip the JIT warmup for the same reason glm52 does
+# — it adds minutes to startup; override VLLM_DEEP_GEMM_WARMUP="" to warm up.
+if [[ "${IS_QWEN38}" == "1" && "${IS_AWQ}" == "0" ]]; then
+    if [[ "${VLLM_USE_DEEP_GEMM_EXPLICIT}" == "0" ]]; then
+        export VLLM_USE_DEEP_GEMM=1
+    fi
+    export VLLM_DEEP_GEMM_WARMUP="${VLLM_DEEP_GEMM_WARMUP:-skip}"
+    export VLLM_USE_FLASHINFER_MOE_FP8=0
+fi
+
+# DeepSeek-V4-Flash block-FP8: same DeepGEMM lane as glm52/qwen38.
+if [[ "${IS_DSV4}" == "1" && "${IS_AWQ}" == "0" ]]; then
+    if [[ "${VLLM_USE_DEEP_GEMM_EXPLICIT}" == "0" ]]; then
+        export VLLM_USE_DEEP_GEMM=1
+    fi
+    export VLLM_DEEP_GEMM_WARMUP="${VLLM_DEEP_GEMM_WARMUP:-skip}"
+    # fp8 KV cache is MANDATORY, not an optimisation. DeepSeek-V4's attention uses
+    # the fp8_ds_mla layout, which refuses anything else — verified on-cluster
+    # 2026-08-18 (job 2036910 died at worker start in 2m37s):
+    #   AssertionError: DeepseekV4 fp8_ds_mla layout only supports fp8 kv-cache,
+    #   got auto
+    # Note this is the EXACT OPPOSITE of GLM-5.2 on this hardware, where forcing
+    # fp8 KV makes the attention selector reject every backend (FLASHMLA_SPARSE
+    # on Hopper does not support it). Same MLA family, inverted requirement — so
+    # do not generalise a KV-dtype rule across the DSA/MLA models.
+    # Useful side effect: fp8 KV roughly halves per-token cache cost, which is
+    # what makes the long-context ladder reach further on this model.
+    KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+fi
+
+# --- GLM-5.2-family multi-node bits that are QUANT-INDEPENDENT --------------
+# These two used to live inside the `IS_AWQ == 0` branch above, which was fine
+# while block-FP8 was the only GLM-5.2 quant. It no longer is: a complete
+# cyankiwi/GLM-5.2-AWQ-INT4 (compressed-tensors pack-quantized 4-bit, ~411 GB)
+# now exists, and it is the SAME GlmMoeDsaForCausalLM with the SAME skip-topk
+# indexer (index_topk_freq=4, index_skip_topk_offset=3 — verified on the
+# on-cluster checkpoint). Both settings below are about DSA + cross-node PP, not
+# about the GEMM path, so gating them on FP8 silently mis-served the AWQ.
+if [[ "${IS_GLM52}" == "1" ]]; then
     # GLM-5.2 multi-node uses RayExecutorV2 (no Ray Compiled Graph). The legacy
     # executor's Compiled Graph wedges decode at 0 tok/s here; V2 decodes cleanly.
     # V2 with our external Ray bootstrap only works in engine-as-Ray-actor mode
@@ -545,15 +778,26 @@ if [[ "${IS_GLM52}" == "1" && "${IS_AWQ}" == "0" ]]; then
     if [[ "${_RAYV2_EXPLICIT}" == "0" ]]; then
         VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1
     fi
-    # Custom PP layer partition (PP=3 only). GLM-5.2's DSA skip-topk layer at a
-    # pipeline-stage boundary trips `KeyError: model.layers.<N>.self_attn.attn`
-    # in get_attn_backends_for_group on the default even split (78/3 → boundary
-    # at layer 52, a skip-topk layer). 26/24/28 moves the boundaries to layers
-    # 0/26/50 — all FULL-indexer layers (full when max(L-2,0) % index_topk_freq
-    # == 0) — which gets init all the way to a live server. (Decode then still
-    # hits the multi-node PP wedge; see CLAUDE.md. Necessary, not sufficient.)
+    # Custom PP layer partition. GLM-5.2's DSA skip-topk layer at a pipeline-stage
+    # boundary trips `KeyError: model.layers.<N>.self_attn.attn` in
+    # get_attn_backends_for_group. A boundary must land on a FULL-indexer layer;
+    # empirically those satisfy max(L-2,0) % index_topk_freq == 0 (freq=4), i.e.
+    # L in {0, 2, 6, 10, ... 4k+2}.
+    #
+    #   PP=3 (78 layers, FP8): default even split → boundary at layer 52, a
+    #         skip-topk layer → KeyError. 26/24/28 puts boundaries at 0/26/50,
+    #         all full-indexer. VALIDATED on-cluster (glm52 serves with this).
+    #   PP=2 (78 layers, the ~411 GB AWQ shape): default even split → boundary at
+    #         layer 39, and (39-2)%4 == 1, so it is NOT full-indexer and should
+    #         trip the same KeyError. 38/40 puts the boundary at layer 38, which
+    #         IS full-indexer ((38-2)%4 == 0), and stays near-balanced.
+    #         DERIVED from the PP=3 rule, NOT yet validated on-cluster — if it
+    #         still KeyErrors, try the next full-indexer boundary (42/36) or
+    #         override VLLM_PP_LAYER_PARTITION directly.
     if [[ "${PP_SIZE}" == "3" ]]; then
         VLLM_PP_LAYER_PARTITION="${VLLM_PP_LAYER_PARTITION:-26,24,28}"
+    elif [[ "${PP_SIZE}" == "2" ]]; then
+        VLLM_PP_LAYER_PARTITION="${VLLM_PP_LAYER_PARTITION:-38,40}"
     fi
 fi
 
@@ -566,8 +810,23 @@ fi
 # from whatever is installed — if nothing works, the error will tell us what
 # to install.
 if [[ -z "${VLLM_ATTENTION_BACKEND}" ]]; then
-    if [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_ORNITH}" == "1" ]]; then
+    if [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_ORNITH}" == "1" || "${IS_QWEN38}" == "1" || "${IS_BOREALIS}" == "1" || "${IS_DSV4}" == "1" ]]; then
         # Don't force FLASH_ATTN — these need vLLM to auto-select a special backend:
+        #   Qwen3.8  HYBRID, same as Ornith (48 linear-attn + 16 full layers).
+        #   Borealis (Gemma 3) MULTIMODAL PrefixLM. Forcing FLASH_ATTN here is a
+        #     HARD FAILURE, verified on-cluster 2026-08-18 (job 2032118 died at
+        #     engine init in 110 s):
+        #       ValueError: Selected backend AttentionBackendEnum.FLASH_ATTN is not
+        #       valid for this configuration. Reason: ['"'"'mm_prefix (PrefixLM
+        #       bidirectional attention) requires FlashAttention v4, which does not
+        #       resolve for this head_size'"'"']
+        #     Gemma 3 gives the image prefix BIDIRECTIONAL attention, and vLLM only
+        #     serves that through FA4 — an SM100/Blackwell path that does not
+        #     resolve for this head size on Hopper. Leaving the backend unset lets
+        #     vLLM pick one that does support mm_prefix. (So "Gemma 3 is ordinary
+        #     attention, keep FLASH_ATTN" was WRONG: it is ordinary for TEXT, but
+        #     the vision tower changes the attention contract even when we only
+        #     ever send text.)
         #   GLM-5.x  sparse-MLA (DSA); Kimi K2.6 standard MLA — FLASH_ATTN rejects MLA.
         #   Ornith   HYBRID (Gated-DeltaNet linear_attn + full self_attn) — the
         #            linear-attn layers use a mamba/GDN kernel + recurrent state, not
@@ -611,10 +870,43 @@ USE_SPECULATIVE=0
 if [[ "${ENABLE_SPECULATIVE}" == "1" ]]; then
     USE_SPECULATIVE=1
 elif [[ "${ENABLE_SPECULATIVE}" == "auto" ]]; then
-    # Auto-enable MTP for GLM-4.7/GLM-5.1 (improves throughput significantly)
-    if [[ "${IS_GLM_MOE}" == "1" ]]; then
+    # Auto-enable MTP for GLM-4.7/GLM-5.1 (improves throughput significantly).
+    # EXCLUDE GLM-5.2: its MTP draft (DeepSeekMTPModel) is loaded as a SECOND full
+    # 83-shard checkpoint pass — doubling an already ~53-min cold load — and MTP on
+    # the new GLM-5.2 DSA arch is unproven here (2-node PP>1 disables it anyway; the
+    # PP=1 single-node offload path auto-enabled it unintentionally, observed
+    # 2026-07-01 job 1424649). Make it opt-in for GLM-5.2 via ENABLE_SPECULATIVE=1.
+    if [[ "${IS_GLM_MOE}" == "1" && "${IS_GLM52}" != "1" ]]; then
         USE_SPECULATIVE=1
         echo "[INFO] Auto-enabling MTP speculative decoding for GLM MoE model"
+    elif [[ "${IS_GLM52}" == "1" && "${MODEL}" == *MTP* ]]; then
+        # GLM-5.2 MTP-GRAFTED checkpoint (dnhkng graft: cyankiwi AWQ body + the FP8
+        # layer-78 MTP head from GLM-5.2-FP8). The plain cyankiwi AWQ checkpoint
+        # DROPPED layer-78 during quantization → MTP init dies (deepseek_mtp.py:480
+        # ValueError, observed job 1424649). Only enable MTP when the checkpoint
+        # path signals the graft ("MTP"), and note: the container's vLLM must carry
+        # the awq+fp8-mtp quant-config patch (patches/vllm-awq-fp8-mtp-quant-config.patch).
+        USE_SPECULATIVE=1
+        echo "[INFO] GLM-5.2 MTP-grafted checkpoint: auto-enabling MTP speculative decoding"
+    elif [[ "${IS_GLM52}" == "1" ]]; then
+        echo "[INFO] GLM-5.2 (non-MTP checkpoint): MTP not auto-enabled — cyankiwi AWQ lacks layer-78 weights. Use an MTP-grafted checkpoint (path contains 'MTP') to enable it."
+    fi
+    # DeepSeek-V4-Flash: MTP is OPT-IN, despite the head being present.
+    #
+    # The checkpoint genuinely ships it — 4705 `mtp.*` tensors of 72317 in the
+    # weight_map (mtp.0.hc_attn_base, ...) — and vLLM registers DeepSeekV4MTPModel.
+    # I auto-enabled it on that basis and it FAILED on-cluster 2026-08-18
+    # (job 2036966, 3m20s):
+    #     KeyError: 'model.layers.43.mtp_block.main_norm.weight'
+    # v0.27.1's loader expects the head at model.layers.<N>.mtp_block.*, but this
+    # 0731 checkpoint stores it as mtp.0.* — the weights are there, in a layout
+    # this vLLM cannot map. So TENSOR PRESENCE IS NECESSARY BUT NOT SUFFICIENT:
+    # Ornith taught that a config claim needs checking against the weight_map, and
+    # this teaches that the weight_map needs checking against the loader's naming.
+    # Re-test with ENABLE_SPECULATIVE=1 after a vLLM bump; if the KeyError persists
+    # the layouts have genuinely diverged and it needs an upstream fix.
+    if [[ "${IS_DSV4}" == "1" && "${ENABLE_SPECULATIVE}" == "auto" ]]; then
+        echo "[INFO] DeepSeek-V4: MTP OFF (head present as mtp.0.* but v0.27.1 expects model.layers.N.mtp_block.*). ENABLE_SPECULATIVE=1 to retry."
     fi
     # Ornith is intentionally NOT auto-on: its config declares mtp_num_hidden_layers=1
     # but the published FP8 checkpoints ship NO MTP weights (verified on-cluster),
@@ -663,7 +955,9 @@ fi
 
 if [[ "${IS_GLM_MOE}" == "1" ]]; then
     echo ""
-    if [[ "${IS_GLM52}" == "1" ]]; then
+    if [[ "${IS_GLM53}" == "1" ]]; then
+        echo "GLM-5.3 Settings (GLM-5.2-family runtime profile):"
+    elif [[ "${IS_GLM52}" == "1" ]]; then
         echo "GLM-5.2 Settings:"
     elif [[ "${IS_GLM51}" == "1" ]]; then
         echo "GLM-5.1 Settings:"
@@ -948,6 +1242,34 @@ VLLM_ARGS=(
     "--port" "${PORT}"
 )
 
+# CPU/Grace weight offload (per GPU). On GH200 the offloaded weights live in the
+# Hopper GPU's coherent Grace LPDDR5X and stream back over C2C (~450 GB/s) each
+# forward. This is the lever that lets a model whose per-GPU shard exceeds the
+# 96 GB HBM (e.g. single-node GLM-5.2-AWQ, ~104 GB/GPU) fit — trading some decode
+# latency for HBM freed up for KV. Only emitted when set > 0.
+if [[ -n "${CPU_OFFLOAD_GB:-}" && "${CPU_OFFLOAD_GB}" != "0" ]]; then
+    VLLM_ARGS+=("--cpu-offload-gb" "${CPU_OFFLOAD_GB}")
+fi
+
+# Native CPU KV-cache offload (queue item (b), plans/proposed/glm52_kv_tiering.md):
+# bulk KV blocks are tiered to coherent Grace LPDDR and reloaded on prefix reuse.
+# KV_OFFLOAD_GB is the TOTAL CPU tier size in GiB summed across TP ranks (vLLM's
+# --kv-offloading-size; backend defaults to 'native' → OffloadingConnector +
+# CPUOffloadingSpec). Requires expandable_segments off — handled above (setting
+# KV_OFFLOAD_GB drops it automatically). Distinct from CPU_OFFLOAD_GB (that offloads
+# *weights*); both can be set together. Validated 2026-07-03 (job 1473586: store +
+# reload proven on GLM-5.2 DSA). Note the connector reserves ~25K tok of HBM.
+if [[ -n "${KV_OFFLOAD_GB:-}" && "${KV_OFFLOAD_GB}" != "0" ]]; then
+    VLLM_ARGS+=("--kv-offloading-size" "${KV_OFFLOAD_GB}")
+    echo "[INFO] native KV offload: --kv-offloading-size ${KV_OFFLOAD_GB} GiB (CPU tier, total across TP ranks)"
+fi
+
+# Optional load-format override, e.g. LOAD_FORMAT=runai_streamer for a parallel
+# streaming loader (needs runai_model_streamer importable — see CONTAINER_PYTHONPATH).
+if [[ -n "${LOAD_FORMAT:-}" ]]; then
+    VLLM_ARGS+=("--load-format" "${LOAD_FORMAT}")
+fi
+
 # CUDAGraph knob. NONE → disable all compilation (mode=NONE). Anything else →
 # keep compilation enabled and only override cudagraph_mode. Unset → no flag,
 # vLLM auto-selects.
@@ -992,6 +1314,9 @@ if [[ "${USE_SPECULATIVE}" == "1" ]]; then
     if [[ "${IS_GLM_MOE}" == "1" ]]; then
         # GLM-4.7/GLM-5.1 use MTP (Multi-Token Prediction) speculative decoding
         SPEC_CONFIG='{"method": "mtp", "num_speculative_tokens": '${MTP_SPECULATIVE_TOKENS}'}'
+    elif [[ "${IS_DSV4}" == "1" ]]; then
+        # DeepSeek-V4 native MTP head (verified present in the checkpoint).
+        SPEC_CONFIG='{"method": "mtp", "num_speculative_tokens": '${DSV4_MTP_SPECULATIVE_TOKENS}'}'
     elif [[ "${IS_ORNITH}" == "1" ]]; then
         # Ornith (qwen3_5_moe) ships a native MTP module — vLLM's generic "mtp"
         # method loads it and drafts from the model's own head, no draft model.
@@ -1119,6 +1444,39 @@ if [[ "${IS_ORNITH}" == "1" ]]; then
     # Passed as one array element straight to `vllm serve`, so the JSON is safe.
     if [[ -n "${ORNITH_GDN_PREFILL_BACKEND}" ]]; then
         VLLM_ARGS+=("--additional-config" "{\"gdn_prefill_backend\": \"${ORNITH_GDN_PREFILL_BACKEND}\"}")
+    fi
+fi
+
+# DeepSeek-V4-Flash serve arguments.
+if [[ "${IS_DSV4}" == "1" ]]; then
+    [[ -n "${DSV4_TOOL_PARSER}" ]] && VLLM_ARGS+=("--tool-call-parser" "${DSV4_TOOL_PARSER}")
+    [[ -n "${DSV4_REASONING_PARSER}" ]] && VLLM_ARGS+=("--reasoning-parser" "${DSV4_REASONING_PARSER}")
+    [[ "${ENABLE_AUTO_TOOL_CHOICE}" == "1" ]] && VLLM_ARGS+=("--enable-auto-tool-choice")
+    [[ -n "${SERVED_MODEL_NAME}" ]] && VLLM_ARGS+=("--served-model-name" "${SERVED_MODEL_NAME}")
+    VLLM_ARGS+=("--trust-remote-code")
+fi
+
+# Qwen3.8 27B dense — same Qwen3.5 parser family as Ornith, different shape.
+if [[ "${IS_QWEN38}" == "1" ]]; then
+    if [[ -n "${QWEN38_TOOL_PARSER}" ]]; then
+        VLLM_ARGS+=("--tool-call-parser" "${QWEN38_TOOL_PARSER}")
+    fi
+    if [[ -n "${QWEN38_REASONING_PARSER}" ]]; then
+        VLLM_ARGS+=("--reasoning-parser" "${QWEN38_REASONING_PARSER}")
+    fi
+    if [[ "${ENABLE_AUTO_TOOL_CHOICE}" == "1" ]]; then
+        VLLM_ARGS+=("--enable-auto-tool-choice")
+    fi
+    if [[ -n "${SERVED_MODEL_NAME}" ]]; then
+        VLLM_ARGS+=("--served-model-name" "${SERVED_MODEL_NAME}")
+    fi
+    VLLM_ARGS+=("--trust-remote-code")
+    if [[ "${QWEN38_ENABLE_PREFIX_CACHING:-1}" == "1" ]]; then
+        VLLM_ARGS+=("--enable-prefix-caching")
+    fi
+    # Empty by default here (unlike Ornith) — this container's flashinfer works.
+    if [[ -n "${QWEN38_GDN_PREFILL_BACKEND}" ]]; then
+        VLLM_ARGS+=("--additional-config" "{\"gdn_prefill_backend\": \"${QWEN38_GDN_PREFILL_BACKEND}\"}")
     fi
 fi
 
@@ -1327,6 +1685,63 @@ else
     _SING_PREFIX=()
 fi
 
+# =============================================================================
+# Idle watchdog — cancel this job if the server is up but nobody is using it
+# =============================================================================
+# THE most expensive failure mode on this cluster is not a crash. A crash dies in
+# 2-5 minutes and costs almost nothing. A server that comes up CORRECTLY and then
+# receives no requests holds 100% of its allocation at 0% utilisation until
+# walltime. Measured over 2026-08-17..19: six failed starts cost ~1.5 GPU-h in
+# total, while TWO healthy-but-unattended servers cost 11 GPU-h — roughly 63% of
+# all GPU time spent. Causes were mundane: an SSH master dropped mid-benchmark,
+# and a benchmark driven by hand from a session that was not attached.
+#
+# run_proxy.sh has had ROUTER_EMPTY_TIMEOUT auto-spindown for a while — on the CPU
+# router, which costs 2 CPUs. The GPU servers, at 4-12x the price, had nothing.
+# This closes that gap.
+#
+# The watchdog only starts counting AFTER /health returns 200, so a long model load
+# (Kimi and the 400 GB models take 10+ minutes) is never mistaken for idleness. It
+# tracks vLLM's monotonic generation-token counter plus the running-request gauge;
+# idle means both "no tokens produced since last check" and "nothing running".
+#
+#   IDLE_TIMEOUT=<seconds>   default 1200 (20 min). 0 DISABLES — use that for a
+#                            server deliberately left up for interactive work.
+IDLE_TIMEOUT="${IDLE_TIMEOUT:-1200}"
+if [[ "${IDLE_TIMEOUT}" =~ ^[0-9]+$ ]] && [[ "${IDLE_TIMEOUT}" -gt 0 ]] && [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    (
+        _wd_curl() { curl -s --noproxy '*' -m 5 "$@" 2>/dev/null; }
+        # Wait for readiness. Deliberately generous (90 min): a slow load must not
+        # be cancelled, and if the server never comes up the JOB dies by itself.
+        for _ in $(seq 1 540); do
+            [ "$(_wd_curl -o /dev/null -w '%{http_code}' "http://localhost:${PORT}/health")" = "200" ] && break
+            sleep 10
+        done
+        [ "$(_wd_curl -o /dev/null -w '%{http_code}' "http://localhost:${PORT}/health")" = "200" ] || exit 0
+        echo "[watchdog] server ready; will cancel job ${SLURM_JOB_ID} after ${IDLE_TIMEOUT}s with no activity"
+        _last_tokens=""; _idle=0
+        while sleep 60; do
+            _m=$(_wd_curl "http://localhost:${PORT}/metrics")
+            [ -z "${_m}" ] && continue   # transient scrape failure is not idleness
+            _tok=$(echo "${_m}" | awk '/^vllm:generation_tokens_total/{s+=$2} END{printf "%.0f", s+0}')
+            _run=$(echo "${_m}" | awk '/^vllm:num_requests_running/{s+=$2} END{printf "%.0f", s+0}')
+            if [ "${_tok}" != "${_last_tokens}" ] || [ "${_run}" != "0" ]; then
+                _idle=0; _last_tokens="${_tok}"
+            else
+                _idle=$((_idle + 60))
+                if [ "${_idle}" -ge "${IDLE_TIMEOUT}" ]; then
+                    echo "[watchdog] no activity for ${_idle}s — cancelling job ${SLURM_JOB_ID} to stop burning allocation"
+                    scancel "${SLURM_JOB_ID}"
+                    exit 0
+                fi
+            fi
+        done
+    ) &
+    echo "[$(date '+%H:%M:%S')] Idle watchdog armed (IDLE_TIMEOUT=${IDLE_TIMEOUT}s; set 0 to disable)"
+else
+    echo "[$(date '+%H:%M:%S')] Idle watchdog DISABLED (IDLE_TIMEOUT=${IDLE_TIMEOUT:-unset}) — job will hold its allocation until walltime"
+fi
+
 # Build shared singularity command array (used by both single-node and multi-node paths)
 SING_CMD=(
     "${_SING_PREFIX[@]}"
@@ -1366,6 +1781,26 @@ SING_CMD=(
     # files we deploy alongside run_vllm_server.sh).
     --bind "${CONTAINER_DIR}:${CONTAINER_DIR}"
 )
+
+# If MODEL is a LOCAL directory (e.g. the grafted AWQ+FP8-MTP checkpoint at
+# /cluster/projects/<proj>/models/...), its path must be visible INSIDE the
+# container. The default binds cover HF_HOME + CONTAINER_DIR but not arbitrary
+# local model dirs, so without this the path doesn't exist in the job, transformers
+# treats it as a HF repo id, and config resolution dies with
+# "Repo id must be in the form 'repo_name' or 'namespace/repo_name'". Bind the model
+# dir (its internal symlinks resolve into HF_HOME, which is already bound).
+if [[ "${MODEL}" == /* && -d "${MODEL}" ]]; then
+    SING_CMD+=(--bind "${MODEL}:${MODEL}")
+    echo "  Local model bind: ${MODEL}"
+fi
+
+# Optional: prepend a PYTHONPATH inside the container (e.g. a staged
+# runai_model_streamer package under HF_HOME) so a pip package we can't install
+# offline is still importable. The path must live under an already-bound dir.
+if [[ -n "${CONTAINER_PYTHONPATH:-}" ]]; then
+    SING_CMD+=(--env "PYTHONPATH=${CONTAINER_PYTHONPATH}")
+    echo "  Container PYTHONPATH: ${CONTAINER_PYTHONPATH}"
+fi
 
 # GLM-5.2 block-FP8 sets VLLM_DEEP_GEMM_WARMUP=skip to avoid the multi-minute
 # DeepGEMM JIT warmup at startup. Only forward it when set so other models keep

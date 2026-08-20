@@ -1,0 +1,126 @@
+diff --git a/vllm/model_executor/models/deepseek_mtp.py b/vllm/model_executor/models/deepseek_mtp.py
+index 88f33ac02..b2aa3ea8c 100644
+--- a/vllm/model_executor/models/deepseek_mtp.py
++++ b/vllm/model_executor/models/deepseek_mtp.py
+@@ -16,7 +16,10 @@ from vllm.model_executor.layers.fused_moe import (
+ )
+ from vllm.model_executor.layers.layernorm import RMSNorm
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+-from vllm.model_executor.layers.quantization import QuantizationConfig
++from vllm.model_executor.layers.quantization import (
++    QuantizationConfig,
++    get_quantization_config,
++)
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     ParallelLMHead,
+     VocabParallelEmbedding,
+@@ -40,6 +43,16 @@ from .utils import get_pp_missing_layer_names, maybe_prefix
+ logger = init_logger(__name__)
+ 
+ 
++def _get_mtp_quant_config(config: PretrainedConfig) -> QuantizationConfig | None:
++    quant_config = getattr(config, "mtp_quantization_config", None)
++    if not quant_config:
++        return None
++    quant_method = quant_config.get("quant_method")
++    if not quant_method:
++        return None
++    return get_quantization_config(quant_method).from_config(quant_config)
++
++
+ class SharedHead(nn.Module):
+     def __init__(
+         self,
+@@ -94,6 +107,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
+             prefix,
+             config=self.config,
+             topk_indices_buffer=topk_indices_buffer,
++            quant_config_override=_get_mtp_quant_config(config),
+         )
+ 
+     def forward(
+@@ -347,6 +361,9 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
+                 if name.endswith(".bias") and name not in params_dict:
+                     continue
+ 
++                if name not in params_dict:
++                    continue
++
+                 param = params_dict[name]
+                 weight_loader = param.weight_loader
+                 weight_loader(param, loaded_weight, shard_id)
+@@ -414,6 +431,9 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
+                         # Instead, create a new variable
+                         name_mapped = chunk_name.replace(weight_name, param_name)
+ 
++                        if name_mapped not in params_dict:
++                            continue
++
+                         param = params_dict[name_mapped]
+                         # We should ask the weight loader to return success or
+                         # not here since otherwise we may skip experts with
+@@ -450,6 +470,9 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
+                         if name is None:
+                             continue
+ 
++                        if name not in params_dict:
++                            continue
++
+                         # According to DeepSeek-V3 Technical Report, MTP modules
+                         # shares embedding layer. We only load the first weights.
+                         if (
+diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/models/deepseek_v2.py
+index 2f6a472fe..4652028d4 100644
+--- a/vllm/model_executor/models/deepseek_v2.py
++++ b/vllm/model_executor/models/deepseek_v2.py
+@@ -1100,6 +1100,7 @@ class DeepseekV2DecoderLayer(nn.Module):
+         prefix: str,
+         config: DeepseekV2Config | None = None,
+         topk_indices_buffer: torch.Tensor | None = None,
++        quant_config_override: QuantizationConfig | None = None,
+     ) -> None:
+         super().__init__()
+ 
+@@ -1107,7 +1108,11 @@ class DeepseekV2DecoderLayer(nn.Module):
+             config = vllm_config.model_config.hf_config
+         model_config = vllm_config.model_config
+         cache_config = vllm_config.cache_config
+-        quant_config = vllm_config.quant_config
++        quant_config = (
++            quant_config_override
++            if quant_config_override is not None
++            else vllm_config.quant_config
++        )
+         parallel_config = vllm_config.parallel_config
+ 
+         self.hidden_size = config.hidden_size
+@@ -1456,6 +1461,9 @@ class DeepseekV2Model(nn.Module):
+                 if is_pp_missing_parameter(name, self):
+                     continue
+ 
++                if name not in params_dict:
++                    continue
++
+                 param = params_dict[name]
+                 weight_loader = param.weight_loader
+                 weight_loader(param, loaded_weight, shard_id)
+@@ -1524,6 +1532,9 @@ class DeepseekV2Model(nn.Module):
+                         # Instead, create a new variable
+                         name_mapped = chunk_name.replace(weight_name, param_name)
+ 
++                        if name_mapped not in params_dict:
++                            continue
++
+                         if is_pp_missing_parameter(name_mapped, self):
+                             continue
+ 
+@@ -1567,6 +1578,9 @@ class DeepseekV2Model(nn.Module):
+                         if is_pp_missing_parameter(name, self):
+                             continue
+ 
++                        if name not in params_dict:
++                            continue
++
+                         param = params_dict[name]
+                         weight_loader = getattr(
+                             param, "weight_loader", default_weight_loader

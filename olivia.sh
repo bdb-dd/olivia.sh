@@ -734,7 +734,7 @@ cmd_build() {
                 info "To build a new container:"
                 echo "    ./olivia.sh build <preset>" >&2
                 echo "" >&2
-                echo "Available presets: glm51_v19 (alias: glm51), glm51_v20, glm52, glm47, kimi, kimi27, laguna, ornith, ornith_gh200, devstral, llama, qwen, generic" >&2
+                echo "Available presets: glm51_v19 (alias: glm51), glm51_v20, glm52, glm53_v27, glm47, kimi, kimi27, laguna, ornith, ornith_gh200, devstral, llama, qwen, generic" >&2
                 exit 0
                 ;;
             --presets|-p)
@@ -754,6 +754,15 @@ cmd_build() {
                 echo "             vLLM: main + PR#45895 (skip-topk indexer); NO release yet"
                 echo "             FP8 ~755GB, 12 GPUs (3×4-GPU nodes, TP=4 + PP=3)"
                 echo "             RedHatAI/GLM-5.2-FP8 (== zai-org). Same PP wedge as glm51."
+                echo ""
+                echo "  glm53_v27  GLM-5.3 (744B/40B) FP8 on a TAGGED vLLM release"
+                echo "             vLLM: v0.27.1, transformers>=5.5.3, NGC 26.07 (torch 2.13)"
+                echo "             FP8, 12 GPUs (3×4-GPU nodes, TP=4 + PP=3), own container."
+                echo "             GLM-5.3 is GLM-5.2's base re-post-trained, so the plain"
+                echo "             'glm53' SERVE preset reuses the glm52 container and needs"
+                echo "             NO build. This one only retires the pinned-main + PR#45895"
+                echo "             graft (merged in v0.24.0). UNVALIDATED — try it on"
+                echo "             GLM-5.2-FP8 weights first."
                 echo ""
                 echo "  glm47      GLM-4.7 (358B) flagship model"
                 echo "             vLLM: main, transformers>=5.0.0rc0"
@@ -914,6 +923,15 @@ cmd_build() {
     # build glm52 on 26.03's inductor (which, unlike 26.05, may not miscompile
     # DSA CUDAGraph capture). build_vllm_gh200.sh resolves env > preset > default.
     [[ -n "${NGC_PYTORCH_TAG:-}" ]] && env_vars="${env_vars} NGC_PYTORCH_TAG=${NGC_PYTORCH_TAG}"
+    # Forward a walltime override. sbatch honours SBATCH_TIMELIMIT from the
+    # environment and it beats the `#SBATCH --time=02:00:00` baked into
+    # build_vllm_gh200.sh. Needed because 2 h is no longer generous: a modern
+    # vLLM (v0.27.1) spends ~15 min just unpacking a fresh NGC sandbox onto
+    # Lustre before the CUDA compile even starts. NB you cannot fix this after
+    # the fact — SLURM only lets a user *lower* a running job's limit
+    # ("Access/permission denied"), so set it at submit time:
+    #   BUILD_TIME_LIMIT=06:00:00 ./olivia.sh build glm53_v27
+    [[ -n "${BUILD_TIME_LIMIT:-}" ]] && env_vars="${env_vars} SBATCH_TIMELIMIT=${BUILD_TIME_LIMIT}"
 
     info "Submitting build job for '${model_id}'..."
     echo "    Environment: ${env_vars}" >&2
@@ -1189,9 +1207,20 @@ start_server_job() {
                        VLLM_USE_RAY_V2_EXECUTOR_BACKEND DISABLE_CUSTOM_ALL_REDUCE \
                        VLLM_CACHE VLLM_CACHE_ROOT TRITON_CACHE_DIR \
                        DG_JIT_CACHE_DIR TORCHINDUCTOR_CACHE_DIR \
+                       CPU_OFFLOAD_GB ENABLE_EXPERT_PARALLEL KV_CACHE_DTYPE \
+                       KV_OFFLOAD_EXPERIMENT KV_OFFLOAD_GB \
+                       LOAD_FORMAT CONTAINER_PYTHONPATH \
                        VLLM_PP_LAYER_PARTITION EXTRA_VLLM_ARGS; do
         if [[ -n "${!forward_var:-}" ]]; then
-            env_vars+=" ${forward_var}=${!forward_var}"
+            # Single-quote the value so a value containing spaces (e.g.
+            # EXTRA_VLLM_ARGS="--kv-offloading-size 120") survives as ONE word in
+            # the remote shell command built below (`${env_vars} sbatch ...`).
+            # Without quoting the remote shell splits on the space and runs the
+            # second token as a command (`bash: 120: command not found`), so the
+            # submit fails. Embedded single quotes are escaped as '\'' .
+            local _q=${!forward_var}
+            _q=${_q//\'/\'\\\'\'}
+            env_vars+=" ${forward_var}='${_q}'"
         fi
     done
 
@@ -1226,6 +1255,9 @@ start_server_job() {
     # TimeLimit=HH:MM:SS.)
     if [[ -n "${TIME_LIMIT:-}" ]]; then
         sbatch_opts+=" --time=${TIME_LIMIT}"
+        echo "    walltime:    ${TIME_LIMIT} (TIME_LIMIT override)" >&2
+    else
+        echo "    walltime:    02:00:00 (run_vllm_server.sh default; set TIME_LIMIT to change)" >&2
     fi
 
     # Debug: echo the exact command being submitted so regressions like
@@ -1931,6 +1963,8 @@ Actions:
 Presets (with default models):
     glm51               GLM-5.1-AWQ (cyankiwi/GLM-5.1-AWQ-4bit) — 2 nodes × 4 GPUs, TP=4 + PP=2
     glm52               GLM-5.2-FP8 (RedHatAI/GLM-5.2-FP8) — 3 nodes × 4 GPUs, TP=4 + PP=3 (needs vLLM main + PR#45895)
+    glm53               GLM-5.3-FP8 (zai-org/GLM-5.3-FP8) — 3 nodes × 4 GPUs, TP=4 + PP=3; reuses the glm52 container (weights not public yet)
+    glm53_v27           Same model on the glm53 container (vLLM v0.27.1 + NGC 26.07, no PR graft) — the upgrade path, unvalidated
     glm47               GLM-4.7-AWQ (QuantTrio/GLM-4.7-AWQ)
     ornith              Ornith 1.0 397B MoE FP8 flagship (deepreinforce-ai/Ornith-1.0-397B-FP8) — 2 nodes × 4 GPUs, TP=4 + PP=2, native MTP (PP-gated), 256K
     ornith_gh200        Ornith 1.0 35B MoE FP8 — single GH200 card, TP=1, MTP, 256K (max single-user throughput)
@@ -2502,25 +2536,31 @@ echo "$jobs" | while IFS='|' read -r jid name state etime tlimit nodes; do
     vllm-*)
       head=$(scontrol show hostnames "$nodes" 2>/dev/null | head -1)
       hl="$CDIR/logs/vllm_server_${jid}_head.log"; wl="$CDIR/logs/vllm_server_${jid}.log"
+      # Multi-node writes the rich log to _head.log; single-node uses the wrapper log.
+      # Fall back to the wrapper log so single-node jobs show real phase/progress.
+      L="$wl"; [ -f "$hl" ] && L="$hl"
       model=$(grep -oE 'Model: +[^[:space:]]+' "$wl" 2>/dev/null | head -1 | awk '{print $NF}')
       mode=$(grep -oE 'CUDAGraph Mode: +[^[:space:]]+' "$wl" 2>/dev/null | head -1 | awk '{print $NF}')
+      # capture-experiment sets --compilation-config directly, so the mode echo can read NONE
+      if { [ -z "$mode" ] || [ "$mode" = NONE ]; } && grep -q '"cudagraph_mode": *"PIECEWISE"' "$wl" 2>/dev/null; then mode="PIECEWISE(cap)"; fi
       tag="${model:-?} [cg=${mode:-?}]"
-      if [ -f "$hl" ] && grep -qE 'Application startup complete|Uvicorn running on' "$hl" 2>/dev/null; then
+      if [ -f "$L" ] && grep -qE 'Application startup complete|Uvicorn running on' "$L" 2>/dev/null; then
         code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://$head:${VPORT}/health" 2>/dev/null)
-        tp=$(grep -oE 'Avg generation throughput: [0-9.]+ tokens/s, Running: [0-9]+ reqs, Waiting: [0-9]+ reqs, GPU KV cache usage: [0-9.]+%' "$hl" 2>/dev/null | tail -1)
+        tp=$(grep -oE 'Avg generation throughput: [0-9.]+ tokens/s, Running: [0-9]+ reqs, Waiting: [0-9]+ reqs, GPU KV cache usage: [0-9.]+%' "$L" 2>/dev/null | tail -1)
         echo "             -> SERVING  $tag  http://$head:${VPORT} (health $code)"
         [ -n "$tp" ] && echo "                ${tp#Avg }"
-      elif [ -f "$hl" ] && grep -qE 'illegal memory access|Traceback \(most recent call last\)|EngineDeadError|Engine core initialization failed|Fatal Python error' "$hl" 2>/dev/null; then
-        echo "             -> ERROR  $tag  (engine failed; tail logs/vllm_server_${jid}_head.log)"
-      elif [ -f "$hl" ] && grep -qE 'Capturing cudagraph|Capturing CUDA graph' "$hl" 2>/dev/null; then
+      elif [ -f "$L" ] && grep -qE 'illegal memory access|Traceback \(most recent call last\)|EngineDeadError|Engine core initialization failed|Fatal Python error' "$L" 2>/dev/null; then
+        echo "             -> ERROR  $tag  (engine failed; tail logs/vllm_server_${jid}.log)"
+      elif [ -f "$L" ] && grep -qE 'Capturing cudagraph|Capturing CUDA graph' "$L" 2>/dev/null; then
         echo "             -> CAPTURING cudagraphs  $tag  (weights loaded)"
-      elif [ -f "$hl" ]; then
-        sh=$(grep -oE 'Loading safetensors checkpoint shards: +[0-9]+% Completed \| [0-9]+/[0-9]+' "$hl" 2>/dev/null | tail -1)
+      elif [ -f "$L" ]; then
+        grep -q 'Loading drafter model' "$L" 2>/dev/null && draft=' (drafter/MTP)' || draft=''
+        sh=$(grep -oE 'Loading safetensors checkpoint shards: +[0-9]+% Completed \| [0-9]+/[0-9]+' "$L" 2>/dev/null | tail -1)
         if [ -n "$sh" ]; then
           nn=$(echo "$sh" | grep -oE '[0-9]+/[0-9]+' | head -1); pct=$(echo "$sh" | grep -oE '[0-9]+%' | head -1)
-          echo "             -> LOADING weights ${nn} (${pct})  $tag"
-        else echo "             -> INIT / Ray bootstrap  $tag"; fi
-      else echo "             -> starting (no head log yet)  $tag"; fi
+          echo "             -> LOADING weights ${nn} (${pct})${draft}  $tag"
+        else echo "             -> INIT / warming up  $tag"; fi
+      else echo "             -> starting (log not ready yet)  $tag"; fi
       ;;
     *build-vllm*)
       bl="$CDIR/build_vllm_${jid}.log"
@@ -2677,25 +2717,29 @@ else
           (vllm-*)
             head=$(scontrol show hostnames "$nodes" 2>/dev/null | head -1)
             hl="$CDIR/logs/vllm_server_${jid}_head.log"; wl="$CDIR/logs/vllm_server_${jid}.log"
+            # Multi-node writes the rich log to _head.log; single-node uses the wrapper log.
+            L="$wl"; [ -f "$hl" ] && L="$hl"
             model=$(grep -oE 'Model: +[^[:space:]]+' "$wl" 2>/dev/null | head -1 | awk '{print $NF}')
             mode=$(grep -oE 'CUDAGraph Mode: +[^[:space:]]+' "$wl" 2>/dev/null | head -1 | awk '{print $NF}')
+            if { [ -z "$mode" ] || [ "$mode" = NONE ]; } && grep -q '"cudagraph_mode": *"PIECEWISE"' "$wl" 2>/dev/null; then mode="PIECEWISE(cap)"; fi
             tag="${model:-?} [cg=${mode:-?}]"
-            if [ -f "$hl" ] && grep -qE 'Application startup complete|Uvicorn running on' "$hl" 2>/dev/null; then
+            if [ -f "$L" ] && grep -qE 'Application startup complete|Uvicorn running on' "$L" 2>/dev/null; then
                 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://$head:${VPORT}/health" 2>/dev/null)
-                tp=$(grep -oE 'Avg generation throughput: [0-9.]+ tokens/s, Running: [0-9]+ reqs, Waiting: [0-9]+ reqs, GPU KV cache usage: [0-9.]+%' "$hl" 2>/dev/null | tail -1)
+                tp=$(grep -oE 'Avg generation throughput: [0-9.]+ tokens/s, Running: [0-9]+ reqs, Waiting: [0-9]+ reqs, GPU KV cache usage: [0-9.]+%' "$L" 2>/dev/null | tail -1)
                 printf "           ${GRN}SERVING${RST}  %s  http://%s:%s (health %s)\n" "$tag" "$head" "$VPORT" "$code"
                 [ -n "$tp" ] && printf "             %s\n" "${tp#Avg }"
-            elif [ -f "$hl" ] && grep -qE 'illegal memory access|Traceback \(most recent call last\)|EngineDeadError|Engine core initialization failed|Fatal Python error' "$hl" 2>/dev/null; then
-                printf "           ${RED}ERROR${RST}  %s  (engine failed; tail logs/vllm_server_%s_head.log)\n" "$tag" "$jid"
-            elif [ -f "$hl" ] && grep -qE 'Capturing cudagraph|Capturing CUDA graph' "$hl" 2>/dev/null; then
+            elif [ -f "$L" ] && grep -qE 'illegal memory access|Traceback \(most recent call last\)|EngineDeadError|Engine core initialization failed|Fatal Python error' "$L" 2>/dev/null; then
+                printf "           ${RED}ERROR${RST}  %s  (engine failed; tail logs/vllm_server_%s.log)\n" "$tag" "$jid"
+            elif [ -f "$L" ] && grep -qE 'Capturing cudagraph|Capturing CUDA graph' "$L" 2>/dev/null; then
                 printf "           ${YEL}CAPTURING${RST} cudagraphs  %s  (weights loaded)\n" "$tag"
-            elif [ -f "$hl" ]; then
-                shd=$(grep -oE 'Loading safetensors checkpoint shards: +[0-9]+% Completed \| [0-9]+/[0-9]+' "$hl" 2>/dev/null | tail -1)
+            elif [ -f "$L" ]; then
+                grep -q 'Loading drafter model' "$L" 2>/dev/null && draft=' (drafter/MTP)' || draft=''
+                shd=$(grep -oE 'Loading safetensors checkpoint shards: +[0-9]+% Completed \| [0-9]+/[0-9]+' "$L" 2>/dev/null | tail -1)
                 if [ -n "$shd" ]; then
                     nn=$(echo "$shd" | grep -oE '[0-9]+/[0-9]+' | head -1); pct=$(echo "$shd" | grep -oE '[0-9]+%' | head -1)
-                    printf "           ${YEL}LOADING${RST} weights %s (%s)  %s\n" "$nn" "$pct" "$tag"
-                else printf "           ${YEL}INIT${RST} / Ray bootstrap  %s\n" "$tag"; fi
-            else printf "           starting (no head log yet)  %s\n" "$tag"; fi
+                    printf "           ${YEL}LOADING${RST} weights %s (%s)%s  %s\n" "$nn" "$pct" "$draft" "$tag"
+                else printf "           ${YEL}INIT${RST} / warming up  %s\n" "$tag"; fi
+            else printf "           starting (log not ready yet)  %s\n" "$tag"; fi
             ;;
           (*build-vllm*)
             bl="$CDIR/build_vllm_${jid}.log"
@@ -2797,7 +2841,7 @@ for k in 4 3 2 1; do
     printf "    %s  %b%s%b%s %3d\n" "$label" "$color" "$bar" "$RST" "$pad" "$c"
 done
 [ "$any_free" -eq 0 ] && printf "    (no free slots on schedulable nodes)\n"
-# Multi-node feasibility callouts: glm51 (PP=2) needs 2 full nodes; glm52
+# Multi-node feasibility callouts: glm51 (PP=2) needs 2 full nodes; glm52/glm53
 # (PP=3) needs 3 full nodes.
 if [ "$full4" -ge 2 ]; then
     printf "    ${GRN}→${RST} 2-node × 4-GPU shape (glm51) can start now (%d full nodes available)\n" "$full4"
@@ -2805,9 +2849,9 @@ else
     printf "    ${YEL}→${RST} 2-node × 4-GPU shape (glm51) cannot start now (%d/2 full nodes available)\n" "$full4"
 fi
 if [ "$full4" -ge 3 ]; then
-    printf "    ${GRN}→${RST} 3-node × 4-GPU shape (glm52) can start now (%d full nodes available)\n" "$full4"
+    printf "    ${GRN}→${RST} 3-node × 4-GPU shape (glm52/glm53) can start now (%d full nodes available)\n" "$full4"
 else
-    printf "    ${YEL}→${RST} 3-node × 4-GPU shape (glm52) cannot start now (%d/3 full nodes available)\n" "$full4"
+    printf "    ${YEL}→${RST} 3-node × 4-GPU shape (glm52/glm53) cannot start now (%d/3 full nodes available)\n" "$full4"
 fi
 echo
 

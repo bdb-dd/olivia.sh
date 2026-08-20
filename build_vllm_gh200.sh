@@ -62,6 +62,17 @@ show_presets() {
     echo "               git-applies it (VLLM_PATCHES=45895). Drop it once PR merges."
     echo "               Same multi-node PP decode wedge as glm51; use proxy serialization."
     echo ""
+    echo "  glm53_v27  - GLM-5.3 (744B, 40B active) on a TAGGED vLLM release"
+    echo "               vLLM: v0.27.1, transformers>=5.5.3, NGC 26.07 (torch 2.13)"
+    echo "               FP8, 12 GPUs (3 nodes × 4× GH200, TP=4 + PP=3). Builds its"
+    echo "               OWN container (vllm-glm53-1) — will not touch glm52's."
+    echo "               GLM-5.3 == GLM-5.2's base re-post-trained, so no new model"
+    echo "               support is needed: the plain 'glm53' SERVE preset reuses the"
+    echo "               glm52 container and needs NO build. This preset exists only"
+    echo "               to retire the pinned-main + PR#45895 graft (PR merged in"
+    echo "               v0.24.0) and pick up the DSA/parser work through v0.27.1."
+    echo "               UNVALIDATED — build against GLM-5.2-FP8 weights first."
+    echo ""
     echo "  gemma4     - Gemma 4 (31B dense, multimodal text+image)"
     echo "               vLLM: v0.19.0, transformers>=5.5.0"
     echo "               ~20GiB @ AWQ, fits 1-2x GH200 (FP8 has known bugs)"
@@ -123,6 +134,12 @@ apply_preset() {
     # preset can pin a newer commit (e.g. glm52 needs fp8_fp4_mqa_logits for
     # GLM-5.2's DSA sparse-attention indexer). Resolved into DEEPGEMM_REF below.
     PRESET_DEEPGEMM_REF=""
+
+    # Default: no preset-specific DeepGEMM *repo* (build falls back to the
+    # upstream deepseek-ai one). vLLM moved its own pin to the vllm-project
+    # DeepGEMM fork, so a preset tracking a modern vLLM release (glm53_v27) must
+    # point here as well as at a ref. Resolved into DEEPGEMM_REPO below.
+    PRESET_DEEPGEMM_REPO=""
 
     case "${preset}" in
         glm51_v19|GLM51_V19|glm51|GLM51|glm-5.1|GLM-5.1)
@@ -195,6 +212,57 @@ apply_preset() {
             # (newest as of 2026-06) ships a later 2.11.0 alpha with that ABI.
             PRESET_NGC_TAG="26.05-py3"
             PRESET_NOTES="GLM-5.2 (744B MoE+DSA) FP8. Builds vLLM main + PR#45895 (skip-topk indexer, grafted via VLLM_PATCHES); not in any release. Multi-node PP wedge as glm51 — pair with proxy serialization."
+            ;;
+        glm53|GLM53|glm-5.3|GLM-5.3|glm53_v27|GLM53_V27)
+            # GLM-5.3 (Z.ai, announced 2026-08-14) is NOT a new architecture and
+            # NOT a new pretrain: it is GLM-5.2's *same 744B base* re-post-trained
+            # (Z.ai's own framing — "every reported gain comes from scaled
+            # post-training"). Same GlmMoeDsaForCausalLM, same ~40B active, same
+            # skip-topk DSA indexer, same 1M context. So nothing about it needs
+            # new *model* support in vLLM — the `glm53` runtime preset therefore
+            # REUSES the already-validated glm52 container (presets.json points it
+            # at container_prefix glm52, index 1) and needs no build at all.
+            #
+            # THIS build preset is the separate upgrade path (`glm53_v27`, its own
+            # vllm-glm53-1-sandbox, so it cannot clobber the working glm52 one).
+            # What it buys over glm52's build:
+            #   - PR#45895 (the skip-topk DSA indexer) MERGED upstream 2026-06-19
+            #     (ab666069) and is an ancestor of every release from v0.24.0 on,
+            #     verified against v0.27.1. So the VLLM_PATCHES graft and the
+            #     unreleased-main-commit pin both go away: we build a TAG.
+            #   - v0.24.0 added the streaming parser engine for GLM-4.7/5.1/5.2
+            #     (better tool-call streaming for Claude Code via anthropic_proxy).
+            #   - v0.27.0 added "skip sparse indexer scoring for short dense
+            #     prefills" (#48407) — straight on the GLM-5.x DSA hot path — plus
+            #     Quark GLM-5.2 checkpoint inference fixes (#48886).
+            # v0.27.0 is a BREAKING environment change: it moves to torch 2.13.0 +
+            # Triton 3.7.1. NGC 26.05 (glm52's base) ships torch 2.12.0a0, so this
+            # preset moves to NGC 26.07 (torch 2.13.0a0 + CUDA 13.3.1) — the newest
+            # tag as of 2026-08-17 and the one that actually matches the pin, which
+            # matters because our --no-deps strategy keeps NGC's torch, not pip's.
+            #
+            # DeepGEMM: vLLM no longer pins the deepseek-ai repo — v0.27.1 pins the
+            # vllm-project/DeepGEMM fork at e21c821f (tools/install_deepgemm.sh,
+            # kept in sync with cmake/external_projects/deepgemm.cmake). GLM-5.x's
+            # DSA indexer calls into it (fp8_fp4_mqa_logits), so match vLLM's pin
+            # exactly rather than guessing a deepseek-ai commit.
+            #
+            # UNVALIDATED as of 2026-08-17: not yet built or served on Olivia, and
+            # GLM-5.3's weights are not public yet (Z.ai promised them ~2 weeks
+            # after launch). Build it against GLM-5.2-FP8 — already in the work-tier
+            # cache — to validate the whole toolchain BEFORE 5.3 weights land; that
+            # is the cheapest way to de-risk this. If it regresses, `glm53` on the
+            # glm52 container is the fallback and needs no rebuild.
+            MODEL_ID="glm53"
+            PRESET_VLLM_VERSION="v0.27.1"
+            # v0.27.1's requirements/common.txt asks for transformers>=5.5.3, which
+            # also satisfies GLM-5.x's own >=5.4.0 floor.
+            PRESET_TRANSFORMERS=">=5.5.3"
+            PRESET_VLLM_PATCHES=""
+            PRESET_DEEPGEMM_REPO="https://github.com/vllm-project/DeepGEMM.git"
+            PRESET_DEEPGEMM_REF="e21c821f39a2056d68067a466c64ddc942200106"
+            PRESET_NGC_TAG="26.07-py3"
+            PRESET_NOTES="GLM-5.3 (== GLM-5.2's base, re-post-trained) FP8 on a TAGGED vLLM: v0.27.1 + NGC 26.07 (torch 2.13) + vllm-project DeepGEMM, NO PR graft (PR#45895 merged upstream). Own container; the plain 'glm53' preset reuses the glm52 one instead. UNVALIDATED — build against GLM-5.2-FP8 first."
             ;;
         gemma4|Gemma4|gemma-4|Gemma-4)
             MODEL_ID="gemma4"
@@ -392,6 +460,12 @@ NGC_IMAGE="${NGC_IMAGE:-docker://nvcr.io/nvidia/pytorch:${NGC_PYTORCH_TAG}}"
 # into the Phase 3 build container below.
 DEEPGEMM_REF="${DEEPGEMM_REF:-${PRESET_DEEPGEMM_REF:-59f2c07}}"
 
+# Resolve the DeepGEMM repo the same way. Default stays the upstream deepseek-ai
+# repo (what every existing preset's pinned ref lives in); vLLM's own pin now
+# lives in the vllm-project fork, so a preset on a modern vLLM release points
+# there (see cmake/external_projects/deepgemm.cmake in the vLLM tree).
+DEEPGEMM_REPO="${DEEPGEMM_REPO:-${PRESET_DEEPGEMM_REPO:-https://github.com/deepseek-ai/DeepGEMM.git}}"
+
 # Upstream vLLM PRs to graft onto the cloned source during Phase 3 (space-
 # separated PR numbers). Defaults to the preset's list; override with
 # VLLM_PATCHES="..." or disable with VLLM_PATCHES="".
@@ -432,7 +506,7 @@ echo "  Sandbox:        ${SANDBOX_NAME}"
 echo "  Sandbox path:   ${SANDBOX_PATH}"
 echo "  vLLM version:   ${VLLM_VERSION}"
 echo "  vLLM patches:   ${VLLM_PATCHES:-<none>}"
-echo "  DeepGEMM ref:   ${DEEPGEMM_REF}"
+echo "  DeepGEMM ref:   ${DEEPGEMM_REF} (${DEEPGEMM_REPO})"
 echo "  NGC base:       ${NGC_IMAGE}"
 echo ""
 
@@ -605,6 +679,7 @@ export PRESET_TRANSFORMERS="${PRESET_TRANSFORMERS}"
 export VLLM_VERSION="${VLLM_VERSION}"
 export VLLM_PATCHES="${VLLM_PATCHES}"
 export DEEPGEMM_REF="${DEEPGEMM_REF}"
+export DEEPGEMM_REPO="${DEEPGEMM_REPO}"
 
 # Reproducible PR graft (#2): if a snapshot dir was deployed alongside this script
 # (olivia.sh deploys ./patches/), bind it read-only so the VLLM_PATCHES step in
@@ -625,6 +700,7 @@ singularity exec ${SING_OPTS} ${PATCHES_BIND} \
     --env "VLLM_VERSION=${VLLM_VERSION}" \
     --env "VLLM_PATCHES=${VLLM_PATCHES}" \
     --env "DEEPGEMM_REF=${DEEPGEMM_REF}" \
+    --env "DEEPGEMM_REPO=${DEEPGEMM_REPO}" \
     --env "NGC_PYTORCH_TAG=${NGC_PYTORCH_TAG}" \
     --bind "${PIP_CACHE}:/root/.cache/pip" \
     "${SANDBOX_PATH}" /bin/bash << 'BUILDSCRIPT'
@@ -896,6 +972,36 @@ PYPATCH_LL_BF16_QUACK
 # is redundant (already set above), so drop it. No-ops on vLLM without this file.
 # Idempotent.
 python3 << 'PYPATCH_CUTLASS_WEIGHTLOADER'
+
+# --- PYPATCH_HAS_CUTEDSL_QUACK ------------------------------------------------
+# vllm/utils/import_utils.py has_cutedsl() reports capability from `cutlass` alone,
+# but every cutedsl code path also imports `quack` -- e.g.
+# models/deepseek_v4/nvidia/ops/fused_indexer_q_cutedsl.py does
+# `from quack.compile_utils import make_fake_tensor`. On this container (cute-dsl
+# present, quack absent) the check returns True, the guarded lazy import then
+# raises ModuleNotFoundError INSIDE the attention forward, and every worker dies.
+# Verified on-cluster 2026-08-19 (job 2043640, DeepSeek-V4-Flash).
+#
+# Installing quack is not an option: quack-kernels 0.6.4 pins
+# nvidia-cutlass-dsl==4.6.2 while vLLM v0.27.1 pins 4.6.0 -- mutually
+# unsatisfiable, and bumping cutlass-dsl is what broke Ornith. Reporting the
+# capability honestly makes callers take their existing non-cutedsl fallback,
+# which is the same remedy as PYPATCH_LL_BF16_QUACK above.
+python3 - <<'PYEOF' || echo "  has_cutedsl patch skipped (anchor absent, OK on other vLLM versions)"
+import glob, sys
+hits = glob.glob('/usr/local/lib/python3.12/dist-packages/vllm/utils/import_utils.py')
+old = '    return _has_module("cutlass")'
+new = '    return _has_module("cutlass") and _has_module("quack")'
+for p in hits:
+    s = open(p).read()
+    if new in s:
+        print('  has_cutedsl already requires quack'); break
+    if old not in s:
+        print('  has_cutedsl anchor not found (OK)'); break
+    open(p, 'w').write(s.replace(old, new, 1))
+    print('  PYPATCH_HAS_CUTEDSL_QUACK: has_cutedsl() now also requires quack')
+PYEOF
+
 import os
 f = "/opt/vllm/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py"
 if not os.path.exists(f):
@@ -1454,11 +1560,48 @@ pip install --no-cache-dir --no-deps --root-user-action=ignore flash-attn --no-b
 # change landed, so it matches vLLM v0.19.0's call convention.
 echo ""
 DEEPGEMM_REF="${DEEPGEMM_REF:-59f2c07}"
-echo "Installing DeepGEMM @ ${DEEPGEMM_REF} (required for GLM-5.1 DSA indexer and FP8 MoE)..."
+# Repo defaults to upstream deepseek-ai (where every pre-existing preset's pinned
+# ref lives). vLLM's own DeepGEMM pin moved to the vllm-project fork, so presets
+# tracking a modern vLLM release (glm53_v27) set DEEPGEMM_REPO to that fork.
+DEEPGEMM_REPO="${DEEPGEMM_REPO:-https://github.com/deepseek-ai/DeepGEMM.git}"
+echo "Installing DeepGEMM @ ${DEEPGEMM_REF} from ${DEEPGEMM_REPO} (required for GLM-5.x DSA indexer and FP8 MoE)..."
 pip install --no-cache-dir --no-deps --root-user-action=ignore --no-build-isolation \
-    "git+https://github.com/deepseek-ai/DeepGEMM.git@${DEEPGEMM_REF}" 2>&1 | tail -30 || {
+    "git+${DEEPGEMM_REPO}@${DEEPGEMM_REF}" 2>&1 | tail -30 || {
     echo "Warning: DeepGEMM install failed. GLM-5.1 (DSA) will not be able to load;"
-    echo "         other presets are unaffected. Override DEEPGEMM_REF to pin a commit."
+    echo "         other presets are unaffected. Override DEEPGEMM_REF/DEEPGEMM_REPO."
+}
+
+# tilelang — required by DeepSeek-V4's "mhc" (head-compression) attention path.
+# Without it the model loads and then dies at worker start with:
+#   ImportError: tilelang is required for mhc but is not installed.
+# (verified on-cluster 2026-08-18, job 2037091). It is a pure wheel on aarch64
+# (manylinux_2_34_aarch64 exists for 0.1.13), so this adds no compile time.
+# Installed unconditionally and failure-tolerated, exactly like DeepGEMM above:
+# it is additive for every other preset, and making it preset-conditional would
+# mean a container that serves DeepSeek only if it happened to be built for it.
+echo ""
+echo "Installing tilelang (required by DeepSeek-V4 mhc attention)..."
+# PIN to the version vLLM asks for. v0.27.1 requires tilelang==0.1.12 exactly; an
+# unpinned install resolves 0.1.13 and pip then reports it as incompatible. Bump
+# this in step with VLLM_VERSION. TILELANG_REF overrides.
+TILELANG_REF="${TILELANG_REF:-0.1.12}"
+# apache-tvm-ffi must be pinned ALONGSIDE tilelang or the two disagree and the
+# workers abort at startup with a C++ terminate, not a Python traceback:
+#   terminate called after throwing an instance of 'tvm::ffi::Error'
+#     what(): TypeAttr `__ffi_repr__` is already registered for type index 130
+# (verified on-cluster 2026-08-19, job 2043587: weights loaded fine, then all four
+# workers died during model init). The container had drifted to 0.1.12, which
+# satisfies NEITHER vLLM v0.27.1 (requires ==0.1.11) NOR tilelang 0.1.12
+# (requires <=0.1.11). flashinfer accepts anything <0.2, so 0.1.11 is the single
+# version all three agree on — pinning it brings the container back INTO
+# compliance with vLLM's own requirement rather than away from it.
+TVM_FFI_REF="${TVM_FFI_REF:-0.1.11}"
+pip install --no-cache-dir --no-deps --root-user-action=ignore "apache-tvm-ffi==${TVM_FFI_REF}" 2>&1 | tail -3 || {
+    echo "Warning: apache-tvm-ffi pin failed; tilelang/DeepSeek-V4 may abort at worker init."
+}
+pip install --no-cache-dir --no-deps --root-user-action=ignore "tilelang==${TILELANG_REF}" 2>&1 | tail -5 || {
+    echo "Warning: tilelang install failed. DeepSeek-V4 will not load (mhc path);"
+    echo "         all other presets are unaffected."
 }
 
 # vLLM main (post-v0.20) ships a Rust frontend under vllm/vllm-rs (tokenizer,
@@ -1658,12 +1801,31 @@ except Exception as e:
     print("  Container builds but cannot serve — check the dependency-install phase.")
     sys.exit(1)
 
-# Check if CUDA graphs work (this is the key test)
-try:
-    from vllm.worker.model_runner import CUDAGraphRunner
-    print("CUDA Graphs module: ✓")
-except ImportError as e:
-    print(f"CUDA Graphs module: ⚠ {e}")
+# Check that a CUDAGraph capture path is importable.
+#
+# `vllm.worker.model_runner.CUDAGraphRunner` is the V0 engine layout and no longer
+# exists on modern vLLM: V1 moved workers under `vllm.v1.worker` and replaced the
+# CUDAGraphRunner class with the CUDAGraphWrapper dispatcher in
+# `vllm.compilation.cuda_graph`. So on anything recent the old probe reported
+# "⚠ No module named 'vllm.worker'" on EVERY build — a stale check reading as a
+# real defect (seen on the v0.27.1/glm53 build). Try the V1 path first, fall back
+# to V0 so older pinned presets (glm51 v0.19.0, kimi v0.19.1) still report ✓.
+_cudagraph_probe = None
+for _mod, _sym in (
+    ("vllm.compilation.cuda_graph", "CUDAGraphWrapper"),   # V1 (current)
+    ("vllm.v1.worker.gpu_model_runner", "GPUModelRunner"), # V1 fallback
+    ("vllm.worker.model_runner", "CUDAGraphRunner"),       # V0 (legacy pins)
+):
+    try:
+        __import__(_mod, fromlist=[_sym])
+        _cudagraph_probe = f"{_mod}.{_sym}"
+        break
+    except ImportError:
+        continue
+if _cudagraph_probe:
+    print(f"CUDA Graphs module: ✓ ({_cudagraph_probe})")
+else:
+    print("CUDA Graphs module: ⚠ no known capture path importable")
 
 # Check torch.compile availability
 try:

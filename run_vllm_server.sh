@@ -76,6 +76,8 @@ TP_SIZE="${TP_SIZE:-4}"                    # Tensor parallel size (per-node for 
 PP_SIZE="${PP_SIZE:-1}"                    # Pipeline parallel size (1=single-node, 2=across nodes)
 NUM_NODES="${NUM_NODES:-1}"                # Number of nodes to use (1 or 2)
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"       # GPU memory utilization
+CPU_OFFLOAD_GB="${CPU_OFFLOAD_GB:-}"       # Per-GPU weight offload to CPU/Grace LPDDR5X (GiB); empty=none
+KV_OFFLOAD_GB="${KV_OFFLOAD_GB:-}"         # Native CPU KV-cache tier (GiB, total across TP ranks); empty=none. Auto-drops expandable_segments
 # Ray compiled-DAG step timeout (seconds). Ray v2's default of 300s is too
 # short for multi-node PP inference over Slingshot: a single engine step can
 # run longer than that during big generations, and the raylet hits an
@@ -306,8 +308,21 @@ export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-NVL}"        # Use NVLink for P2P
 export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-PHB}" # GPU Direct RDMA level
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"         # Enable InfiniBand if available
 
-# Memory optimizations
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+# Memory optimizations. Override-respecting so a KV-offload run can drop it (below).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+# KV-offload experiment (queue item (b), plans/proposed/glm52_kv_tiering.md). vLLM
+# HARD-REJECTS any KV connector (--kv-offloading-size / --kv-transfer-config) when
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True — its CUDA VMM allocator can remap
+# KV pages, invalidating pinned/registered KV memory (ValueError at config validation,
+# before load). Set KV_OFFLOAD_EXPERIMENT=1 to drop expandable_segments so the native
+# CPU KV-offload path can start. TRADE-OFF: expandable_segments is our anti-
+# fragmentation guard on the tight-HBM offload path — watch for fragmentation OOM; the
+# alternative (keep it + enable the cumem allocator) is heavier. Forwarded by olivia.sh.
+if [[ "${KV_OFFLOAD_EXPERIMENT:-0}" == "1" || -n "${KV_OFFLOAD_GB:-}" ]]; then
+    export PYTORCH_CUDA_ALLOC_CONF=""
+    echo "[INFO] KV offload requested: dropped PYTORCH_CUDA_ALLOC_CONF=expandable_segments (required for KV connectors; watch for fragmentation OOM)"
+fi
 
 # Logging configuration
 # Set VERBOSE=1 for detailed vLLM + Ray + NCCL logging. Useful when debugging
@@ -661,6 +676,33 @@ if [[ "${IS_GLM5}" == "1" && "${IS_AWQ}" == "1" ]]; then
     export VLLM_USE_FLASHINFER_MOE_FP16=1
 fi
 
+# Single-node GLM-5.2 AWQ CANNOT load without weight offload: the ~415 GiB AWQ
+# checkpoint is ~104 GB/GPU across 4 GH200, over the 96 GB HBM before any KV. So
+# default a conservative per-GPU offload when running single-node AWQ GLM-5.2 and
+# the user hasn't pinned one — otherwise the job OOMs at load. The offload SWEEP
+# (plans/proposed/glm52_awq_1n_offload.md) refines this value; 40 is a safe start
+# (~64 GB/GPU resident weights, ~32 GB/GPU freed for bf16 KV).
+if [[ "${IS_GLM52}" == "1" && "${IS_AWQ}" == "1" && "${NUM_NODES}" -le 1 && -z "${CPU_OFFLOAD_GB:-}" ]]; then
+    CPU_OFFLOAD_GB=40
+    echo "[INFO] single-node GLM-5.2 AWQ: defaulting CPU_OFFLOAD_GB=${CPU_OFFLOAD_GB} (weights exceed HBM without offload)"
+fi
+
+# GLM-5.2 cold load is vLLM-pipeline-bound, not I/O-bound: the default loader
+# takes ~56 min for the ~415 GiB AWQ checkpoint (and MTP double-loads to ~84 min).
+# The Run:ai Model Streamer parallelizes the safetensors read ~6x — VALIDATED at
+# ~9.5 min on glm52_awq_1n (loads, serves, decodes cleanly). It ships as a pip
+# package we can't install offline into the container, so it's staged under the
+# persistent (projects) HF_HOME and imported via PYTHONPATH (CONTAINER_PYTHONPATH).
+# Default it on for GLM-5.2 when that staged package is present next to HF_HOME;
+# no-op (fall back to the default loader) when it's absent — e.g. the FP8 preset
+# resolves HF_HOME to the work tier where the pkg isn't staged. Fully overridable
+# via LOAD_FORMAT / CONTAINER_PYTHONPATH.
+if [[ "${IS_GLM52}" == "1" && -z "${LOAD_FORMAT:-}" && -d "${HF_HOME:-}/runai-pkg" ]]; then
+    LOAD_FORMAT=runai_streamer
+    CONTAINER_PYTHONPATH="${CONTAINER_PYTHONPATH:-${HF_HOME}/runai-pkg}"
+    echo "[INFO] GLM-5.2: defaulting LOAD_FORMAT=runai_streamer (staged pkg at ${HF_HOME}/runai-pkg; ~6x faster cold load)"
+fi
+
 # GLM-5.2 FP8: block-wise FP8 ([128,128], e4m3) is the DeepSeek-style quant, so
 # it runs through DeepGEMM on Hopper rather than the AWQ flashinfer-MoE path.
 # Enable DeepGEMM and keep the FP8 (not FP16) MoE kernel. DeepGEMM JIT warmup
@@ -828,10 +870,26 @@ USE_SPECULATIVE=0
 if [[ "${ENABLE_SPECULATIVE}" == "1" ]]; then
     USE_SPECULATIVE=1
 elif [[ "${ENABLE_SPECULATIVE}" == "auto" ]]; then
-    # Auto-enable MTP for GLM-4.7/GLM-5.1 (improves throughput significantly)
-    if [[ "${IS_GLM_MOE}" == "1" ]]; then
+    # Auto-enable MTP for GLM-4.7/GLM-5.1 (improves throughput significantly).
+    # EXCLUDE GLM-5.2: its MTP draft (DeepSeekMTPModel) is loaded as a SECOND full
+    # 83-shard checkpoint pass — doubling an already ~53-min cold load — and MTP on
+    # the new GLM-5.2 DSA arch is unproven here (2-node PP>1 disables it anyway; the
+    # PP=1 single-node offload path auto-enabled it unintentionally, observed
+    # 2026-07-01 job 1424649). Make it opt-in for GLM-5.2 via ENABLE_SPECULATIVE=1.
+    if [[ "${IS_GLM_MOE}" == "1" && "${IS_GLM52}" != "1" ]]; then
         USE_SPECULATIVE=1
         echo "[INFO] Auto-enabling MTP speculative decoding for GLM MoE model"
+    elif [[ "${IS_GLM52}" == "1" && "${MODEL}" == *MTP* ]]; then
+        # GLM-5.2 MTP-GRAFTED checkpoint (dnhkng graft: cyankiwi AWQ body + the FP8
+        # layer-78 MTP head from GLM-5.2-FP8). The plain cyankiwi AWQ checkpoint
+        # DROPPED layer-78 during quantization → MTP init dies (deepseek_mtp.py:480
+        # ValueError, observed job 1424649). Only enable MTP when the checkpoint
+        # path signals the graft ("MTP"), and note: the container's vLLM must carry
+        # the awq+fp8-mtp quant-config patch (patches/vllm-awq-fp8-mtp-quant-config.patch).
+        USE_SPECULATIVE=1
+        echo "[INFO] GLM-5.2 MTP-grafted checkpoint: auto-enabling MTP speculative decoding"
+    elif [[ "${IS_GLM52}" == "1" ]]; then
+        echo "[INFO] GLM-5.2 (non-MTP checkpoint): MTP not auto-enabled — cyankiwi AWQ lacks layer-78 weights. Use an MTP-grafted checkpoint (path contains 'MTP') to enable it."
     fi
     # DeepSeek-V4-Flash: MTP is OPT-IN, despite the head being present.
     #
@@ -1183,6 +1241,34 @@ VLLM_ARGS=(
     "--host" "${HOST}"
     "--port" "${PORT}"
 )
+
+# CPU/Grace weight offload (per GPU). On GH200 the offloaded weights live in the
+# Hopper GPU's coherent Grace LPDDR5X and stream back over C2C (~450 GB/s) each
+# forward. This is the lever that lets a model whose per-GPU shard exceeds the
+# 96 GB HBM (e.g. single-node GLM-5.2-AWQ, ~104 GB/GPU) fit — trading some decode
+# latency for HBM freed up for KV. Only emitted when set > 0.
+if [[ -n "${CPU_OFFLOAD_GB:-}" && "${CPU_OFFLOAD_GB}" != "0" ]]; then
+    VLLM_ARGS+=("--cpu-offload-gb" "${CPU_OFFLOAD_GB}")
+fi
+
+# Native CPU KV-cache offload (queue item (b), plans/proposed/glm52_kv_tiering.md):
+# bulk KV blocks are tiered to coherent Grace LPDDR and reloaded on prefix reuse.
+# KV_OFFLOAD_GB is the TOTAL CPU tier size in GiB summed across TP ranks (vLLM's
+# --kv-offloading-size; backend defaults to 'native' → OffloadingConnector +
+# CPUOffloadingSpec). Requires expandable_segments off — handled above (setting
+# KV_OFFLOAD_GB drops it automatically). Distinct from CPU_OFFLOAD_GB (that offloads
+# *weights*); both can be set together. Validated 2026-07-03 (job 1473586: store +
+# reload proven on GLM-5.2 DSA). Note the connector reserves ~25K tok of HBM.
+if [[ -n "${KV_OFFLOAD_GB:-}" && "${KV_OFFLOAD_GB}" != "0" ]]; then
+    VLLM_ARGS+=("--kv-offloading-size" "${KV_OFFLOAD_GB}")
+    echo "[INFO] native KV offload: --kv-offloading-size ${KV_OFFLOAD_GB} GiB (CPU tier, total across TP ranks)"
+fi
+
+# Optional load-format override, e.g. LOAD_FORMAT=runai_streamer for a parallel
+# streaming loader (needs runai_model_streamer importable — see CONTAINER_PYTHONPATH).
+if [[ -n "${LOAD_FORMAT:-}" ]]; then
+    VLLM_ARGS+=("--load-format" "${LOAD_FORMAT}")
+fi
 
 # CUDAGraph knob. NONE → disable all compilation (mode=NONE). Anything else →
 # keep compilation enabled and only override cudagraph_mode. Unset → no flag,
@@ -1695,6 +1781,26 @@ SING_CMD=(
     # files we deploy alongside run_vllm_server.sh).
     --bind "${CONTAINER_DIR}:${CONTAINER_DIR}"
 )
+
+# If MODEL is a LOCAL directory (e.g. the grafted AWQ+FP8-MTP checkpoint at
+# /cluster/projects/<proj>/models/...), its path must be visible INSIDE the
+# container. The default binds cover HF_HOME + CONTAINER_DIR but not arbitrary
+# local model dirs, so without this the path doesn't exist in the job, transformers
+# treats it as a HF repo id, and config resolution dies with
+# "Repo id must be in the form 'repo_name' or 'namespace/repo_name'". Bind the model
+# dir (its internal symlinks resolve into HF_HOME, which is already bound).
+if [[ "${MODEL}" == /* && -d "${MODEL}" ]]; then
+    SING_CMD+=(--bind "${MODEL}:${MODEL}")
+    echo "  Local model bind: ${MODEL}"
+fi
+
+# Optional: prepend a PYTHONPATH inside the container (e.g. a staged
+# runai_model_streamer package under HF_HOME) so a pip package we can't install
+# offline is still importable. The path must live under an already-bound dir.
+if [[ -n "${CONTAINER_PYTHONPATH:-}" ]]; then
+    SING_CMD+=(--env "PYTHONPATH=${CONTAINER_PYTHONPATH}")
+    echo "  Container PYTHONPATH: ${CONTAINER_PYTHONPATH}"
+fi
 
 # GLM-5.2 block-FP8 sets VLLM_DEEP_GEMM_WARMUP=skip to avoid the multi-minute
 # DeepGEMM JIT warmup at startup. Only forward it when set so other models keep

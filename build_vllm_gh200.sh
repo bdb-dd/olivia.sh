@@ -1789,6 +1789,42 @@ pip install --no-cache-dir --no-deps --root-user-action=ignore "tilelang==${TILE
     echo "         all other presets are unaffected."
 }
 
+# z3-solver is tilelang's ONE dependency that --no-deps must not skip.
+#
+# `--no-deps` above exists to stop pip replacing NGC's PyTorch, but it also drops
+# tilelang's declared `z3-solver<4.15.5,>=4.13.0`. tilelang then dlopens
+# **libz3.so.4.15** in its lazy_init and dies with
+#   OSError: libz3.so.4.15: cannot open shared object file: No such file or directory
+# The container's apt `libz3-4` does NOT satisfy this: Ubuntu 24.04 ships z3 4.8.x,
+# i.e. soname libz3.so.4, so only the pip wheel (which bundles its own versioned
+# .so) works. z3-solver is self-contained and has NO torch dependency, so it cannot
+# clobber NGC PyTorch — this is safe to install here.
+#
+# Cost of learning this the hard way: GLM-5.3-Flash reached a 4-GPU allocation and
+# died at ENGINE INIT (job 2673535, 2026-10-29), because glm5next's layer
+# construction imports tilelang. Pin inside tilelang's own declared range.
+Z3_SOLVER_REF="${Z3_SOLVER_REF:->=4.13.0,<4.15.5}"
+echo "Installing z3-solver ${Z3_SOLVER_REF} (tilelang needs libz3.so.4.15)..."
+pip install --no-cache-dir --no-deps --root-user-action=ignore "z3-solver${Z3_SOLVER_REF}" 2>&1 | tail -3 || {
+    echo "Warning: z3-solver install failed — tilelang will not import."
+}
+
+# Build-time import probe. tilelang is imported during MODEL CONSTRUCTION, so a
+# broken install is otherwise invisible until a GPU allocation is already spent.
+# Fail here, loudly, where it costs nothing. (Same spirit as the flashinfer probe,
+# but tilelang is REQUIRED by the glm5next/DeepSeek-V4 paths, so we fix rather than
+# uninstall it.)
+if python3 -c "import tilelang" 2>/tmp/tilelang_probe.txt; then
+    echo "tilelang: imports cleanly ✓"
+else
+    echo "⚠ WARNING: tilelang does NOT import after install:"
+    sed -e "s/^/    /" /tmp/tilelang_probe.txt | tail -5
+    echo "    Presets whose model construction imports tilelang (glm53flash,"
+    echo "    dsv4flash) will die at ENGINE INIT after their weights load."
+    echo "    If the error names a missing libz3, adjust Z3_SOLVER_REF."
+fi
+rm -f /tmp/tilelang_probe.txt
+
 # vLLM main (post-v0.20) ships a Rust frontend under vllm/vllm-rs (tokenizer,
 # tool/reasoning parsers, incl. the deepseek_v32 renderer used by DSA models).
 # Its pyproject build needs an actual Rust toolchain (cargo/rustc) in addition

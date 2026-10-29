@@ -400,8 +400,41 @@ fi
 # IS_GLM52 as the "5.2-family profile" flag and keep IS_GLM53 for reporting and
 # for any future 5.3-only divergence. If Z.ai ever ships a 5.3 that ISN'T the 5.2
 # base, split them here first.
+# Detect GLM-5.3-FLASH. This MUST be tested before IS_GLM53 below, and IS_GLM53
+# must exclude it, because the string "GLM-5.3" matches BOTH — and they are not
+# the same model in any respect that matters to a serving stack:
+#
+#   GLM-5.3        744B/40B-active, GlmMoeDsaForCausalLM, text-only. GLM-5.2's
+#                  base re-post-trained → inherits the whole 5.2 runtime profile.
+#   GLM-5.3-Flash  320B/18B-active, Glm5NextForConditionalGeneration, natively
+#                  MULTIMODAL, a NEW architecture and a NEW pretrain.
+#
+# Letting Flash fall into the 5.2 family would hand it the PP=3 layer partition,
+# the glm52 eager default, --trust-remote-code and the DSA assumptions of a
+# different architecture. Verified from the published config.json (2026-09-01):
+#   - 45 layers, HYBRID attention: 34 KDA linear-attention + 11 NoPE sparse-MLA
+#     (layer_types, linear_attn_config.kda_layers). So do NOT force FLASH_ATTN —
+#     the linear layers need a GDN/mamba kernel and recurrent state, exactly like
+#     Ornith and Qwen3.8.
+#   - MoE: 288 routed experts, 8 active + 1 shared, first 3 layers dense.
+#   - Quant is BLOCK-FP8 (weight_scale_inv tensors, e4m3 dynamic) → the DeepGEMM
+#     lane, same as glm52/qwen38/dsv4 — not Ornith's channel/token W8A8.
+#   - Vision tower present (347 model.visual.* tensors). We serve it for TEXT;
+#     the encoder just loads, as with Ornith/Qwen3.8/Borealis.
+#   - MTP head IS genuinely shipped, but NOT under an `mtp.*` name: it is stored
+#     as language layer 45 — one PAST num_hidden_layers=45 — carrying the
+#     eh_proj/enorm/hnorm nextn signature plus its own 288-expert MoE. Grepping
+#     for "mtp" in the weight_map finds ZERO tensors and would wrongly conclude
+#     the head is missing (the Ornith trap in reverse). vLLM registers
+#     Glm5NextMTPModel (v0.30.0+), so the loader side exists too — see the
+#     speculative block for why it is still opt-in on the first serve.
+IS_GLM53_FLASH=0
+if [[ "${MODEL}" == *"GLM-5.3-Flash"* ]] || [[ "${MODEL}" == *"glm-5.3-flash"* ]]; then
+    IS_GLM53_FLASH=1
+fi
+
 IS_GLM53=0
-if [[ "${MODEL}" == *"GLM-5.3"* ]] || [[ "${MODEL}" == *"glm-5.3"* ]]; then
+if [[ "${IS_GLM53_FLASH}" == "0" ]] && { [[ "${MODEL}" == *"GLM-5.3"* ]] || [[ "${MODEL}" == *"glm-5.3"* ]]; }; then
     IS_GLM53=1
     IS_GLM52=1
 fi
@@ -573,9 +606,12 @@ if [[ "${IS_ORNITH}" == "1" && "${PP_SIZE}" -gt 1 && -z "${CUDAGRAPH_MODE}" ]]; 
     CUDAGRAPH_MODE="PIECEWISE"
 fi
 
-# Any GLM MoE model that uses the glm47/glm45 parser family
+# Any GLM MoE model that uses the glm47/glm45 parser family. GLM-5.3-Flash is in
+# this set (vLLM's own recipe serves it with --tool-call-parser glm47
+# --reasoning-parser glm45) but deliberately NOT in IS_GLM5 above: it shares the
+# parsers, not the 744B DSA runtime profile.
 IS_GLM_MOE=0
-if [[ "${IS_GLM47}" == "1" || "${IS_GLM5}" == "1" ]]; then
+if [[ "${IS_GLM47}" == "1" || "${IS_GLM5}" == "1" || "${IS_GLM53_FLASH}" == "1" ]]; then
     IS_GLM_MOE=1
 fi
 
@@ -619,6 +655,14 @@ if [[ -z "${MAX_MODEL_LEN+x}" ]]; then
         #                 ~280 GB for KV (~18 sequences at full 256K). For higher
         #                 concurrency, lower this or set KV_CACHE_DTYPE=fp8_e4m3.
         MAX_MODEL_LEN=262144
+    elif [[ "${IS_GLM53_FLASH}" == "1" ]]; then
+        # Native window is 1,048,576. Default to 131072 for the same reason as
+        # DeepSeek-V4-Flash: the full 1M would spend the whole KV budget on one
+        # sequence. The hybrid attention makes that budget go unusually far
+        # (only 11 of 45 layers hold a KV cache, and those are MLA with
+        # kv_lora_rank=512), so this is a starting point, not a ceiling — raise it
+        # explicitly once the KV pool size is known from a real serve.
+        MAX_MODEL_LEN=131072
     elif [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" ]]; then
         # GLM-5.1 ~205K, GLM-5.2/5.3 ~1M, Kimi K2.6 ~256K, Laguna M.1 ~256K native —
         # all ship far larger windows, but 128K is the safe default within budget.
@@ -760,6 +804,34 @@ if [[ "${IS_DSV4}" == "1" && "${IS_AWQ}" == "0" ]]; then
     KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 fi
 
+# GLM-5.3-Flash block-FP8: `weight_scale_inv` in the weight_map is the DeepSeek
+# blocked-quant signature, so it rides the same DeepGEMM lane as glm52/qwen38/
+# dsv4 — not Ornith's channel/token W8A8. Skip the JIT warmup as they all do
+# (it adds minutes to startup); override VLLM_DEEP_GEMM_WARMUP="" to warm up.
+if [[ "${IS_GLM53_FLASH}" == "1" && "${IS_AWQ}" == "0" ]]; then
+    if [[ "${VLLM_USE_DEEP_GEMM_EXPLICIT}" == "0" ]]; then
+        export VLLM_USE_DEEP_GEMM=1
+    fi
+    export VLLM_DEEP_GEMM_WARMUP="${VLLM_DEEP_GEMM_WARMUP:-skip}"
+
+    # FP8 KV CACHE IS NOT AVAILABLE ON HOPPER FOR THIS MODEL. vLLM's own recipe
+    # is explicit: "On Blackwell you can add --kv-cache-dtype fp8 ...; Hopper does
+    # not support FP8 KV cache for this model and must run BF16 KV." Every GH200
+    # is Hopper, so the fp8 KV that DeepSeek-V4-Flash *requires* is exactly what
+    # this model must NOT get — the third distinct KV-dtype rule among four MLA
+    # models we serve, which is why there is no family-wide default here.
+    #
+    # A stray KV_CACHE_DTYPE=fp8 (e.g. copied from the dsv4 or ornith recipe, or
+    # left in a shell) would otherwise fail at engine init after a long weight
+    # load. Clear it with a loud warning instead; FORCE_KV_CACHE_DTYPE=1 keeps it
+    # for anyone deliberately testing a Blackwell-style config.
+    if [[ -n "${KV_CACHE_DTYPE:-}" && "${KV_CACHE_DTYPE}" == fp8* && "${FORCE_KV_CACHE_DTYPE:-0}" != "1" ]]; then
+        echo "[WARN] GLM-5.3-Flash on Hopper must run BF16 KV — ignoring KV_CACHE_DTYPE=${KV_CACHE_DTYPE}."
+        echo "[WARN] (FP8 KV cache for this model is Blackwell-only; set FORCE_KV_CACHE_DTYPE=1 to override.)"
+        KV_CACHE_DTYPE=""
+    fi
+fi
+
 # --- GLM-5.2-family multi-node bits that are QUANT-INDEPENDENT --------------
 # These two used to live inside the `IS_AWQ == 0` branch above, which was fine
 # while block-FP8 was the only GLM-5.2 quant. It no longer is: a complete
@@ -810,8 +882,13 @@ fi
 # from whatever is installed — if nothing works, the error will tell us what
 # to install.
 if [[ -z "${VLLM_ATTENTION_BACKEND}" ]]; then
-    if [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_ORNITH}" == "1" || "${IS_QWEN38}" == "1" || "${IS_BOREALIS}" == "1" || "${IS_DSV4}" == "1" ]]; then
+    if [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_ORNITH}" == "1" || "${IS_QWEN38}" == "1" || "${IS_BOREALIS}" == "1" || "${IS_DSV4}" == "1" || "${IS_GLM53_FLASH}" == "1" ]]; then
         # Don't force FLASH_ATTN — these need vLLM to auto-select a special backend:
+        #   GLM-5.3-Flash HYBRID *and* sparse-MLA in one model: 34 KDA linear-attn
+        #     layers (need a GDN kernel + recurrent state) interleaved with 11 NoPE
+        #     sparse-MLA layers (need a sparse-MLA backend, and specifically one
+        #     that handles qk_rope_head_dim=0 — FlashInfer >= 0.6.18 provides it).
+        #     No single forced backend can serve both halves.
         #   Qwen3.8  HYBRID, same as Ornith (48 linear-attn + 16 full layers).
         #   Borealis (Gemma 3) MULTIMODAL PrefixLM. Forcing FLASH_ATTN here is a
         #     HARD FAILURE, verified on-cluster 2026-08-18 (job 2032118 died at
@@ -876,7 +953,7 @@ elif [[ "${ENABLE_SPECULATIVE}" == "auto" ]]; then
     # the new GLM-5.2 DSA arch is unproven here (2-node PP>1 disables it anyway; the
     # PP=1 single-node offload path auto-enabled it unintentionally, observed
     # 2026-07-01 job 1424649). Make it opt-in for GLM-5.2 via ENABLE_SPECULATIVE=1.
-    if [[ "${IS_GLM_MOE}" == "1" && "${IS_GLM52}" != "1" ]]; then
+    if [[ "${IS_GLM_MOE}" == "1" && "${IS_GLM52}" != "1" && "${IS_GLM53_FLASH}" != "1" ]]; then
         USE_SPECULATIVE=1
         echo "[INFO] Auto-enabling MTP speculative decoding for GLM MoE model"
     elif [[ "${IS_GLM52}" == "1" && "${MODEL}" == *MTP* ]]; then
@@ -890,6 +967,34 @@ elif [[ "${ENABLE_SPECULATIVE}" == "auto" ]]; then
         echo "[INFO] GLM-5.2 MTP-grafted checkpoint: auto-enabling MTP speculative decoding"
     elif [[ "${IS_GLM52}" == "1" ]]; then
         echo "[INFO] GLM-5.2 (non-MTP checkpoint): MTP not auto-enabled — cyankiwi AWQ lacks layer-78 weights. Use an MTP-grafted checkpoint (path contains 'MTP') to enable it."
+    fi
+    # GLM-5.3-Flash: MTP is OPT-IN on the first serve, despite the head being real.
+    #
+    # The head IS shipped — but grepping the weight_map for "mtp"/"nextn" finds
+    # ZERO tensors, which is a trap: it is stored as language layer 45, one past
+    # num_hidden_layers=45, carrying eh_proj/enorm/hnorm plus its own full
+    # 288-expert MoE (verified against the published index 2026-09-01). vLLM's own
+    # recipe runs it with {"method":"mtp","num_speculative_tokens":5}, and from
+    # v0.30.0 the registry carries Glm5NextMTPModel — so unlike DeepSeek-V4-Flash
+    # below, both the weights AND a matching loader are known to exist.
+    #
+    # Two reasons it is still opt-in rather than auto-on here:
+    #   1. Nothing has been served on our stack yet, and the house rule is that a
+    #      first serve changes one thing at a time — auto-enabling an unproven
+    #      spec-decode config turns a smoke test into a confusing failure. That is
+    #      the same call Qwen3.8 got, and DeepSeek-V4-Flash is why: its head was
+    #      verified present too, auto-enabled on that basis, and still failed
+    #      because the LOADER expected a different tensor layout.
+    #   2. That extra layer is ~7 GiB of 288-expert weights, and the single-node
+    #      fit here leaves only ~40 GiB after weights. On this shape MTP is not
+    #      free memory-wise, so it should be enabled deliberately.
+    # Of the three presets whose MTP story we have traced, this one has the best
+    # odds: Ornith shipped no weights at all, DeepSeek-V4-Flash shipped weights
+    # the loader could not map, and this has both weights and a registered MTP
+    # model class.
+    # `ENABLE_SPECULATIVE=1` is the first optimisation to try once it serves clean.
+    if [[ "${IS_GLM53_FLASH}" == "1" && "${ENABLE_SPECULATIVE}" == "auto" ]]; then
+        echo "[INFO] GLM-5.3-Flash: MTP OFF by default (head IS present as language layer 45, ~7 GiB). ENABLE_SPECULATIVE=1 to try it."
     fi
     # DeepSeek-V4-Flash: MTP is OPT-IN, despite the head being present.
     #

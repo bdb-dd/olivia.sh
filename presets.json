@@ -122,6 +122,38 @@
       "storage": "work",
       "description": "GLM-5.3 on a modern vLLM release (v0.27.1 + NGC 26.07, no PR graft) — own container, the upgrade path off glm52's pinned-main build"
     },
+    "glm53_flash": {
+      "aliases": [
+        "glm53-flash",
+        "glm-5.3-flash",
+        "glm5.3-flash",
+        "glm53flash",
+        "flash"
+      ],
+      "model": "zai-org/GLM-5.3-Flash",
+      "nodes": 1,
+      "gpus": 4,
+      "pp": 1,
+      "container_prefix": "glm53flash",
+      "index": 1,
+      "storage": "projects",
+      "description": "GLM-5.3-Flash 320B/18B-active multimodal MoE — a DIFFERENT model from the 744B `glm53`: new arch Glm5NextForConditionalGeneration (45 layers = 34 KDA linear-attn + 11 NoPE sparse-MLA, 288 experts, mHC), native FP8 ~306 GiB, 1M ctx, MIT. Fits ONE node at TP=4 (tighter than glm47-AWQ's ~358 GB) and hybrid attn makes KV cheap. SOURCE BUILD on vLLM v0.32.0 + NGC 26.07 — glm5_next is native from v0.30.0 onward (NOT v0.29.0, despite what the recipe page claims), and v0.32.0's FlashInfer 0.7.0.post1 clears the >=0.6.18 NoPE-sparse-MLA floor. MTP head ships as layer 45 and vLLM registers Glm5NextMTPModel, but it is OFF by default (~7 GiB on a tight fit, unproven here). ⚠️ Hopper MUST run BF16 KV — --kv-cache-dtype fp8 is Blackwell-only for this model"
+    },
+    "glm53_flash_prebuilt": {
+      "aliases": [
+        "glm53-flash-prebuilt",
+        "glm53flash-prebuilt",
+        "glm53flashprebuilt"
+      ],
+      "model": "zai-org/GLM-5.3-Flash",
+      "nodes": 1,
+      "gpus": 4,
+      "pp": 1,
+      "container_prefix": "glm53flash",
+      "index": 2,
+      "storage": "projects",
+      "description": "GLM-5.3-Flash from the PREBUILT arm64 image vllm/vllm-openai:glm53-flash (container index 2) — the FALLBACK, kept only in case the v0.32.0 source build regresses. This was the primary path while glm5_next was absent from the public vLLM repo (Aug-Sep 2026); v0.30.0 made it unnecessary. Same serve shape and same Hopper BF16-KV rule as glm53_flash"
+    },
     "borealis": {
       "aliases": [
         "borealis-27b",

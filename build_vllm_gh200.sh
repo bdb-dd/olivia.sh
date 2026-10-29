@@ -73,6 +73,24 @@ show_presets() {
     echo "               v0.24.0) and pick up the DSA/parser work through v0.27.1."
     echo "               UNVALIDATED — build against GLM-5.2-FP8 weights first."
     echo ""
+    echo "  glm53flash - GLM-5.3-Flash (320B, 18B active) — a DIFFERENT model from"
+    echo "               the 744B glm53 above: new arch Glm5NextForConditionalGeneration"
+    echo "               (34 KDA linear-attn + 11 NoPE sparse-MLA layers, 288 experts,"
+    echo "               mHC), natively multimodal, native FP8 ~306 GiB, 1M ctx, MIT."
+    echo "               vLLM: v0.32.0, transformers>=5.16.1,<5.20.0, NGC 26.07"
+    echo "               (torch 2.13), vllm-project DeepGEMM 1e1842a8."
+    echo "               glm5_next is native from v0.30.0 — NOT v0.29.0, despite the"
+    echo "               recipe page (v0.29.0 registry has zero Glm5Next entries)."
+    echo "               Serves on ONE node (4× GH200, TP=4). Builds vllm-glm53flash-1."
+    echo "               HOPPER: BF16 KV only — FP8 KV cache is Blackwell-only here."
+    echo ""
+    echo "  glm53flash_prebuilt"
+    echo "             - FALLBACK: the same model from the prebuilt arm64 image"
+    echo "               vllm/vllm-openai:glm53-flash, no source build (Phase 3"
+    echo "               skipped). Was the primary path Aug-Oct 2026 while glm5_next"
+    echo "               was in no public release. Builds to index 2 so it coexists"
+    echo "               with the source build. Use only if v0.32.0 regresses."
+    echo ""
     echo "  gemma4     - Gemma 4 (31B dense, multimodal text+image)"
     echo "               vLLM: v0.19.0, transformers>=5.5.0"
     echo "               ~20GiB @ AWQ, fits 1-2x GH200 (FP8 has known bugs)"
@@ -140,6 +158,21 @@ apply_preset() {
     # DeepGEMM fork, so a preset tracking a modern vLLM release (glm53_v27) must
     # point here as well as at a ref. Resolved into DEEPGEMM_REPO below.
     PRESET_DEEPGEMM_REPO=""
+
+    # Default: build vLLM from source (every preset above this line does). A
+    # preset can instead point at a PREBUILT container image that already ships
+    # vLLM — set PRESET_PREBUILT_IMAGE to a `docker://` (or local .sif) URI and
+    # Phase 3 is skipped entirely. This exists for a model whose vLLM support is
+    # not in the public repo yet, so there is no source to build: GLM-5.3-Flash's
+    # `glm5_next` lands in 0.29.0, and until then vLLM ships it only as the
+    # prebuilt image. Resolved into PREBUILT_IMAGE below.
+    PRESET_PREBUILT_IMAGE=""
+
+    # Default: no preset-specific build index (falls back to 1). A preset that
+    # deliberately builds ALONGSIDE another one — same MODEL_ID, different
+    # toolchain — pins its own so a plain `build <preset>` can't land on top of
+    # its sibling. Resolved into BUILD_INDEX below.
+    PRESET_BUILD_INDEX=""
 
     case "${preset}" in
         glm51_v19|GLM51_V19|glm51|GLM51|glm-5.1|GLM-5.1)
@@ -263,6 +296,67 @@ apply_preset() {
             PRESET_DEEPGEMM_REF="e21c821f39a2056d68067a466c64ddc942200106"
             PRESET_NGC_TAG="26.07-py3"
             PRESET_NOTES="GLM-5.3 (== GLM-5.2's base, re-post-trained) FP8 on a TAGGED vLLM: v0.27.1 + NGC 26.07 (torch 2.13) + vllm-project DeepGEMM, NO PR graft (PR#45895 merged upstream). Own container; the plain 'glm53' preset reuses the glm52 one instead. UNVALIDATED — build against GLM-5.2-FP8 first."
+            ;;
+        glm53flash|GLM53FLASH|glm53_flash|GLM53_FLASH|glm-5.3-flash|GLM-5.3-Flash)
+            # GLM-5.3-Flash is NOT the 744B GLM-5.3 the presets above serve — it
+            # is a different model on a NEW architecture: 320B total / 18B active,
+            # natively multimodal, `Glm5NextForConditionalGeneration` (45 layers =
+            # 34 KDA linear-attention + 11 NoPE sparse-MLA, 288 experts, 8 active
+            # + 1 shared, Manifold-Constrained Hyper-Connections), native FP8
+            # (~306 GiB), 1M ctx, one MTP draft layer. MIT.
+            #
+            # VERSION FLOOR — v0.30.0, NOT v0.29.0. vLLM's own recipe page says
+            # "vLLM 0.29.0+", and that is WRONG: v0.29.0's registry.py contains
+            # zero Glm5Next entries. Checked tag by tag (2026-10-28): v0.29.0 → 0,
+            # v0.30.0 → 4, v0.31.0 → 4, v0.32.0 → 4. We build the newest tag
+            # (v0.32.0, 2026-10-18) because this model's upstream support is only
+            # weeks old and several GH200-relevant bugs were filed against it right
+            # after release (sparse-MLA paths, hybrid KV page alignment, a
+            # recurring CUDA IMA) — the later tag has had the most fixes land.
+            #
+            # torch stays 2.13.0 (same as v0.27.1), so NGC 26.07 is still the
+            # matching base — no new base image needed. FlashInfer comes in at
+            # 0.7.0.post1, comfortably over the >=0.6.18 that NoPE sparse MLA
+            # (qk_rope_head_dim=0) requires, which is the one dependency the old
+            # prebuilt-image path existed to guarantee.
+            #
+            # DeepGEMM: block-FP8 (weight_scale_inv) rides the DeepGEMM lane, so
+            # match vLLM's own pin exactly rather than guessing — v0.32.0 pins
+            # vllm-project/DeepGEMM @ 1e1842a8 (cmake/external_projects/deepgemm.cmake).
+            MODEL_ID="glm53flash"
+            PRESET_BUILD_INDEX="1"
+            PRESET_VLLM_VERSION="v0.32.0"
+            # v0.32.0 requirements/common.txt: transformers >= 5.16.1, < 5.20.0.
+            # The checkpoint's own config declares transformers_version 5.16.0, so
+            # the vLLM floor is the binding one. NOTE the comma — it is forwarded
+            # via SINGULARITYENV_ (see Phase 3), which is exactly why that
+            # mechanism exists (Kimi's range broke `--env`).
+            PRESET_TRANSFORMERS=">=5.16.1,<5.20.0"
+            PRESET_DEEPGEMM_REPO="https://github.com/vllm-project/DeepGEMM.git"
+            PRESET_DEEPGEMM_REF="1e1842a833699298f7afc02eefb2ed168fff6938"
+            PRESET_NGC_TAG="26.07-py3"
+            PRESET_NOTES="GLM-5.3-Flash 320B/18B multimodal MoE (glm5_next) from SOURCE on vLLM v0.32.0 + NGC 26.07 + vllm-project DeepGEMM 1e1842a8. glm5_next is native from v0.30.0 (NOT v0.29.0 — the recipe page is wrong). Serve on ONE node TP=4. HOPPER: BF16 KV only (FP8 KV cache is Blackwell-only for this model)."
+            ;;
+        glm53flash_prebuilt|GLM53FLASH_PREBUILT|glm53_flash_prebuilt|GLM53_FLASH_PREBUILT)
+            # FALLBACK ONLY — kept in case the v0.32.0 source build above regresses.
+            #
+            # This was the PRIMARY path from 2026-08-31 to 2026-10-28, when
+            # glm5_next existed in no public vLLM release and the recipe page said,
+            # verbatim, "use docker before the integration is included in the
+            # public repo". v0.30.0 ended that, so a source build is now the
+            # normal path and this exists only as an escape hatch.
+            #
+            # Builds to container index 2 (vllm-glm53flash-2-sandbox) so it can
+            # coexist with the source build rather than overwrite it. Phase 3 is
+            # skipped entirely (PREBUILT_IMAGE); Phase 4 verifies the arch is
+            # registered and FlashInfer >= 0.6.18, because we did not build it.
+            MODEL_ID="glm53flash"
+            PRESET_PREBUILT_IMAGE="docker://vllm/vllm-openai:glm53-flash"
+            PRESET_BUILD_INDEX="2"
+            # Informational only — nothing is built.
+            PRESET_VLLM_VERSION="prebuilt:glm53-flash"
+            PRESET_TRANSFORMERS="(prebuilt)"
+            PRESET_NOTES="FALLBACK: GLM-5.3-Flash from the PREBUILT arm64 image vllm/vllm-openai:glm53-flash, container index 2. Superseded by the v0.32.0 source build (glm53flash) now that glm5_next is upstream; kept only as an escape hatch."
             ;;
         gemma4|Gemma4|gemma-4|Gemma-4)
             MODEL_ID="gemma4"
@@ -454,7 +548,25 @@ VLLM_VERSION="${VLLM_VERSION:-${PRESET_VLLM_VERSION}}"
 # Resolve NGC base image now that the preset has run: explicit env wins, then
 # the preset's pin (PRESET_NGC_TAG), then the 26.03 default.
 NGC_PYTORCH_TAG="${NGC_PYTORCH_TAG:-${PRESET_NGC_TAG:-26.03-py3}}"
-NGC_IMAGE="${NGC_IMAGE:-docker://nvcr.io/nvidia/pytorch:${NGC_PYTORCH_TAG}}"
+
+# Prebuilt-image mode: explicit env > preset pin > empty (= build from source).
+# When set, the sandbox is created from THIS image instead of the NGC base and
+# Phase 3 (the vLLM source build) is skipped wholesale — the image already ships
+# vLLM. Everything downstream (naming, atomic swap, SIF conversion) is unchanged,
+# so a prebuilt container is a first-class citizen of the container dir.
+PREBUILT_IMAGE="${PREBUILT_IMAGE:-${PRESET_PREBUILT_IMAGE:-}}"
+
+# Forwarded into the container so the verification heredocs (which are quoted,
+# so the host can't interpolate into them) can branch on the mode. Set for both
+# Singularity and Apptainer since the cluster has been either at times.
+export SINGULARITYENV_OLIVIA_PREBUILT="${PREBUILT_IMAGE:+1}"
+export APPTAINERENV_OLIVIA_PREBUILT="${PREBUILT_IMAGE:+1}"
+
+if [[ -n "${PREBUILT_IMAGE}" ]]; then
+    NGC_IMAGE="${NGC_IMAGE:-${PREBUILT_IMAGE}}"
+else
+    NGC_IMAGE="${NGC_IMAGE:-docker://nvcr.io/nvidia/pytorch:${NGC_PYTORCH_TAG}}"
+fi
 
 # Resolve DeepGEMM ref: explicit env > preset pin > 59f2c07 default. Forwarded
 # into the Phase 3 build container below.
@@ -471,8 +583,9 @@ DEEPGEMM_REPO="${DEEPGEMM_REPO:-${PRESET_DEEPGEMM_REPO:-https://github.com/deeps
 # VLLM_PATCHES="..." or disable with VLLM_PATCHES="".
 VLLM_PATCHES="${VLLM_PATCHES-${PRESET_VLLM_PATCHES}}"
 
-# Build index (for multiple builds of same model type)
-BUILD_INDEX="${BUILD_INDEX:-1}"
+# Build index (for multiple builds of same model type). Explicit env > the
+# preset's own pin (a preset that deliberately builds alongside a sibling) > 1.
+BUILD_INDEX="${BUILD_INDEX:-${PRESET_BUILD_INDEX:-1}}"
 
 # Derived names
 SANDBOX_NAME="vllm-${MODEL_ID}-${BUILD_INDEX}-sandbox"
@@ -506,8 +619,14 @@ echo "  Sandbox:        ${SANDBOX_NAME}"
 echo "  Sandbox path:   ${SANDBOX_PATH}"
 echo "  vLLM version:   ${VLLM_VERSION}"
 echo "  vLLM patches:   ${VLLM_PATCHES:-<none>}"
-echo "  DeepGEMM ref:   ${DEEPGEMM_REF} (${DEEPGEMM_REPO})"
-echo "  NGC base:       ${NGC_IMAGE}"
+if [[ -z "${PREBUILT_IMAGE}" ]]; then
+    echo "  DeepGEMM ref:   ${DEEPGEMM_REF} (${DEEPGEMM_REPO})"
+fi
+if [[ -n "${PREBUILT_IMAGE}" ]]; then
+    echo "  Base image:     ${NGC_IMAGE}  (PREBUILT — vLLM source build SKIPPED)"
+else
+    echo "  NGC base:       ${NGC_IMAGE}"
+fi
 echo ""
 
 # Create container directory if it doesn't exist
@@ -537,7 +656,11 @@ fi
 # -----------------------------------------------------------------------------
 # Phase 1: Create sandbox from NGC base image
 # -----------------------------------------------------------------------------
-echo "[Phase 1] Creating sandbox from NGC base image..."
+if [[ -n "${PREBUILT_IMAGE}" ]]; then
+    echo "[Phase 1] Creating sandbox from the PREBUILT vLLM image..."
+else
+    echo "[Phase 1] Creating sandbox from NGC base image..."
+fi
 
 if [[ -d "${SANDBOX_PATH}" ]]; then
     if [[ "${BATCH_MODE}" == "1" ]]; then
@@ -611,13 +734,23 @@ fi
 # Phase 2: Verify NGC PyTorch before modifications
 # -----------------------------------------------------------------------------
 echo ""
-echo "[Phase 2] Verifying NGC PyTorch installation..."
+if [[ -n "${PREBUILT_IMAGE}" ]]; then
+    echo "[Phase 2] Verifying the prebuilt image's PyTorch..."
+else
+    echo "[Phase 2] Verifying NGC PyTorch installation..."
+fi
 
+# A prebuilt vLLM image ships an upstream pip torch, NOT NGC's — so the nv2x
+# marker assert below would (correctly) fail on it. The assert exists to catch
+# pip clobbering NGC torch during OUR build; with no build to run, there is
+# nothing for it to protect. Report the toolchain and move on.
 singularity exec --nv "${SANDBOX_PATH}" python3 -c "
+import os
 import torch
 import sys
 
-print('=== NGC PyTorch Info ===')
+prebuilt = bool(os.environ.get('OLIVIA_PREBUILT'))
+print('=== Prebuilt image PyTorch Info ===' if prebuilt else '=== NGC PyTorch Info ===')
 print(f'Python: {sys.version}')
 print(f'PyTorch version: {torch.__version__}')
 print(f'PyTorch path: {torch.__path__[0]}')
@@ -628,10 +761,13 @@ if torch.cuda.is_available():
     for i in range(torch.cuda.device_count()):
         print(f'  GPU {i}: {torch.cuda.get_device_name(i)}')
 
-# Verify this is the NGC build
-assert any(m in torch.__version__ for m in ('nv24', 'nv25', 'nv26', 'nv27')), \
-    f'Expected NGC PyTorch, got: {torch.__version__}'
-print('\\n✓ NGC PyTorch verified')
+# Verify this is the NGC build (source-build path only — see comment above).
+if prebuilt:
+    print('\\n✓ Prebuilt image: skipping the NGC-PyTorch assert (no source build to protect)')
+else:
+    assert any(m in torch.__version__ for m in ('nv24', 'nv25', 'nv26', 'nv27')), \
+        f'Expected NGC PyTorch, got: {torch.__version__}'
+    print('\\n✓ NGC PyTorch verified')
 "
 
 # Save PyTorch info for later verification
@@ -642,6 +778,13 @@ echo "NGC PyTorch version saved to pytorch_version_before.txt"
 # Phase 3: Build vLLM with constraints to preserve NGC PyTorch
 # -----------------------------------------------------------------------------
 echo ""
+if [[ -n "${PREBUILT_IMAGE}" ]]; then
+    echo "[Phase 3] SKIPPED — the prebuilt image already ships vLLM."
+    echo "          Image: ${NGC_IMAGE}"
+    echo "          Nothing is compiled, patched or pip-installed into it."
+fi
+
+if [[ -z "${PREBUILT_IMAGE}" ]]; then
 echo "[Phase 3] Building vLLM (preserving NGC PyTorch)..."
 
 # Determine singularity exec options based on available features
@@ -718,6 +861,48 @@ echo "Installing build dependencies..."
 # every build-system.requires entry must be present in the env up front.
 # Harmless for older pinned versions that don't use it.
 pip install --no-cache-dir --root-user-action=ignore ninja cmake wheel packaging setuptools-scm setuptools-rust
+
+# DeepGEMM needs the elfutils HEADERS, which no NGC PyTorch image ships.
+#
+# vLLM from ~v0.30 pins the vllm-project/DeepGEMM fork, and that fork vendors
+# `third-party/deep_jit`. Its csrc/python_api.cpp pulls in
+# deep_jit/backend/cuda/backend.hpp -> deep_jit/utils/exception.hpp, which does
+# `#include <elfutils/libdwfl.h>` (deep_jit uses libdwfl to symbolise JIT
+# backtraces). Absent that header the aarch64 g++ compile dies with
+#   fatal error: elfutils/libdwfl.h: No such file or directory
+# and it kills the build TWICE over: once in the standalone DeepGEMM install
+# (tolerated with a warning) and once in vLLM's own `_deep_gemm_C` cmake target,
+# which is fatal -- the whole wheel build aborts. Verified on-cluster 2026-10-28,
+# job 2665731, after 1 h 37 m of compiling, so this is an expensive one to hit.
+#
+# `libdw-dev` provides /usr/include/elfutils/libdwfl.h (and pulls libelf-dev).
+# Idempotent and no-op on any image that already has the header, so it is safe
+# for every preset; only the block-FP8 ones (glm52/glm53/qwen38/dsv4/glm53flash)
+# actually need DeepGEMM, but an unbuildable target breaks them all.
+if [[ -e /usr/include/elfutils/libdwfl.h ]]; then
+    echo "elfutils headers: already present, skipping apt"
+else
+    echo "Installing elfutils headers (libdw-dev) for DeepGEMM's deep_jit..."
+    # `update` is deliberately tolerated: NGC images carry extra NVIDIA apt repos
+    # alongside the Ubuntu archive, and one unreachable repo makes `update` exit
+    # non-zero even though the archive we need refreshed fine. Gating the install
+    # on it would skip the package for no reason -- so refresh, ignore the status,
+    # and let the INSTALL be the thing that decides.
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq || \
+        echo "  (apt-get update returned non-zero -- continuing, a stale/extra repo is usually harmless)"
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libdw-dev; then
+        echo "elfutils headers: installed"
+    else
+        echo "WARNING: apt-get could not install libdw-dev."
+    fi
+    if [[ -e /usr/include/elfutils/libdwfl.h ]]; then
+        echo "elfutils headers: verified at /usr/include/elfutils/libdwfl.h"
+    else
+        echo "WARNING: /usr/include/elfutils/libdwfl.h STILL absent -- DeepGEMM will"
+        echo "         fail to compile and the wheel build will abort. Fix this before"
+        echo "         burning another ~1.5 h of allocation."
+    fi
+fi
 
 echo "Cloning vLLM repository..."
 cd /opt
@@ -971,8 +1156,6 @@ PYPATCH_LL_BF16_QUACK
 # 397B multi-node FP8 (the 35B's dims are aligned, so it never hits it). The re-set
 # is redundant (already set above), so drop it. No-ops on vLLM without this file.
 # Idempotent.
-python3 << 'PYPATCH_CUTLASS_WEIGHTLOADER'
-
 # --- PYPATCH_HAS_CUTEDSL_QUACK ------------------------------------------------
 # vllm/utils/import_utils.py has_cutedsl() reports capability from `cutlass` alone,
 # but every cutedsl code path also imports `quack` -- e.g.
@@ -1001,6 +1184,8 @@ for p in hits:
     open(p, 'w').write(s.replace(old, new, 1))
     print('  PYPATCH_HAS_CUTEDSL_QUACK: has_cutedsl() now also requires quack')
 PYEOF
+
+python3 << 'PYPATCH_CUTLASS_WEIGHTLOADER'
 
 import os
 f = "/opt/vllm/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py"
@@ -1750,6 +1935,8 @@ echo "Build complete!"
 
 BUILDSCRIPT
 
+fi  # end Phase 3 (skipped entirely in prebuilt mode)
+
 # -----------------------------------------------------------------------------
 # Phase 4: Verify final installation
 # -----------------------------------------------------------------------------
@@ -1757,7 +1944,9 @@ echo ""
 echo "[Phase 4] Final verification..."
 
 singularity exec --nv "${SANDBOX_PATH}" python3 << 'VERIFY'
+import os
 import sys
+PREBUILT = bool(os.environ.get("OLIVIA_PREBUILT"))
 print("=" * 50)
 print("Final Installation Verification")
 print("=" * 50)
@@ -1775,8 +1964,11 @@ if torch.cuda.is_available():
     y = torch.matmul(x, x)
     print(f"GPU matmul test: ✓")
 
-# Verify NGC build
-if not any(m in torch.__version__ for m in ('nv24', 'nv25', 'nv26', 'nv27')):
+# Verify NGC build. A prebuilt vLLM image is EXPECTED to carry upstream pip
+# torch, so this warning would be pure noise there.
+if PREBUILT:
+    print(f"\n✓ Prebuilt image (upstream torch expected here, not NGC)")
+elif not any(m in torch.__version__ for m in ('nv24', 'nv25', 'nv26', 'nv27')):
     print(f"\n⚠ WARNING: This may not be NGC PyTorch!")
     print(f"  Expected 'nv24'..'nv27' marker in version string")
 else:
@@ -1836,6 +2028,47 @@ try:
 except Exception as e:
     print(f"torch.compile: ⚠ {e}")
 
+# A prebuilt image is opaque — we did not choose what went into it — so verify
+# the two things that actually decide whether it can serve GLM-5.3-Flash on a
+# GH200, rather than trusting the tag:
+#   1. `Glm5NextForConditionalGeneration` is registered. That is the whole reason
+#      we use the image: the arch is absent from the public repo until 0.29.0.
+#   2. FlashInfer >= 0.6.18. vLLM's own recipe troubleshooting says a
+#      "Sparse-MLA initialization error" means the image predates that, and NoPE
+#      sparse MLA is 11 of this model's 45 layers.
+if PREBUILT:
+    print("\n--- Prebuilt image checks ---")
+    try:
+        from vllm.model_executor.models.registry import ModelRegistry
+        archs = set(ModelRegistry.get_supported_archs())
+        for arch in ("Glm5NextForConditionalGeneration",):
+            if arch in archs:
+                print(f"{arch}: ✓ registered")
+            else:
+                print(f"{arch}: ✗ FATAL — NOT registered; this image cannot serve GLM-5.3-Flash")
+                sys.exit(1)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"Model registry: ⚠ could not read it ({e!r})")
+
+    try:
+        import flashinfer
+        fi = getattr(flashinfer, "__version__", "unknown")
+        try:
+            parts = tuple(int(x) for x in str(fi).split(".")[:3])
+        except ValueError:
+            parts = None
+        if parts is None:
+            print(f"FlashInfer: ⚠ {fi} — unparseable, check by hand (need >= 0.6.18)")
+        elif parts < (0, 6, 18):
+            print(f"FlashInfer: ⚠ {fi} < 0.6.18 — NoPE sparse MLA will fail to initialise")
+        else:
+            print(f"FlashInfer: ✓ {fi} (>= 0.6.18, NoPE sparse MLA supported)")
+    except Exception as e:
+        print(f"FlashInfer: ✗ FATAL — missing from the image ({e!r})")
+        sys.exit(1)
+
 print("\n" + "=" * 50)
 print("Verification complete!")
 print("=" * 50)
@@ -1848,7 +2081,9 @@ AFTER=$(singularity exec --nv "${SANDBOX_PATH}" python3 -c "import torch; print(
 echo "PyTorch version before: ${BEFORE}"
 echo "PyTorch version after:  ${AFTER}"
 
-if [[ "${BEFORE}" == "${AFTER}" ]]; then
+if [[ -n "${PREBUILT_IMAGE}" ]]; then
+    echo "(prebuilt image — nothing was installed, so no change was possible)"
+elif [[ "${BEFORE}" == "${AFTER}" ]]; then
     echo "✓ NGC PyTorch preserved successfully!"
 else
     echo "⚠ WARNING: PyTorch version changed!"

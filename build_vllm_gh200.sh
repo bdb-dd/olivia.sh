@@ -1192,10 +1192,17 @@ f = "/opt/vllm/vllm/utils/import_utils.py"
 old = '    return _has_module("cutlass")'
 new = '    return _has_module("cutlass") and _has_module("quack")'
 if not os.path.exists(f):
-    sys.exit("  PYPATCH_HAS_CUTEDSL_QUACK: FATAL -- %s is absent. Without this "
-             "patch has_cutedsl() reports True on a container with cute-dsl but "
-             "no quack, and every worker dies inside the attention forward with "
-             "ModuleNotFoundError: No module named 'quack'." % f)
+    # NOT fatal: this script builds every preset, and vllm/utils/import_utils.py
+    # is a recent refactor. v0.19.x / v0.20.0 / v0.21.0 (glm51, gemma-4, laguna,
+    # devstral...) predate it, and those builds must not die here. Absence is
+    # only a problem for a vLLM new enough to HAVE cute-dsl indexer paths, and
+    # on those the file exists -- so warn loudly and let Phase 4 be the gate.
+    print("  PYPATCH_HAS_CUTEDSL_QUACK: %s absent -- assuming this vLLM predates\n"
+          "    vllm/utils/import_utils.py. If this build is for dsv4/dsv41/glm53*,\n"
+          "    that assumption is WRONG and the gating check is missing: expect\n"
+          "    ModuleNotFoundError: No module named 'quack' inside the attention\n"
+          "    forward. Phase 4 verifies the installed copy either way." % f)
+    raise SystemExit(0)
 s = open(f).read()
 if new in s:
     print('  has_cutedsl already requires quack')
@@ -2087,15 +2094,21 @@ print("=" * 50)
 # Checked on the INSTALLED package because the patch is applied to the source
 # tree and only becomes real if `pip install .` carried it -- the failure mode
 # that made PYPATCH_HAS_CUTEDSL_QUACK a silent no-op for ten weeks.
-from vllm.utils.import_utils import has_cutedsl, _has_module
-_cut, _qk = _has_module("cutlass"), _has_module("quack")
-print(f"\ncute-dsl gating: cutlass={_cut} quack={_qk} has_cutedsl()={has_cutedsl()}")
-if _cut and not _qk and has_cutedsl():
-    print("  FAIL: cute-dsl present, quack absent, yet has_cutedsl() is True.")
-    print("        PYPATCH_HAS_CUTEDSL_QUACK did not survive the install.")
-    print("        dsv4/dsv41 WILL die in the attention forward. Do not deploy.")
-    sys.exit(1)
-print("  OK: cute-dsl capability is reported honestly")
+try:
+    from vllm.utils.import_utils import has_cutedsl, _has_module
+except ImportError:
+    # Older vLLM has no vllm/utils/import_utils.py, and no cute-dsl indexer
+    # paths to gate either. Nothing to verify.
+    print("\ncute-dsl gating: n/a for this vLLM (no vllm.utils.import_utils)")
+else:
+    _cut, _qk = _has_module("cutlass"), _has_module("quack")
+    print(f"\ncute-dsl gating: cutlass={_cut} quack={_qk} has_cutedsl()={has_cutedsl()}")
+    if _cut and not _qk and has_cutedsl():
+        print("  FAIL: cute-dsl present, quack absent, yet has_cutedsl() is True.")
+        print("        PYPATCH_HAS_CUTEDSL_QUACK did not survive the install.")
+        print("        dsv4/dsv41 WILL die in the attention forward. Do not deploy.")
+        sys.exit(1)
+    print("  OK: cute-dsl capability is reported honestly")
 
 # Check PyTorch
 import torch

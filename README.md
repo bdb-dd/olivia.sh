@@ -387,14 +387,34 @@ Stable 1→64 (0 failures, no decode wedge — RayExecutorV2). Single-stream is 
 
 ### GLM-5.3 (`glm53` / `glm53_v27`) — not yet run
 No allocation spent. GLM-5.3's weights were still unpublished as of 2026-08-17 (announced 2026-08-14, open weights promised ~2 weeks out), so neither preset has been prefetched, built, or served. `glm53` is expected to match the GLM-5.2 row above exactly — it is the same base on the same container.
-### DeepSeek-V4.1-Flash (`dsv41`) — not yet run · preset added 2026-11-02
-No allocation spent. Wired from the published config and vLLM's recipe; nothing prefetched or served. **Blocked on the same FlashInfer problem as `glm53_flash`** — its sparse-MLA backend is `FLASHINFER_MLA_SPARSE_DSV41` and our build strips flashinfer — so fixing the cute-dsl skew now unblocks two presets rather than one.
+### DeepSeek-V4.1-Flash (`dsv41`) — Engram offload PROVEN, not yet serving · 2026-11-02
+**Allocation spent: ~0.5 GPU-h.** Weights prefetched and verified; **three serve attempts, each killed by a different one-line fault in our own code, each caught further along than the last.** The model itself has raised no objection yet.
+
+| step | result |
+|---|---|
+| prefetch | ✅ **510 GB (475.3 GiB), 48/48 shards**, 0 incomplete, 0 dangling symlinks, 6m25s (~1.3 GB/s) to the work tier. Verified with `stat -L`, not `du` — content lives in a shared `hub/blobs` store behind two symlink hops, where `du` under-reports ~30,000x |
+| submit | ❌ not a job — `sbatch: Unable to open file .../deploys/add-dsv41/run_vllm_server.sh`. `server start` does not upload the script without **`--deploy`**, and this branch had never deployed |
+| serve (job 2694557) | ❌ **1 second** — `line 601: DSV41_CUDAGRAPH_MODE: unbound variable`. An informational echo referenced the knob 392 lines before its assignment; fatal under `set -euo pipefail` whenever the operator has not exported it. 0.0 GPU-h |
+| serve (job 2694626) | ❌ **25 s**, *after* all four Engram tables had offloaded — `indexer_kv_dtype='mxfp4' requires Blackwell datacenter GPUs (sm_10x)`. Copied from a recipe written for B200/GB200 |
+| serve (job 2694691) | ❌ **~7 min**, in the attention *forward* — `ModuleNotFoundError: No module named 'quack'` from `fused_indexer_q_cutedsl.py:13`. **A build patch written in August to prevent exactly this had never executed** (it globbed `dist-packages` ~770 lines before vLLM is installed; empty glob, empty loop, exit 0, no output). 0.5 GPU-h |
+
+**✅ What is now proven on-cluster — the thing the preset exists for.** All four ranks, twice over:
+
+    Engram table offloaded to pinned host memory: 96,002,514 rows x 256, 23.60 GiB per rank
+
+That is **per table**, across two Engram layers (1 and 14) → **~47.2 GiB per rank, ~188.8 GiB of Grace LPDDR5X node-wide**, matching the figure derived from the config beforehand. ~1.03 bytes/element, consistent with fp8 hash tables. **Half the node's entire HBM worth of parameters, resident in host memory** — read by **UVA lookup**, so the GPU addresses Grace directly over NVLink-C2C rather than staging copies. Without it there is no single-node configuration of this model. vLLM also confirmed `dp_shared_memory=False` resolves automatically at DP=1, which is the precondition `use_thp` needs — so transparent huge pages are a legal, de-risked next step.
+
+**Also settled:** the backend is **`FLASHMLA_SPARSE_DSV41`**, compiled into vLLM (`_flashmla_C.abi3.so`), *not* the flashinfer variant the earlier note below assumed. v0.32.1 registers three V4.1 sparse-MLA backends and only one needs flashinfer. `util 0.90` is at its ceiling here too — the allocator logged the same `failed to map 20 MB with ~20 MB free` signature as GLM-5.3-Flash on all four ranks.
+
+**❌ Known unavailable on Hopper:** `indexer_sparse_logits`, which scores only candidate blocks instead of walking the whole context — O(candidate blocks) per query, and vLLM notes it "pays off for long contexts (roughly 32K and beyond)", i.e. exactly our 131072 window. It needs MXFP4 **tensor cores** (SM100 / CDNA4); Hopper bottoms out at fp8. This is silicon, not a version gate, so **expect throughput below vLLM's published figures by design, with the gap widening as context grows.** Do not read that as underperformance.
+
+> **Lesson, and it is the same one three times.** Every failure was ours, none was the model's, and each was a single line. The common thread is not carelessness about the model but **unverified assumptions about our own toolchain**: a knob assumed assigned, a dtype assumed portable, a patch assumed applied. Two now have permanent checks (`check_scripts.sh`, and a Phase 4 assertion on the installed copy); the dtype one has only a written rule — *a recipe's dtypes are valid only for the hardware the recipe was written on.*
 
 Why it is worth the allocation once unblocked: **748B parameters on a single node.** vLLM sizes V4.1-Flash at ~614 GB VRAM (a GB200 tray, or an 8-GPU H200 node); our node has 384 GB. The gap closes because 196.6B of those parameters are Engram n-gram tables, held by only two layers and read sparsely by token lookup — `--engram-config {"cpu_offload":true}` parks them in pinned Grace memory over NVLink-C2C (~900 GB/s, ~800 GB available) and the cards hold only the backbone. KV is 890 B/token, so a 1M-token prompt costs under 1 GB of global KV. If it serves, it is the largest model we have run on four GPUs, and the first where cold-parameter offload is what makes it possible at all.
 
 ### GLM-5.3-Flash (`glm53_flash`) — BUILT; loads, captures, one config line from serving · updated 2026-11-02
 
-**Allocation spent so far: ~3 GPU-h of 6000.** Weights prefetched and verified; container built and verified; **three serve attempts**. The third got all the way through weight load **and full CUDA-graph capture** before dying on a vLLM *default* — so the model, the arch support and our container are all proven; what remained was one missing argument. No throughput numbers yet.
+**Allocation spent so far: ~5 GPU-h of 6000** (measured: `cost` reported `Used 4.95` GPU-h for the whole 2026.2 period on 2026-11-02, superseding the ~3 GPU-h estimate previously recorded here). Weights prefetched and verified; container built and verified; **three serve attempts**. The third got all the way through weight load **and full CUDA-graph capture** before dying on a vLLM *default* — so the model, the arch support and our container are all proven; what remained was one missing argument. No throughput numbers yet.
 
 | step | result |
 |---|---|

@@ -132,6 +132,8 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 | `glm52_awq` | `cyankiwi/GLM-5.2-AWQ-INT4` | **8 (2 nodes × 4)** | TP=4 + **PP=2**. AWQ/compressed-tensors INT4 (~411 GB) fits 8 GPUs, so it costs **8 GPU-h/hour instead of 12**. Same DSA skip-topk indexer as the FP8, so it needs PR#45895 → runs on the **glm53** (vLLM v0.27.1) container where that is native. Weights live on the **persistent** tier and are already cached. Auto-applies `VLLM_PP_LAYER_PARTITION=38,40` (see below). **Not yet served.** |
 | `glm53` | `zai-org/GLM-5.3-FP8` | 12 (3 nodes × 4) | GLM-5.2's **same base, re-post-trained** — identical arch, so it **reuses the glm52 container** (index 1, no rebuild) and inherits the whole 5.2 runtime profile. **Weights not public yet** (Z.ai promised them ~2 weeks after the 2026-08-14 launch); confirm the repo id when they land. |
 | `glm53_v27` | `zai-org/GLM-5.3-FP8` | 12 (3 nodes × 4) | Same model on its **own** `vllm-glm53-1` container built from **vLLM v0.27.1 + NGC 26.07**, no PR graft. The upgrade path off glm52's pinned-main build — **unvalidated**. |
+| `glm53_flash` | `zai-org/GLM-5.3-Flash` | **4 (1 node)** | ⚠️ **A DIFFERENT MODEL from `glm53`, not a variant of it.** 320B total / 18B active, new arch `Glm5NextForConditionalGeneration`, new pretrain, natively multimodal. 34 KDA linear-attn + 11 NoPE sparse-MLA layers, 288 experts, mHC, native FP8 ~306 GiB, 1M ctx, MIT. **One node at TP=4.** Own container from **source: vLLM v0.32.0 + NGC 26.07** (`glm5_next` is native from v0.30.0). **Hopper: BF16 KV only.** |
+| `glm53_flash_prebuilt` | `zai-org/GLM-5.3-Flash` | 4 (1 node) | Same model from the **prebuilt** `vllm/vllm-openai:glm53-flash` image, container index 2. **Fallback only** — the primary path while `glm5_next` was in no public release; use if the source build regresses. |
 | `glm52_awq` (aliases `glm-5.2-awq`, `glm52awq`) | `cyankiwi/GLM-5.2-AWQ-INT4` | 8 (2 nodes × 4) | TP=4 + PP=2. **AWQ-INT4 (~415 GiB)** — fits 8×GH200 (the preferred path over 3-node FP8), **persistent** (projects) tier. **Reuses the glm52 container** (same vLLM main + PR#45895 + DeepGEMM — the DSA indexer needs are architectural, not FP8-specific); build `glm52`, serve `glm52_awq`. Same GLM-5.2 sparse-MLA → **bf16 KV** (no fp8 KV on GH200), eager. **Untested on-cluster:** MoE-FP16 kernel + the PP=2 indexer-aligned layer partition (`38,40`) need first-serve verification; multi-node PP wedge applies → proxy serialization. |
 | `glm47` | `QuantTrio/GLM-4.7-AWQ` | 4 | TP=4, MTP speculative |
 | `kimi` | `moonshotai/Kimi-K2.6` | 8 (2 nodes × 4) | TP=4 + PP=2, native int4, MLA, multimodal, vLLM v0.19.1 |
@@ -339,6 +341,8 @@ The build script includes predefined configurations for common models. Run witho
 | `glm51_v19` (alias `glm51`) | GLM-5.1 (744B / 40B active) MoE+DSA flagship, recipe-default | v0.19.0 | >=5.4.0 |
 | `glm51_v20` | GLM-5.1 on RayExecutorV2 — **quarantined**, same multi-node PP wedge as v0.19.0 | v0.20.0 | >=5.4.0 |
 | `glm52` | GLM-5.2 (744B / 40B active) MoE+DSA, successor to 5.1 — FP8. Builds vLLM main pinned to `091386a` + auto-grafts PR#45895 snapshot (`VLLM_PATCHES`); not in any release | main `091386a` + PR#45895 | >=5.4.0 |
+| `glm53flash` | **GLM-5.3-Flash (320B/18B active)** — a different model from `glm53`, on the new `glm5_next` arch. NGC 26.07 (torch 2.13, same as `glm53_v27`), vllm-project DeepGEMM `1e1842a8`. `glm5_next` is native from **v0.30.0** — *not* v0.29.0, despite the recipe page. Builds `vllm-glm53flash-1` | v0.32.0 | >=5.16.1,<5.20.0 |
+| `glm53flash_prebuilt` | **Fallback.** Same model from the prebuilt arm64 image `vllm/vllm-openai:glm53-flash`, Phase 3 skipped. Was the primary path Aug–Oct 2026 while `glm5_next` was in no public release. Builds to **index 2** so it coexists with the source build | prebuilt | (prebuilt) |
 | `glm53_v27` | GLM-5.3 on a **tagged** release. Same arch as 5.2, so this preset exists only to retire the pinned-main + PR-graft build (PR#45895 merged upstream in v0.24.0) and pick up the DSA/parser work through v0.27.1. NGC 26.07 (torch 2.13), vllm-project DeepGEMM `e21c821f`. Builds `vllm-glm53-1`; the serve preset `glm53` needs no build at all | v0.27.1 | >=5.5.3 |
 | `glm47` | GLM-4.7 (358B) flagship model | main | >=5.0.0rc0 |
 | `kimi` | Kimi K2.6 (1T / 32B active) MoE + MLA, multimodal | v0.19.1 | >=4.57.1,<5.0.0 |
@@ -391,6 +395,19 @@ Runs vLLM server with GH200-optimized settings:
 - `MAX_MODEL_LEN`: Maximum context length (default: `131072` for GLM-5.1 — native 205K context with ~260 GB KV cache headroom on 8×GH200 AWQ; `32768` elsewhere)
 - `HF_HOME`: HuggingFace cache directory for model weights (**required**). The value in `mise.local.toml` is the **persistent/projects root** (e.g. `/cluster/projects/<proj>/huggingface`). `olivia.sh` forwards it from your local environment, but for a **work-tier preset** (`"storage": "work"` in `presets.json`) it first rewrites the root to the `/cluster/work` mirror — so `prefetch`/`server start` land a kimi/glm51/glm52 model on `/cluster/work` automatically, while laguna/glm47/etc. stay on the persistent root. `run_vllm_server.sh` errors if it is unset and (correctly, by design now) warns when it resolves under `/cluster/work` (auto-purged after 21–42 days — see "Persistent model cache" under Container/Cache Structure). An explicit `HF_HOME=…` on the command line overrides the per-preset resolution. `HF_CACHE` is a back-compat alias.
 - `HF_TOKEN`: HuggingFace token for gated models. `olivia.sh` forwards it over stdin (kept off argv and out of logs), so it lives only in local config — not the cluster shell.
+- `QOS`: SLURM QOS for the server job, passed through as `--qos=` by
+  `olivia.sh server start` (default: unset → the account's `nn10104k` QOS).
+  **`QOS=devel` is the most effective scheduling lever on this cluster.** Priority
+  here is `QOS_component + 1 point per accrued minute` (fairshare/jobsize/partition
+  all contribute 0), and the QOS component is
+  `PriorityWeightQOS(20000) × (your QOS priority / cluster max 10000)` — so
+  `nn10104k` (9880) scores **19760** while `devel` (10000) scores **20000**. That
+  +240 head start is worth **four hours of queueing**: measured 2026-10-28, a devel
+  job started in *seconds* while a normal-QOS build sat pending **7.5 h** on the same
+  partition. `devel` caps walltime at **02:00:00**, allows **2** concurrent jobs, and
+  carries **DenyOnLimit** (a >2 h request is *rejected at submit*, not killed later),
+  so it fits a serve plus a benchmark sweep but **not** a from-scratch container
+  build. `olivia.sh` warns if you combine `QOS=devel` with `TIME_LIMIT` over 2 h.
 - `VLLM_ATTENTION_BACKEND`: Attention backend (default: `FLASH_ATTN`)
 - `VERBOSE`: Set to `1` for detailed logging including weight loading progress (default: `0`)
 - `VLLM_LOGGING_LEVEL`: Logging level - `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`, or `DEBUG` if VERBOSE=1)
@@ -715,6 +732,152 @@ glm52 container is the fallback and needs no rebuild.
 ./olivia.sh server start glm53_v27 --model RedHatAI/GLM-5.2-FP8
 # Then A/B against README "## Performance" -> GLM-5.2 (glm52). Retry capture once:
 CUDAGRAPH_MODE=PIECEWISE ./olivia.sh server start glm53_v27 --model RedHatAI/GLM-5.2-FP8
+```
+
+### GLM-5.3-Flash (presets `glm53_flash` / `glm53_flash_prebuilt`) — 320B on ONE node
+
+⚠️ **`GLM-5.3-Flash` is not a variant of `GLM-5.3`. They are different models, and
+the substring `GLM-5.3` matches both** — which is why `run_vllm_server.sh` tests
+`IS_GLM53_FLASH` *first* and `IS_GLM53` explicitly excludes it. Getting this wrong
+hands Flash the 744B model's PP=3 layer partition, eager default,
+`--trust-remote-code` and DSA assumptions.
+
+| | `glm53` (744B) | `glm53_flash` |
+|---|---|---|
+| Params | 744B / 40B active | **320B / 18B active** |
+| Arch | `GlmMoeDsaForCausalLM` | **`Glm5NextForConditionalGeneration`** (new) |
+| Lineage | GLM-5.2's base, re-post-trained | **New base, new pretrain** |
+| Attention | sparse MLA (DSA) everywhere | **hybrid: 34 KDA linear + 11 NoPE sparse-MLA** |
+| Modality | text | **native image + video** |
+| Shape | 12 GPUs, 3 nodes, TP=4+PP=3 | **4 GPUs, 1 node, TP=4** |
+| Weights | ~755 GB FP8 | **~306 GiB FP8** (62 shards, MIT) |
+
+Verified from the published `config.json` + `model.safetensors.index.json`
+(2026-09-01), not the model card:
+- 45 layers. `layer_types` = 34 `linear_attention` + 11 `deepseek_sparse_attention`;
+  `linear_attn_config.kda_layers` lists the KDA ones. **So do not force an
+  attention backend** — one forced choice cannot serve both halves. Same rule as
+  Ornith/Qwen3.8, for the same reason.
+- MoE: 288 routed experts, 8 active + 1 shared, `first_k_dense_replace=3`.
+- **mHC** (`mhc: true`, `hc_mult`, `hc_sinkhorn_iters`) — Manifold-Constrained
+  Hyper-Connections, a new residual mechanism. Nothing for us to configure, but it
+  is why the arch is new rather than a GLM-5.2 reskin.
+- Quant is **block-FP8** (`weight_scale_inv` tensors) → the **DeepGEMM lane**, same
+  as glm52/qwen38/dsv4, not Ornith's channel/token W8A8.
+- Vision tower: 347 `model.visual.*` tensors. Served for text; the encoder loads.
+- **MTP head IS shipped — but grepping the weight_map for `mtp` finds ZERO
+  tensors.** It is stored as language layer **45**, one past `num_hidden_layers=45`,
+  with the `eh_proj`/`enorm`/`hnorm` nextn signature and its own 288-expert MoE.
+  The Ornith trap in reverse: there, config claimed a head and the weights were
+  absent; here, the name is absent and the weights are present.
+
+**Two Hopper rules that will cost you a job if ignored:**
+1. **BF16 KV cache, always.** vLLM's recipe is explicit that `--kv-cache-dtype fp8`
+   is Blackwell-only for this model and Hopper must run BF16 KV. This is the
+   *inverse* of DeepSeek-V4-Flash, which refuses anything but fp8 KV. That is now
+   three different KV-dtype rules across four MLA-family models, so **never
+   generalise a KV-dtype setting between them.** The server script clears a stray
+   `KV_CACHE_DTYPE=fp8*` with a warning (`FORCE_KV_CACHE_DTYPE=1` overrides).
+2. **FlashInfer ≥ 0.6.18** is required for NoPE sparse MLA (`qk_rope_head_dim=0`).
+   The recipe's own troubleshooting maps "Sparse-MLA initialization error" to an
+   older FlashInfer. The glm53 container has 0.6.17 — **which is why that container
+   cannot be reused here.** The v0.32.0 build pulls **0.7.0.post1**, so the source
+   build clears this on its own; it only needs checking if you pin an older vLLM.
+
+**Version floor: v0.30.0, and the recipe page is wrong about it.** vLLM's recipe
+says "vLLM 0.29.0+". That is incorrect — **v0.29.0's `registry.py` contains zero
+`Glm5Next` entries.** Checked tag by tag (2026-10-28): v0.29.0 → 0, v0.30.0 → 4,
+v0.31.0 → 4, v0.32.0 → 4. Trusting the recipe would have produced a preset that
+builds cleanly and then fails at model load with an unsupported-architecture error.
+**The preset builds v0.32.0** (newest tag, 2026-10-18): this model's upstream
+support is only weeks old and several GH200-relevant bugs were filed right after
+release (missing sparse-MLA paths on some SMs, hybrid mamba/attention KV page
+alignment, a recurring CUDA IMA), so the later tag has had the most fixes land.
+torch stays **2.13.0**, so **NGC 26.07** is still the matching base — no new base
+image. FlashInfer arrives as **0.7.0.post1**, which clears the ≥0.6.18 NoPE
+sparse-MLA floor on its own.
+
+> **Historical note — why this was a prebuilt-image preset until 2026-10-28.**
+> When GLM-5.3-Flash's weights landed (2026-08-31), `glm5_next` was in **no public
+> vLLM release**: `main`'s registry had no entry and the recipe said, verbatim,
+> *"use docker before the integration is included in the public repo"*. There was
+> nothing to clone and build, so the preset pulled `vllm/vllm-openai:glm53-flash`
+> (which does publish a **linux/arm64** manifest, hence usable on GH200). That is
+> what `build_vllm_gh200.sh`'s **`PREBUILT_IMAGE`** mode was added for: Phase 1
+> builds the sandbox from a docker image, **Phase 3 is skipped entirely**, and
+> Phase 4 verifies what actually matters about an image we did not build — that
+> `Glm5NextForConditionalGeneration` is registered and FlashInfer is ≥0.6.18 —
+> instead of trusting the tag. v0.30.0 made that unnecessary. The mode is **kept**:
+> it is generic, additive, has no effect on any other preset, and day-0 models are
+> a recurring pattern here. `glm53_flash_prebuilt` (container index 2) keeps the
+> image reachable as a **fallback** if the source build regresses.
+
+**Memory budget.** ~306 GiB on 4×96 GB is tighter than `glm47`'s ~358 GB AWQ (which
+serves), leaving ~40 GiB after weights at the default `GPU_MEM_UTIL=0.90` — the
+first knob if the KV pool comes out too small. KV should nonetheless go far: only
+11 of 45 layers cache anything, and those are MLA with `kv_lora_rank=512` (order
+11 KB/token at BF16). Enabling MTP costs another ~7 GiB for layer 45's experts,
+which is why it is **off by default** here despite being present.
+
+**Reasoning effort.** The chat template takes `reasoning_effort` ∈ `low|high|max`
+(default `max`) and thinking is always on. Pass it through
+`chat_template_kwargs`. Parsers are the GLM family's: `--tool-call-parser glm47`,
+`--reasoning-parser glm45`.
+
+### GLM-5.3-Flash Usage
+
+```bash
+# 1. Prefetch (~306 GiB) to the PERSISTENT tier — the preset is storage=projects,
+#    so HF_HOME resolves to /cluster/projects automatically. Deliberate: the
+#    /cluster/work purge hollowed out 11 of 12 sandboxes once already.
+./olivia.sh prefetch glm53_flash
+
+# 2. Build the container from source (vLLM v0.32.0 + NGC 26.07; ~2 h, 1 GPU).
+#    ASK FOR 2.5 h, NOT MORE. The job needs ~2 h (a v0.32.0 compile reached
+#    1 h 37 m before the DeepGEMM failure, plus SIF conversion); the script's own
+#    #SBATCH default of 2 h is too tight. Walltime is a backfill lever *when a
+#    schedule gap exists* — a 4 h request needs a 4 h gap — so asking for less is
+#    free insurance. But do NOT assume it buys speed: measured 2026-10-28 with
+#    `sbatch --test-only`, the estimated start was IDENTICAL for 4 h, 2.5 h and
+#    even 1 h, because the binding constraint was queue depth (~1476 pending jobs
+#    also wanting a single GPU), not fragmentation.
+BUILD_TIME_LIMIT=02:30:00 ./olivia.sh build glm53_flash --sif
+#    Add --force to rebuild over an existing/partial sandbox (it builds into
+#    .new.JOBID and swaps atomically, preserving the old one as .prev.TIMESTAMP).
+#    Fallback if the source build regresses — pull the prebuilt image to index 2:
+#    ./olivia.sh build glm53_flash_prebuilt && ./olivia.sh server start glm53_flash_prebuilt
+#
+#    Do NOT cancel-and-resubmit a queued build just to tweak flags. Measured on
+#    this cluster: PriorityWeightAge=10080 with PriorityMaxAge=7d (=10080 min), so
+#    the age factor is exactly ONE POINT PER MINUTE QUEUED, and a job's priority is
+#    `QOS + AGE` with fairshare/jobsize/partition all contributing 0. Since every
+#    job in our QOS shares the same 19760 base (= the median pending priority),
+#    MINUTES QUEUED IS THE ONLY THING RANKING US. Example: 48 min of age put us at
+#    rank 87 of 1680; resubmitting would have reset that to the median and cost a
+#    top-5% slot for no gain. Check with `sprio -j <id> -l` and `sprio -w`.
+
+# 3. Serve on ONE node, TP=4 — ON devel, or you may queue for hours. A 4-GPU
+#    single-node shape is the hardest allocation we ask for (there were ZERO full
+#    nodes free all of 2026-10-28), and devel's +240 priority is what gets it
+#    promptly; its 2 h cap fits a smoke test plus a sweep.
+./olivia.sh cluster                      # confirm a 1-node × 4-GPU shape schedules
+QOS=devel TIME_LIMIT=02:00:00 ./olivia.sh server start glm53_flash
+./olivia.sh server watch
+#
+#    ⚠️ FIRST-SERVE UNKNOWN: FlashInfer is NOT in this container — the build
+#    installs it then uninstalls it, because `import flashinfer` fails on this stack
+#    (cute-dsl skew) and our Ornith-era guard strips it. vLLM's recipe says
+#    FlashInfer >=0.6.18 is required for the NoPE sparse-MLA layers (11 of 45). It
+#    may still work via vLLM's own compiled _flashmla_C (GLM-5.2's DSA served on
+#    Hopper without flashinfer). If engine init dies with a sparse-MLA
+#    initialisation error, THAT is the cause, and the fix is to resolve the cute-dsl
+#    skew so flashinfer imports — not to drop it.
+
+# Fallback ladder, in the order to try it:
+#   a) KV pool too small / OOM at init   -> GPU_MEM_UTIL=0.93 (then 0.94)
+#   b) CUDAGraph capture IMA (upstream #54317, seen on 4×B200)
+#                                        -> CUDAGRAPH_MODE=NONE (eager, like glm52/kimi)
+#   c) once it serves clean, THEN try    -> ENABLE_SPECULATIVE=1   (MTP, ~7 GiB)
 ```
 
 ### Borealis 27B (preset `borealis`) — Norwegian-centric, Gemma-3, one GH200

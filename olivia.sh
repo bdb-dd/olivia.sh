@@ -1260,6 +1260,37 @@ start_server_job() {
         echo "    walltime:    02:00:00 (run_vllm_server.sh default; set TIME_LIMIT to change)" >&2
     fi
 
+    # Optional QOS override (QOS, e.g. "devel"). This is the single most effective
+    # scheduling lever on Olivia, and it is NOT about limits — it is about priority.
+    # Measured 2026-10-28: priority = QOS_component + 1 point per minute queued, with
+    # fairshare/jobsize/partition all contributing zero. The QOS component is
+    #   PriorityWeightQOS(20000) x (your QOS priority / cluster max QOS priority 10000)
+    # so our normal nn10104k (9880) scores 19760 while `devel` (10000) scores 20000 —
+    # a +240 head start worth FOUR HOURS of queueing. A devel probe started in
+    # SECONDS while a normal-QOS build sat pending for 7.5 h on the same partition.
+    #
+    # `devel` caps walltime at 02:00:00 and allows 2 concurrent jobs, and carries
+    # DenyOnLimit — so asking for more than 2 h under it is REJECTED AT SUBMIT rather
+    # than killed later. That fits a serve plus a benchmark sweep comfortably; it does
+    # NOT fit a from-scratch container build (~2 h compile), so do not use it there.
+    if [[ -n "${QOS:-}" ]]; then
+        sbatch_opts+=" --qos=${QOS}"
+        echo "    qos:         ${QOS} (QOS override)" >&2
+        if [[ "${QOS}" == "devel" && -n "${TIME_LIMIT:-}" ]]; then
+            # Cheap pre-flight: devel's DenyOnLimit rejects >2 h at submit, so catch
+            # an obviously-too-long request here with a clearer message than SLURM's.
+            case "${TIME_LIMIT}" in
+                *:*:*) _tl_h=${TIME_LIMIT%%:*} ;;
+                *:*)   _tl_h=0 ;;
+                *)     _tl_h=$(( TIME_LIMIT / 60 )) ;;
+            esac
+            if [[ "${_tl_h#0}" =~ ^[0-9]+$ ]] && (( ${_tl_h#0} > 2 )); then
+                warn "QOS=devel caps walltime at 02:00:00 but TIME_LIMIT=${TIME_LIMIT} exceeds it."
+                warn "devel has DenyOnLimit, so SLURM will REJECT this at submit. Lower TIME_LIMIT or drop QOS."
+            fi
+        fi
+    fi
+
     # Debug: echo the exact command being submitted so regressions like
     # "didn't request 2 nodes" are visible at submission time.
     echo "    sbatch opts: ${sbatch_opts}" >&2

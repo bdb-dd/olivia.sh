@@ -386,8 +386,24 @@ Stable 1→64 (0 failures, no decode wedge — RayExecutorV2). Single-stream is 
 
 ### GLM-5.3 (`glm53` / `glm53_v27`) — not yet run
 No allocation spent. GLM-5.3's weights were still unpublished as of 2026-08-17 (announced 2026-08-14, open weights promised ~2 weeks out), so neither preset has been prefetched, built, or served. `glm53` is expected to match the GLM-5.2 row above exactly — it is the same base on the same container.
-### GLM-5.3-Flash (`glm53_flash`) — not yet run · preset added 2026-09-01
-No allocation spent yet. Weights published 2026-08-31 (MIT, ~306 GiB, 62 shards) and the preset is wired, but nothing has been prefetched, built or served — the numbers below are **estimates from the config and the vLLM recipe**, not measurements, and this section gets replaced with a real sweep the moment one runs.
+### GLM-5.3-Flash (`glm53_flash`) — BUILT, not yet serving · 2026-10-29
+
+**Allocation spent so far: ~3 GPU-h of 6000.** Weights prefetched and verified; container built and verified; **two serve attempts, both died at engine init**, each on a different missing dependency in our own toolchain. No throughput numbers yet — the estimates further down remain estimates.
+
+| step | result |
+|---|---|
+| prefetch | ✅ 306 G on the **persistent** tier, 74 files in **2m23s** (~2.1 GB/s), 62/62 shards matching the index, 0 incomplete. MTP head confirmed at language layer 45 (1760 tensors) |
+| build (job 2663868) | ❌ failed 29 min in — `<stdin> line 16: SyntaxError`. Our own nested-heredoc bug, latent on `main` since ~2026-08-19 |
+| build (job 2665731) | ❌ failed 1 h 37 m in — `fatal error: elfutils/libdwfl.h`. DeepGEMM's vendored `deep_jit` needs `libdw-dev`, which no NGC image ships |
+| build (job 2666829) | ✅ **41 GB sandbox, vLLM 0.32.1.dev0 on NGC 26.07.** NGC torch preserved, serving stack verified, and all four `Glm5Next` entries present in the *installed* registry. 7.5 h queued, then 2 h 05 m running. SIF step OOM-killed (`mksquashfs` MaxRSS 131478 M vs 128 G) — harmless, the atomic swap precedes it |
+| serve (job 2673535) | ❌ engine init, 2.5 min — `OSError: libz3.so.4.15`. tilelang's `z3-solver` dep was skipped by our `--no-deps` install |
+| serve (job 2673772) | ❓ **outcome unknown** — the SSH master dropped mid-run and the watch was lost. Its 2 h window has closed; the verdict is in `logs/vllm_server_2673772.log` and has not yet been read |
+
+**What the attempts did confirm**, from job 2673535's log before it died: `Attention Backend: <auto-select>` (correctly not forced), `glm47`/`glm45` parsers, `max_model_len 131072`, `tensor_parallel_size 4`, and `kv_cache_dtype=auto` — i.e. the Hopper BF16-KV rule honoured. The preset's runtime block behaves as designed.
+
+> ⚠️ **The open technical question is FlashInfer.** Our build installs `flashinfer-python` and then deliberately uninstalls it (the Ornith-era guard, because `import flashinfer` fails on this stack from cute-dsl skew). vLLM's recipe says FlashInfer ≥0.6.18 is *required* for the NoPE sparse-MLA layers — 11 of 45 here. It may still work via vLLM's own compiled `_flashmla_C` (GLM-5.2's DSA served on Hopper without it). **Unresolved: neither serve attempt got far enough to test it.**
+
+**Lesson worth more than the preset:** three of the four failures were latent faults in our own build path, not properties of this model — and the first two had silently blocked *every* container build since August. `--no-deps` protects NGC PyTorch but quietly drops legitimate dependencies, and nothing verified the result until a GPU was already allocated. Hence the build-time import probes now in `build_vllm_gh200.sh`, and the `--qos=devel` probe pattern (a 12-second job proved the `libdw-dev` fix; a 26-second one proved the `z3-solver` fix) instead of discovering such things 1.5 h into a build.
 
 What the shape should be, and why it is worth the allocation:
 - **One node, TP=4.** ~306 GiB of weights against 4×96 GB = 384 GB. That is a tighter fit than `glm47`'s ~358 GB AWQ, which already serves at TP=4, leaving roughly 40 GiB after weights at the default `GPU_MEM_UTIL=0.90`. For comparison, GLM-5.2 needs **12 GPUs across 3 nodes** — so if this serves, it is a 320B-class model at **4 GPU-h/hour instead of 12**.

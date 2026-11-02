@@ -18,13 +18,17 @@ set -uo pipefail
 cd "$(dirname "$0")"
 rc=0
 
+# Every shell script, not a hand-maintained list: a new script would otherwise
+# be silently uncovered, which is the same failure shape as the bugs above.
+SHELLS=(*.sh)
+
 echo "== bash -n =="
-for f in run_vllm_server.sh build_vllm_gh200.sh olivia.sh; do
+for f in "${SHELLS[@]}"; do
     if bash -n "$f" 2>&1; then echo "  OK    $f"; else echo "  FAIL  $f"; rc=1; fi
 done
 
 echo "== embedded python heredocs =="
-python3 -I check_heredoc_py.py build_vllm_gh200.sh run_vllm_server.sh olivia.sh || rc=1
+python3 -I check_heredoc_py.py "${SHELLS[@]}" || rc=1
 
 echo "== per-model knob use-before-assign =="
 python3 -I check_unbound_order.py run_vllm_server.sh || rc=1

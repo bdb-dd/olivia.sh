@@ -898,12 +898,18 @@ if [[ "${IS_GLM53_FLASH}" == "1" && "${IS_AWQ}" == "0" ]]; then
     # allocator failing to map 20 MB with ~14 MB free on all four ranks, so 0.9
     # is already the ceiling. Hence a cap rather than more memory.
     #
-    # 192 and not 202: the block count shifts run to run with memory-profiling
-    # noise, so a cap AT the measured maximum would fail again on a slightly
-    # tighter profile — and 192 is one of vLLM's CUDA-graph capture sizes, so
-    # rounding up wastes no graph. This only protects startup; the real decode
-    # ceiling at full context is 1.59x (see MAX_MODEL_LEN above).
-    GLM53_FLASH_MAX_NUM_SEQS="${GLM53_FLASH_MAX_NUM_SEQS:-192}"
+    # 128, well under the measured 202, because A HIGHER CAP BUYS NOTHING HERE.
+    # This is a startup guard, not a throughput setting: the KV pool binds first
+    # at every context we actually run. 208,476 tokens / max_model_len gives the
+    # reachable concurrency — 1.6 at 131072, 6.4 at 32768, 25 at 8192, 51 at 4096
+    # — so a cap of 128 only starts to bind below ~1.6K context, far under any
+    # sweep we drive (<= 64 streams). Spending the margin on headroom we cannot
+    # reach would be the wrong trade, because the block count DOES drift run to
+    # run with memory-profiling noise: a cap at 192 sits 5% under the measured
+    # count and would fail again on a slightly tighter profile, costing another
+    # full weight load and capture to find out. 128 keeps 37% margin and is a
+    # CUDA-graph capture size, so no graph is wasted rounding up.
+    GLM53_FLASH_MAX_NUM_SEQS="${GLM53_FLASH_MAX_NUM_SEQS:-128}"
 fi
 
 # DeepSeek-V4.1-Flash runtime profile — and THE reason this preset exists on

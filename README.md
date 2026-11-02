@@ -387,8 +387,35 @@ Stable 1→64 (0 failures, no decode wedge — RayExecutorV2). Single-stream is 
 
 ### GLM-5.3 (`glm53` / `glm53_v27`) — not yet run
 No allocation spent. GLM-5.3's weights were still unpublished as of 2026-08-17 (announced 2026-08-14, open weights promised ~2 weeks out), so neither preset has been prefetched, built, or served. `glm53` is expected to match the GLM-5.2 row above exactly — it is the same base on the same container.
-### DeepSeek-V4.1-Flash (`dsv41`) — Engram offload PROVEN, not yet serving · 2026-11-02
-**Allocation spent: ~0.5 GPU-h.** Weights prefetched and verified; **three serve attempts, each killed by a different one-line fault in our own code, each caught further along than the last.** The model itself has raised no objection yet.
+### DeepSeek-V4.1-Flash (`dsv41`) — ✅ **SERVING AND BENCHMARKED** · 2026-11-03
+**748B parameters generating on four GPUs**, job 2697324 on gpu-1-50. Engine init 119.71 s, CUDA graphs captured 100%, zero errors, `OpenAI server is ready to accept requests`. A completion returned `dsv41 online` with reasoning split into its own field, so the `deepseek_v41` tokenizer/tool/reasoning parsers all resolve.
+
+| streams | aggregate | per stream |
+|---|---|---|
+| 1 | **112.4 tok/s** (2 runs, 0.2% apart) | 112.4 |
+| 4 | 357 tok/s | 89.2 |
+| 16 | **1121 tok/s** | 70.0 |
+
+**Measurement conditions, so these are not over-read:** short prompts, `max_tokens` 200–300, `temperature 0`, requests issued from the login node to the compute node. Not a long-context test and not a full `bench_sweep.py` run — the KV pool was never stressed, which matters given only 1.75x concurrency is available at the full 131072 window.
+
+**Why this is the best throughput-per-GPU we have measured.** GLM-5.2 is a comparable 744B and needs **12 GPUs across 3 nodes** to reach ~895 tok/s @64, eager-only. This does **1121 tok/s @16 on 4 GPUs, with CUDA graphs captured.** Single-stream it beats Ornith's 397B on 8 GPUs (~81 tok/s) and Laguna M.1 on the same 4-GPU shape (~63 tok/s). The flat scaler — 112 → 70 per stream across a 16x fan-out — is the other notable part.
+
+**And the KV result inverts the GLM-5.3-Flash story.** Measured at TP=4 / util 0.90:
+
+| | dsv41 | glm53_flash |
+|---|---|---|
+| Available KV cache | **1.08 GiB/rank** | 2.52 GiB/rank |
+| GPU KV cache size | **229,815 tokens** | 208,476 tokens |
+| Max concurrency @131072 | **1.75x** | 1.59x |
+
+More KV tokens out of **less than half** the memory — about 2.6x the tokens per GiB. That is CSA2 earning its design, and it is why `DSV41_MAX_NUM_SEQS=128` was never at risk: here the cap binds on **weights**, exactly as predicted, not on cache.
+
+> ⚠️ **Unreconciled, and worth chasing:** the preset notes claim CSA2 costs **890 bytes/token**, but 229,815 tokens from 1.08 GiB is ~5 KB/token (~20 KB if that figure is per-rank and the pool is sharded). The likely explanation is that 890 B covers only the **main** KV while this pool also funds the indexer K cache, the sliding-window cache and the compressor — the four backends the log registers (`FLASHMLA_SPARSE_DSV41` / `DEEPSEEK_SPARSE_SWA` / `DEEPSEEK_V41_INDEXER` / `CompressorBackend`). **Unverified.** Do not plan context budgets off the 890 B figure until it is.
+
+**Still on the table:** `DSV41_ENGRAM_USE_THP=true` (confirmed legal at DP=1 — the single most promising next knob, since ~259 GiB of table behind 4 KiB pages is ~68M PTEs under random hash lookup); a real `bench_sweep.py` run including long context; and DSpark speculative decode.
+
+#### How it got here — three runs, three one-line faults, all ours
+**Allocation spent: ~1 GPU-h to a working server.** Weights prefetched and verified; **three failed serve attempts before this one, each killed by a different one-line fault in our own code, each caught further along than the last.** The model itself never objected to anything.
 
 | step | result |
 |---|---|

@@ -953,7 +953,39 @@ if [[ "${IS_DSV41}" == "1" ]]; then
     # Engram to pinned host memory (see the comment block above). Override with
     # DSV41_ENGRAM_CPU_OFFLOAD=false only on a card large enough to hold ~47 GiB
     # of tables per rank beside the backbone — not ours.
+    #
+    # Note: `cpu_offload` is ALREADY vLLM's default for this model
+    # (config/engram.py: `cpu_offload: bool = True`), so passing it changes
+    # nothing by itself. It is passed explicitly anyway — this is the flag the
+    # whole single-node fit depends on, and an explicit value documents that and
+    # keeps an upstream default-flip from silently un-fitting the preset.
     DSV41_ENGRAM_CPU_OFFLOAD="${DSV41_ENGRAM_CPU_OFFLOAD:-true}"
+
+    # TRANSPARENT HUGE PAGES for the offloaded tables — the one Engram knob our
+    # shape can actually use, and OFF for the first serve on purpose.
+    #
+    # The offloaded tables are read by **UVA lookup**: the GPU addresses host
+    # memory directly over NVLink-C2C rather than copying pages in. With ~259 GiB
+    # of table behind 4 KiB pages that is ~68M page-table entries, walked by a
+    # *random, sparse, token-driven hash* — close to the worst case for TLB
+    # locality. `use_thp` backs the private tables with 2 MiB pages instead,
+    # cutting entries by ~512x. On a workload whose access pattern is pure random
+    # lookup into a host table, that is the obvious thing to try.
+    #
+    # Constraints checked against vLLM's own validator (config/engram.py):
+    #   * requires cpu_offload=true  — we set that.
+    #   * requires dp_shared_memory=false. `resolve_dp_shared_memory` only turns
+    #     that on when data_parallel_size > 1; we run TP=4 / DP=1, so it stays
+    #     off and THP is legal here. (It would NOT be on a DP shape.)
+    #   * best effort — it falls back to ordinary pinned pages, so a kernel
+    #     without THP available degrades rather than fails.
+    # Cost: it PREFAULTS the tables at startup, so first load gets slower — which
+    # is why VLLM_ENGINE_READY_TIMEOUT_S is already 3600 above.
+    #
+    # Default OFF because the first serve of a 748B model should move one
+    # variable at a time; this is the FIRST optimisation to try once it serves
+    # clean, ahead of DSpark spec decode.
+    DSV41_ENGRAM_USE_THP="${DSV41_ENGRAM_USE_THP:-false}"
 
     # V4.1-Flash does NOT support torch.compile, so the default
     # FULL_AND_PIECEWISE dies at capture. FULL_DECODE_ONLY is what the recipe
@@ -965,7 +997,24 @@ if [[ "${IS_DSV41}" == "1" ]]; then
     # uninstalls flashinfer when `import flashinfer` fails on the cute-dsl skew.
     # Set DSV41_ATTENTION_CONFIG="" to let vLLM auto-select and find out what it
     # picks without flashinfer present.
-    DSV41_ATTENTION_CONFIG="${DSV41_ATTENTION_CONFIG:-{\"backend\":\"FLASHINFER_MLA_SPARSE_DSV41\",\"indexer_kv_dtype\":\"mxfp4\",\"indexer_sparse_logits\":true}}"
+    # BACKEND: FLASHMLA, not FLASHINFER — and this was wrong until 2026-11-02.
+    #
+    # v0.32.1 registers THREE V4.1 sparse-MLA backends (v1/attention/backends/
+    # registry.py), not one:
+    #   FLASHMLA_SPARSE_DSV41      -> vllm.models.deepseek_v41.sparse_mla
+    #   FLASHINFER_MLA_SPARSE_DSV41-> ...deepseek_v41.nvidia.flashinfer_sparse
+    #   FLASHMLA_MEGA_ATTN_DSV41   -> ...deepseek_v41.sparse_mla (mega attention)
+    # Only the middle one needs flashinfer, and our container does not ship it.
+    # FLASHMLA_SPARSE_DSV41 runs on vLLM's OWN compiled `_flashmla_C.abi3.so`
+    # (39 MB, verified present in the sandbox), so it needs nothing extra.
+    #
+    # This is the same lesson GLM-5.3-Flash taught by accident: it served its
+    # NoPE sparse-MLA layers on FLASH_ATTN_MLA_SPARSE with flashinfer absent.
+    # Naming a flashinfer backend explicitly would turn a working default into a
+    # hard failure, so prefer the compiled path and keep flashinfer optional.
+    # Set DSV41_ATTENTION_CONFIG="" to let vLLM auto-select, or name
+    # FLASHMLA_MEGA_ATTN_DSV41 to try mega attention (same KV geometry).
+    DSV41_ATTENTION_CONFIG="${DSV41_ATTENTION_CONFIG:-{\"backend\":\"FLASHMLA_SPARSE_DSV41\",\"indexer_kv_dtype\":\"mxfp4\",\"indexer_sparse_logits\":true}}"
 
     DSV41_TOOL_PARSER="${DSV41_TOOL_PARSER:-deepseek_v41}"
     DSV41_REASONING_PARSER="${DSV41_REASONING_PARSER:-deepseek_v41}"
@@ -1712,7 +1761,7 @@ if [[ "${IS_DSV41}" == "1" ]]; then
 
     # THE headline flag: park Engram's sparsely-accessed tables in pinned host
     # memory so 96 GB cards only hold the backbone.
-    VLLM_ARGS+=("--engram-config" "{\"cpu_offload\":${DSV41_ENGRAM_CPU_OFFLOAD}}")
+    VLLM_ARGS+=("--engram-config" "{\"cpu_offload\":${DSV41_ENGRAM_CPU_OFFLOAD},\"use_thp\":${DSV41_ENGRAM_USE_THP}}")
 
     # Sparse-MLA backend + indexer dtypes. Empty string = let vLLM auto-select
     # (useful for discovering what it picks when flashinfer is absent).

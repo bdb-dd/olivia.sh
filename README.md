@@ -415,7 +415,18 @@ More KV tokens out of **less than half** the memory — about 2.6x the tokens pe
 **Still on the table:** `DSV41_ENGRAM_USE_THP=true` (confirmed legal at DP=1 — the single most promising next knob, since ~259 GiB of table behind 4 KiB pages is ~68M PTEs under random hash lookup); a real `bench_sweep.py` run including long context; and DSpark speculative decode.
 
 #### How it got here — three runs, three one-line faults, all ours
-**Allocation spent: ~1 GPU-h to a working server.** Weights prefetched and verified; **three failed serve attempts before this one, each killed by a different one-line fault in our own code, each caught further along than the last.** The model itself never objected to anything.
+**Allocation spent: ~3.9 GPU-h for the whole campaign** (measured: `cost` reported `Used 9.10` GPU-h for the 2026.2 period afterwards, up from 4.95 before the first dsv41 serve). Breakdown worth keeping, because most of it was not the work:
+
+| job | outcome | GPU-h |
+|---|---|---|
+| 2694557 | unbound variable, 1 s | 0.0 |
+| 2694626 | Blackwell mxfp4, 25 s | ~0.03 |
+| 2694691 | missing quack, ~7 min | 0.5 |
+| 2697324 | ✅ **served**, 51:22 elapsed | **3.4** |
+
+**Reaching a working server cost only ~0.6 GPU-h** (≈9 min to `ready` × 4 GPUs). The other ~2.8 GPU-h of job 2697324 was the server sitting **idle** until the 1200 s watchdog cancelled it. So an unattended successful serve costs ~1.3 GPU-h per idle window on this shape — cheap insurance against a forgotten job, but not free, and worth a shorter `IDLE_TIMEOUT` for a bench-and-exit run.
+
+Weights prefetched and verified; **three failed serve attempts before the good one, each killed by a different one-line fault in our own code, each caught further along than the last.** The model itself never objected to anything.
 
 | step | result |
 |---|---|

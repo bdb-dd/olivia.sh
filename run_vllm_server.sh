@@ -700,8 +700,18 @@ if [[ -z "${MAX_MODEL_LEN+x}" ]]; then
         # DeepSeek-V4-Flash: the full 1M would spend the whole KV budget on one
         # sequence. The hybrid attention makes that budget go unusually far
         # (only 11 of 45 layers hold a KV cache, and those are MLA with
-        # kv_lora_rank=512), so this is a starting point, not a ceiling — raise it
-        # explicitly once the KV pool size is known from a real serve.
+        # kv_lora_rank=512) — but the budget itself is the constraint here, not
+        # the per-token cost.
+        #
+        # MEASURED on-cluster (job 2673772, 2026-10-30, TP=4 @ util 0.9):
+        #   Available KV cache memory: 2.52 GiB per rank
+        #   GPU KV cache size:         208,476 tokens
+        #   Maximum concurrency @131072: 1.59x
+        # So 320B of FP8 weights leave ~2.5 GiB per card and this window already
+        # spends the pool on ~1.6 sequences. Raising it is only worthwhile for
+        # single-stream long-context work; LOWERING it is what buys concurrency
+        # (e.g. 32768 -> ~6.4x). This is the lever, not --gpu-memory-utilization,
+        # which that run showed is already at its ceiling.
         MAX_MODEL_LEN=131072
     elif [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" ]]; then
         # GLM-5.1 ~205K, GLM-5.2/5.3 ~1M, Kimi K2.6 ~256K, Laguna M.1 ~256K native —
@@ -870,6 +880,30 @@ if [[ "${IS_GLM53_FLASH}" == "1" && "${IS_AWQ}" == "0" ]]; then
         echo "[WARN] (FP8 KV cache for this model is Blackwell-only; set FORCE_KV_CACHE_DTYPE=1 to override.)"
         KV_CACHE_DTYPE=""
     fi
+
+    # DECODE CONCURRENCY IS CAPPED BY THE KDA STATE CACHE, NOT BY KV.
+    #
+    # glm5_next is a HYBRID: NoPE sparse-MLA layers interleaved with KDA linear
+    # attention, and every KDA layer carries a per-sequence recurrent state —
+    # what vLLM accounts for as a "Mamba cache block". One block per decode
+    # sequence, drawn from the same budget as the KV pool, and that budget is
+    # thin: ~2.5 GiB per rank, which came to 202 blocks on-cluster.
+    #
+    # vLLM's default max_num_seqs is 1024, so it refuses to capture and the
+    # engine dies 8.6 minutes in — AFTER the full weight load AND a clean 51/51
+    # PIECEWISE + 2/2 FULL capture (job 2673772, 2026-10-30):
+    #     ValueError: max_num_seqs (1024) exceeds available Mamba cache blocks (202).
+    # That error suggests raising --gpu-memory-utilization as the alternative.
+    # On this shape it is NOT available: the same run logged the caching
+    # allocator failing to map 20 MB with ~14 MB free on all four ranks, so 0.9
+    # is already the ceiling. Hence a cap rather than more memory.
+    #
+    # 192 and not 202: the block count shifts run to run with memory-profiling
+    # noise, so a cap AT the measured maximum would fail again on a slightly
+    # tighter profile — and 192 is one of vLLM's CUDA-graph capture sizes, so
+    # rounding up wastes no graph. This only protects startup; the real decode
+    # ceiling at full context is 1.59x (see MAX_MODEL_LEN above).
+    GLM53_FLASH_MAX_NUM_SEQS="${GLM53_FLASH_MAX_NUM_SEQS:-192}"
 fi
 
 # DeepSeek-V4.1-Flash runtime profile — and THE reason this preset exists on
@@ -1693,6 +1727,13 @@ if [[ "${IS_DSV41}" == "1" ]]; then
     if [[ "${DSV41_ENABLE_PREFIX_CACHING:-1}" == "1" ]]; then
         VLLM_ARGS+=("--enable-prefix-caching")
     fi
+fi
+
+# GLM-5.3-Flash: cap decode concurrency to the KDA state-cache budget. See the
+# runtime-profile block above for why 192, and why raising the memory
+# utilisation is not the alternative the vLLM error message suggests it is.
+if [[ "${IS_GLM53_FLASH}" == "1" && -n "${GLM53_FLASH_MAX_NUM_SEQS:-}" ]]; then
+    VLLM_ARGS+=("--max-num-seqs" "${GLM53_FLASH_MAX_NUM_SEQS}")
 fi
 
 # Qwen3.8 27B dense — same Qwen3.5 parser family as Ornith, different shape.

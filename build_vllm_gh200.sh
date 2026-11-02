@@ -1718,9 +1718,23 @@ pip install --no-cache-dir --root-user-action=ignore apache-tvm-ffi 2>&1 | tail 
 # uninstalled it, and vLLM fell back to Triton/CUTLASS. The SAME `--no-deps`
 # dependency-dropping bug as tilelang's z3-solver.
 #
-# That strip is no longer acceptable: both GLM-5.3-Flash (NoPE sparse MLA) and
-# DeepSeek-V4.1-Flash (`FLASHINFER_MLA_SPARSE_DSV41`) need flashinfer for their
-# sparse-MLA backends. Two presets, one dependency.
+# Why fix it rather than keep stripping -- and a correction to my first version
+# of this comment, which claimed GLM-5.3-Flash NEEDS flashinfer for sparse MLA.
+# It does not. Job 2673772 (2026-10-30) loaded and captured GLM-5.3-Flash with
+# flashinfer ABSENT: the selector logged
+#   "Using FLASH_ATTN_MLA_SPARSE attention backend out of potential backends:
+#    ['FLASH_ATTN_MLA_SPARSE', 'FLASHMLA_SPARSE']"
+# -- neither of which is a flashinfer backend -- plus DEEPGEMM for the FP8 MoE
+# and a PYNCCL fall-back for the all-reduce ("FlashInfer All Reduce is disabled
+# because flashinfer is not available"). So on Hopper the NoPE sparse-MLA path
+# is served by FlashAttention, and flashinfer is a PERFORMANCE option here, not
+# a requirement.
+#
+# It is still worth having: DeepSeek-V4.1-Flash asks for
+# `FLASHINFER_MLA_SPARSE_DSV41` by name, FlashInfer all-reduce and the
+# top-p/top-k sampler are otherwise unavailable to every preset, and shipping a
+# dependency-complete install is the point. But it must NOT gate a serve
+# attempt: nothing here blocks GLM-5.3-Flash.
 #
 # What changed upstream to make this fixable: the old conflict was real --
 # quack-kernels 0.6.4 pinned nvidia-cutlass-dsl==4.6.2 while vLLM v0.27.1 pinned

@@ -554,8 +554,31 @@ fi
 #     (mtp.0.hc_attn_base, ...), and vLLM registers DeepSeekV4MTPModel. This is a
 #     verified-present head, so MTP is left ON by default here — the opposite call
 #     from Ornith, whose FP8 declared MTP and shipped nothing.
+# Detect DeepSeek-V4.1-Flash. This MUST be tested before IS_DSV4, and IS_DSV4 must
+# exclude it, because "DeepSeek-V4" is a substring of "DeepSeek-V4.1-Flash" — the
+# same trap GLM-5.3 vs GLM-5.3-Flash set. They are different architectures
+# (DeepseekV41ForCausalLM vs DeepseekV4ForCausalLM) with different serve contracts,
+# and letting 4.1 inherit the 4.0 profile would hand it the wrong attention backend
+# and a tilelang mhc path it does not use.
+#
+# From the published config + vLLM's recipe (2026-11-02):
+#   - 552B backbone + 196.6B Engram, only 8B active per prompt token and 16B per
+#     output token; 40 layers, 384 routed + 1 shared expert, 6 active; 1M ctx via
+#     YaRN (factor 16 over 65536); vision-language; MIT.
+#   - Quant is fp8 with weight_block_size [32,32] and expert_dtype fp4.
+#   - CSA2 attention (Full/Reindex/Reuse modes) + a two-level hierarchical indexer,
+#     with FP4 main KV shared across layers → **890 bytes per token**. KV is
+#     therefore almost free; WEIGHTS set the capacity limit, not cache.
+#   - **V4.1 DROPPED the MTP module.** Despite num_nextn_predict_layers=3 in the
+#     config, DSpark is the only speculative method for this checkpoint. Do not
+#     try `--speculative-config method=mtp` here.
+IS_DSV41=0
+if [[ "${MODEL}" == *"V4.1"* ]] || [[ "${MODEL}" == *"v4.1"* ]] || [[ "${MODEL}" == *"V4_1"* ]]; then
+    IS_DSV41=1
+fi
+
 IS_DSV4=0
-if [[ "${MODEL}" == *"DeepSeek-V4"* ]] || [[ "${MODEL}" == *"deepseek-v4"* ]]; then
+if [[ "${IS_DSV41}" == "0" ]] && { [[ "${MODEL}" == *"DeepSeek-V4"* ]] || [[ "${MODEL}" == *"deepseek-v4"* ]]; }; then
     IS_DSV4=1
 fi
 
@@ -567,6 +590,15 @@ fi
 # capture once upstream ships a meta impl for the op (decode-speedup TODO).
 if [[ "${IS_KIMI}" == "1" && -z "${CUDAGRAPH_MODE}" ]]; then
     CUDAGRAPH_MODE="NONE"
+fi
+
+# DeepSeek-V4.1-Flash does not support torch.compile, so vLLM's default
+# FULL_AND_PIECEWISE dies at capture. Hand the compilation config an explicit
+# FULL_DECODE_ONLY instead (see the IS_DSV41 block): decode graphs are kept, which
+# is where the throughput is, and prefill is left uncompiled. We therefore do NOT
+# set CUDAGRAPH_MODE for 4.1 — the compilation-config flag carries it.
+if [[ "${IS_DSV41}" == "1" && -z "${CUDAGRAPH_MODE}" ]]; then
+    echo "[INFO] DeepSeek-V4.1: cudagraph_mode=${DSV41_CUDAGRAPH_MODE} via --compilation-config (no torch.compile support)"
 fi
 
 # GLM-5.2: CUDAGraph capture hits an illegal-memory-access during capture_model
@@ -620,7 +652,7 @@ fi
 # any OpenAI tool-using client (Claude Code via anthropic_proxy.py, etc.).
 # ``${VAR+x}`` distinguishes "user explicitly set (even to 0)" from "unset".
 if [[ -z "${ENABLE_AUTO_TOOL_CHOICE+x}" ]]; then
-    if [[ "${IS_GLM_MOE}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" || "${IS_ORNITH}" == "1" || "${IS_QWEN38}" == "1" || "${IS_DSV4}" == "1" ]]; then
+    if [[ "${IS_GLM_MOE}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" || "${IS_ORNITH}" == "1" || "${IS_QWEN38}" == "1" || "${IS_DSV4}" == "1" || "${IS_DSV41}" == "1" ]]; then
         ENABLE_AUTO_TOOL_CHOICE=1
     else
         ENABLE_AUTO_TOOL_CHOICE=0
@@ -632,7 +664,15 @@ fi
 # matches typical Claude Code usage (which requests max_tokens=32000).
 # Other models keep the conservative 32K default.
 if [[ -z "${MAX_MODEL_LEN+x}" ]]; then
-    if [[ "${IS_DSV4}" == "1" ]]; then
+    if [[ "${IS_DSV41}" == "1" ]]; then
+        # Native window is 1,048,576 (YaRN x16 over 65536). Unusually, the full 1M
+        # is nearly affordable here: KV is 890 BYTES per token (FP4 latents shared
+        # across layers), so a 1M prompt holds under 1 GB of global KV plus a fixed
+        # 128-token sliding window per layer. 131072 is still the default because
+        # weights, not cache, are what is tight on 96 GB cards — but raising this
+        # costs far less than on any other preset we run.
+        MAX_MODEL_LEN=131072
+    elif [[ "${IS_DSV4}" == "1" ]]; then
         # Native window is 1,048,576 (YaRN x16). Default to 131072: the full 1M
         # would consume the entire KV budget for a single sequence. Raise it
         # explicitly for long-context runs (the context ladder does exactly that).
@@ -832,6 +872,66 @@ if [[ "${IS_GLM53_FLASH}" == "1" && "${IS_AWQ}" == "0" ]]; then
     fi
 fi
 
+# DeepSeek-V4.1-Flash runtime profile — and THE reason this preset exists on
+# GH200 rather than a bigger box.
+#
+# vLLM's own sizing says V4.1-Flash wants ~614 GB of VRAM, i.e. a GB200 NVL4 tray
+# (768 GB) or an 8-GPU H200 node (1128 GB). Our node is 4 x 96 = 384 GB, so it does
+# not fit — UNLESS the Engram tables leave the GPUs. They are the ideal candidate:
+# 196.6B parameters (259.5 GiB, ~47.2 GiB per rank at TP4) that are **sparsely
+# accessed by token-based hash lookup**, held by only two layers (1 and 14, each a
+# ~384M-row x 256 table). Keeping them resident would consume half of every 96 GB
+# card; `--engram-config {"cpu_offload":true}` parks them in **pinned host memory**
+# so the cards hold only the backbone.
+#
+# This is a better fit on GH200 than almost anywhere else: Grace is attached over
+# NVLink-C2C at ~900 GB/s, roughly an order of magnitude more than a PCIe host hop,
+# and there is ~800 GB of LPDDR5X per node to hold the tables. It is also finer
+# grained than our CPU_OFFLOAD_GB lever: --cpu-offload-gb evicts by layer order,
+# blind to access frequency, whereas this moves exactly the cold structure.
+# CPU_OFFLOAD_GB remains available on top if the backbone itself still does not fit.
+if [[ "${IS_DSV41}" == "1" ]]; then
+    # Block-FP8 → DeepGEMM lane (same as glm52/qwen38/dsv4). Skip the JIT warmup;
+    # vLLM's recipe sets this too.
+    if [[ "${VLLM_USE_DEEP_GEMM_EXPLICIT}" == "0" ]]; then
+        export VLLM_USE_DEEP_GEMM=1
+    fi
+    export VLLM_DEEP_GEMM_WARMUP="${VLLM_DEEP_GEMM_WARMUP:-skip}"
+
+    # First load is genuinely long (510 GB of shards, Engram tables staged into
+    # pinned host memory). vLLM's recipe raises its own readiness timeout to an
+    # hour for exactly this reason; without it the engine is declared dead while
+    # still loading.
+    export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-3600}"
+    export VLLM_USE_RUST_FRONTEND="${VLLM_USE_RUST_FRONTEND:-1}"
+
+    # fp8 KV is REQUIRED, as with DeepSeek-V4 — and this is the OPPOSITE of
+    # GLM-5.3-Flash, where fp8 KV is Blackwell-only and Hopper must run BF16.
+    # Four MLA-family models now, four different KV rules: never generalise one.
+    KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+
+    # Engram to pinned host memory (see the comment block above). Override with
+    # DSV41_ENGRAM_CPU_OFFLOAD=false only on a card large enough to hold ~47 GiB
+    # of tables per rank beside the backbone — not ours.
+    DSV41_ENGRAM_CPU_OFFLOAD="${DSV41_ENGRAM_CPU_OFFLOAD:-true}"
+
+    # V4.1-Flash does NOT support torch.compile, so the default
+    # FULL_AND_PIECEWISE dies at capture. FULL_DECODE_ONLY is what the recipe
+    # uses; it keeps decode graphs (the throughput win) without compiling prefill.
+    DSV41_CUDAGRAPH_MODE="${DSV41_CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"
+
+    # Sparse-MLA backend for this arch. NOTE the FLASHINFER prefix: this is the
+    # hard dependency that currently BLOCKS the preset, because our build
+    # uninstalls flashinfer when `import flashinfer` fails on the cute-dsl skew.
+    # Set DSV41_ATTENTION_CONFIG="" to let vLLM auto-select and find out what it
+    # picks without flashinfer present.
+    DSV41_ATTENTION_CONFIG="${DSV41_ATTENTION_CONFIG:-{\"backend\":\"FLASHINFER_MLA_SPARSE_DSV41\",\"indexer_kv_dtype\":\"mxfp4\",\"indexer_sparse_logits\":true}}"
+
+    DSV41_TOOL_PARSER="${DSV41_TOOL_PARSER:-deepseek_v41}"
+    DSV41_REASONING_PARSER="${DSV41_REASONING_PARSER:-deepseek_v41}"
+    DSV41_MAX_NUM_SEQS="${DSV41_MAX_NUM_SEQS:-128}"
+fi
+
 # --- GLM-5.2-family multi-node bits that are QUANT-INDEPENDENT --------------
 # These two used to live inside the `IS_AWQ == 0` branch above, which was fine
 # while block-FP8 was the only GLM-5.2 quant. It no longer is: a complete
@@ -882,7 +982,7 @@ fi
 # from whatever is installed — if nothing works, the error will tell us what
 # to install.
 if [[ -z "${VLLM_ATTENTION_BACKEND}" ]]; then
-    if [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_ORNITH}" == "1" || "${IS_QWEN38}" == "1" || "${IS_BOREALIS}" == "1" || "${IS_DSV4}" == "1" || "${IS_GLM53_FLASH}" == "1" ]]; then
+    if [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_ORNITH}" == "1" || "${IS_QWEN38}" == "1" || "${IS_BOREALIS}" == "1" || "${IS_DSV4}" == "1" || "${IS_GLM53_FLASH}" == "1" || "${IS_DSV41}" == "1" ]]; then
         # Don't force FLASH_ATTN — these need vLLM to auto-select a special backend:
         #   GLM-5.3-Flash HYBRID *and* sparse-MLA in one model: 34 KDA linear-attn
         #     layers (need a GDN kernel + recurrent state) interleaved with 11 NoPE
@@ -1559,6 +1659,40 @@ if [[ "${IS_DSV4}" == "1" ]]; then
     [[ "${ENABLE_AUTO_TOOL_CHOICE}" == "1" ]] && VLLM_ARGS+=("--enable-auto-tool-choice")
     [[ -n "${SERVED_MODEL_NAME}" ]] && VLLM_ARGS+=("--served-model-name" "${SERVED_MODEL_NAME}")
     VLLM_ARGS+=("--trust-remote-code")
+fi
+
+# DeepSeek-V4.1-Flash serve arguments.
+if [[ "${IS_DSV41}" == "1" ]]; then
+    VLLM_ARGS+=("--tokenizer-mode" "deepseek_v41")
+    [[ -n "${DSV41_TOOL_PARSER}" ]] && VLLM_ARGS+=("--tool-call-parser" "${DSV41_TOOL_PARSER}")
+    [[ -n "${DSV41_REASONING_PARSER}" ]] && VLLM_ARGS+=("--reasoning-parser" "${DSV41_REASONING_PARSER}")
+    [[ "${ENABLE_AUTO_TOOL_CHOICE}" == "1" ]] && VLLM_ARGS+=("--enable-auto-tool-choice")
+    [[ -n "${SERVED_MODEL_NAME}" ]] && VLLM_ARGS+=("--served-model-name" "${SERVED_MODEL_NAME}")
+    VLLM_ARGS+=("--trust-remote-code")
+
+    # THE headline flag: park Engram's sparsely-accessed tables in pinned host
+    # memory so 96 GB cards only hold the backbone.
+    VLLM_ARGS+=("--engram-config" "{\"cpu_offload\":${DSV41_ENGRAM_CPU_OFFLOAD}}")
+
+    # Sparse-MLA backend + indexer dtypes. Empty string = let vLLM auto-select
+    # (useful for discovering what it picks when flashinfer is absent).
+    if [[ -n "${DSV41_ATTENTION_CONFIG}" ]]; then
+        VLLM_ARGS+=("--attention-config" "${DSV41_ATTENTION_CONFIG}")
+    fi
+
+    # No torch.compile on this arch — decode-only graphs.
+    VLLM_ARGS+=("--compilation-config" "{\"cudagraph_mode\":\"${DSV41_CUDAGRAPH_MODE}\"}")
+
+    # Vision encoder replicated across the TP group rather than sharded; at 32
+    # layers / hidden 1024 it is small enough that data mode is the cheaper choice
+    # (same call as Kimi's MoonViT).
+    VLLM_ARGS+=("--mm-encoder-tp-mode" "data")
+
+    [[ -n "${DSV41_MAX_NUM_SEQS}" ]] && VLLM_ARGS+=("--max-num-seqs" "${DSV41_MAX_NUM_SEQS}")
+
+    if [[ "${DSV41_ENABLE_PREFIX_CACHING:-1}" == "1" ]]; then
+        VLLM_ARGS+=("--enable-prefix-caching")
+    fi
 fi
 
 # Qwen3.8 27B dense — same Qwen3.5 parser family as Ornith, different shape.

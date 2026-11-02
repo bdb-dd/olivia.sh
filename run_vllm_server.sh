@@ -596,10 +596,14 @@ fi
 # FULL_AND_PIECEWISE dies at capture. Hand the compilation config an explicit
 # FULL_DECODE_ONLY instead (see the IS_DSV41 block): decode graphs are kept, which
 # is where the throughput is, and prefill is left uncompiled. We therefore do NOT
-# set CUDAGRAPH_MODE for 4.1 — the compilation-config flag carries it.
-if [[ "${IS_DSV41}" == "1" && -z "${CUDAGRAPH_MODE}" ]]; then
-    echo "[INFO] DeepSeek-V4.1: cudagraph_mode=${DSV41_CUDAGRAPH_MODE} via --compilation-config (no torch.compile support)"
-fi
+# set CUDAGRAPH_MODE for 4.1 — the compilation-config flag carries it, and the
+# IS_DSV41 block logs the chosen mode once it has actually been resolved.
+#
+# NOTE: an informational echo used to live here and referenced
+# ${DSV41_CUDAGRAPH_MODE} — which this early in the script is still UNSET. Under
+# `set -euo pipefail` that is fatal, so every dsv41 serve died in 1 second
+# (job 2694557). `bash -n` cannot see it: the syntax is valid, the ordering is
+# not. The message now sits next to the assignment.
 
 # GLM-5.2: CUDAGraph capture hits an illegal-memory-access during capture_model
 # (the same eager-only story as Kimi — verified 2026-06-18, job 1308936 died with
@@ -991,6 +995,9 @@ if [[ "${IS_DSV41}" == "1" ]]; then
     # FULL_AND_PIECEWISE dies at capture. FULL_DECODE_ONLY is what the recipe
     # uses; it keeps decode graphs (the throughput win) without compiling prefill.
     DSV41_CUDAGRAPH_MODE="${DSV41_CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"
+    if [[ -z "${CUDAGRAPH_MODE}" ]]; then
+        echo "[INFO] DeepSeek-V4.1: cudagraph_mode=${DSV41_CUDAGRAPH_MODE} via --compilation-config (no torch.compile support)"
+    fi
 
     # Sparse-MLA backend for this arch. NOTE the FLASHINFER prefix: this is the
     # hard dependency that currently BLOCKS the preset, because our build

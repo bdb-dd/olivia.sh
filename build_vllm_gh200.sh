@@ -1168,20 +1168,43 @@ PYPATCH_LL_BF16_QUACK
 # Installing quack is not an option: quack-kernels 0.6.4 pins
 # nvidia-cutlass-dsl==4.6.2 while vLLM v0.27.1 pins 4.6.0 -- mutually
 # unsatisfiable, and bumping cutlass-dsl is what broke Ornith. Reporting the
-# capability honestly makes callers take their existing non-cutedsl fallback,
-# which is the same remedy as PYPATCH_LL_BF16_QUACK above.
-python3 - <<'PYEOF' || echo "  has_cutedsl patch skipped (anchor absent, OK on other vLLM versions)"
-import glob, sys
-hits = glob.glob('/usr/local/lib/python3.12/dist-packages/vllm/utils/import_utils.py')
+# capability honestly makes callers take their existing non-cutedsl fallback
+# (a Triton kernel in the same file), which is the same remedy as
+# PYPATCH_LL_BF16_QUACK above.
+#
+# THIS PATCH WAS A SILENT NO-OP FROM 2026-08-19 TO 2026-11-02. It targeted the
+# INSTALLED tree, /usr/local/lib/.../dist-packages/vllm/utils/import_utils.py --
+# but vLLM is not pip-installed until ~770 lines below this point, so the file
+# did not exist yet. glob returned [], the for-loop body never ran, and nothing
+# printed: an empty loop exits 0, so even the `|| echo ... skipped` could not
+# fire. Two consequences, both paid for in GPU time: the DeepSeek-V4-Flash bug
+# this was written for (job 2043640) was never actually fixed, and dsv41 died
+# the same way on job 2694691 -- with the exact traceback the comment above
+# predicts, down to the quack.compile_utils import.
+#
+# Fixed by targeting the SOURCE tree like its two neighbours do, so `pip install .`
+# carries it into the installed copy -- and by FAILING LOUDLY when the file is
+# absent instead of vanishing. Phase 4 additionally verifies the INSTALLED copy,
+# because a patch is only real once it survives the install.
+python3 - <<'PYEOF'
+import os, sys
+f = "/opt/vllm/vllm/utils/import_utils.py"
 old = '    return _has_module("cutlass")'
 new = '    return _has_module("cutlass") and _has_module("quack")'
-for p in hits:
-    s = open(p).read()
-    if new in s:
-        print('  has_cutedsl already requires quack'); break
-    if old not in s:
-        print('  has_cutedsl anchor not found (OK)'); break
-    open(p, 'w').write(s.replace(old, new, 1))
+if not os.path.exists(f):
+    sys.exit("  PYPATCH_HAS_CUTEDSL_QUACK: FATAL -- %s is absent. Without this "
+             "patch has_cutedsl() reports True on a container with cute-dsl but "
+             "no quack, and every worker dies inside the attention forward with "
+             "ModuleNotFoundError: No module named 'quack'." % f)
+s = open(f).read()
+if new in s:
+    print('  has_cutedsl already requires quack')
+elif old not in s:
+    print('  WARNING: has_cutedsl anchor not found -- upstream may have '
+          'refactored it. VERIFY has_cutedsl() by hand before serving dsv4/dsv41.')
+else:
+    open(f, 'w').write(s.replace(old, new, 1))
+    assert new in open(f).read(), "write-back verification failed"
     print('  PYPATCH_HAS_CUTEDSL_QUACK: has_cutedsl() now also requires quack')
 PYEOF
 
@@ -1984,9 +2007,12 @@ if python3 -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec
         echo "[flashinfer] ---- why it failed ----"
         tail -5 /tmp/fi_probe.txt | sed -e "s/^/[flashinfer]   /"
         echo "[flashinfer] ------------------------"
-        echo "[flashinfer] NOTE: this DISABLES the sparse-MLA backends that glm53_flash"
-        echo "[flashinfer]       and dsv41 need (FLASHINFER_MLA_SPARSE*). If the error"
-        echo "[flashinfer]       names cutlass/cute, the cutlass-dsl pin above is wrong."
+        echo "[flashinfer] NOTE: measured 2026-11-02 — this is SURVIVABLE. glm53_flash"
+        echo "[flashinfer]       served its NoPE sparse-MLA layers on FLASH_ATTN_MLA_SPARSE"
+        echo "[flashinfer]       and dsv41 uses FLASHMLA_SPARSE_DSV41; both are compiled"
+        echo "[flashinfer]       into vLLM and need no flashinfer. You lose FlashInfer"
+        echo "[flashinfer]       all-reduce and the FLASHINFER_* backend variants only."
+        echo "[flashinfer]       If the error names cutlass/cute, the cutlass-dsl pin is wrong."
         pip uninstall -y flashinfer-python flashinfer 2>/dev/null || true
     fi
     rm -f /tmp/fi_probe.txt
@@ -2055,6 +2081,21 @@ PREBUILT = bool(os.environ.get("OLIVIA_PREBUILT"))
 print("=" * 50)
 print("Final Installation Verification")
 print("=" * 50)
+
+# has_cutedsl() must agree with reality, or every dsv4/dsv41 worker dies INSIDE
+# the attention forward on `from quack.compile_utils import make_fake_tensor`.
+# Checked on the INSTALLED package because the patch is applied to the source
+# tree and only becomes real if `pip install .` carried it -- the failure mode
+# that made PYPATCH_HAS_CUTEDSL_QUACK a silent no-op for ten weeks.
+from vllm.utils.import_utils import has_cutedsl, _has_module
+_cut, _qk = _has_module("cutlass"), _has_module("quack")
+print(f"\ncute-dsl gating: cutlass={_cut} quack={_qk} has_cutedsl()={has_cutedsl()}")
+if _cut and not _qk and has_cutedsl():
+    print("  FAIL: cute-dsl present, quack absent, yet has_cutedsl() is True.")
+    print("        PYPATCH_HAS_CUTEDSL_QUACK did not survive the install.")
+    print("        dsv4/dsv41 WILL die in the attention forward. Do not deploy.")
+    sys.exit(1)
+print("  OK: cute-dsl capability is reported honestly")
 
 # Check PyTorch
 import torch

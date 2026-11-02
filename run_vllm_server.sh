@@ -1021,7 +1021,38 @@ if [[ "${IS_DSV41}" == "1" ]]; then
     # hard failure, so prefer the compiled path and keep flashinfer optional.
     # Set DSV41_ATTENTION_CONFIG="" to let vLLM auto-select, or name
     # FLASHMLA_MEGA_ATTN_DSV41 to try mega attention (same KV geometry).
-    DSV41_ATTENTION_CONFIG="${DSV41_ATTENTION_CONFIG:-{\"backend\":\"FLASHMLA_SPARSE_DSV41\",\"indexer_kv_dtype\":\"mxfp4\",\"indexer_sparse_logits\":true}}"
+    # INDEXER TUNING IS BLACKWELL-ONLY — do not set it here. Job 2694626 died
+    # 25 s in, after the Engram tables had already offloaded, on:
+    #     ValueError: indexer_kv_dtype='mxfp4' requires Blackwell datacenter
+    #     GPUs (sm_10x, e.g. B200/GB200); ... earlier architectures are not
+    #     supported.
+    # Both values had been copied from vLLM's recipe, which targets B200/GB200:
+    #   * indexer_kv_dtype=mxfp4      -> needs sm_10x. GH200 is sm_90.
+    #   * indexer_sparse_logits=true  -> needs mxfp4 AND an SM100-class GPU AND
+    #                                    DeepGEMM >= 2.8 (config/attention.py).
+    # Leaving indexer_kv_dtype unset means "auto", which per vLLM's own docstring
+    # "picks the model's default (... fp8 for the DeepSeek sparse indexer)" —
+    # i.e. exactly the Hopper-correct choice, chosen by the backend rather than
+    # guessed by us. The allowed set is auto|bf16|fp8|mxfp4|nvfp4.
+    #
+    # Worth knowing what we are giving up: indexer_sparse_logits scores only
+    # candidate blocks instead of walking the whole context, costing O(candidate
+    # blocks) per query regardless of length. It "pays off for long contexts
+    # (roughly 32K and beyond)" — precisely our 131072 window — so this is a real
+    # loss on Hopper, not a knob we would not have wanted. It is simply not
+    # available, and asking for it is fatal rather than ignored.
+    #
+    # The two knobs stay reachable for a future Blackwell box:
+    #   DSV41_INDEXER_KV_DTYPE=mxfp4 DSV41_INDEXER_SPARSE_LOGITS=true
+    DSV41_INDEXER_KV_DTYPE="${DSV41_INDEXER_KV_DTYPE:-}"
+    DSV41_INDEXER_SPARSE_LOGITS="${DSV41_INDEXER_SPARSE_LOGITS:-}"
+    if [[ -z "${DSV41_ATTENTION_CONFIG:-}" ]]; then
+        _ac="{\"backend\":\"FLASHMLA_SPARSE_DSV41\""
+        [[ -n "${DSV41_INDEXER_KV_DTYPE}" ]] && _ac="${_ac},\"indexer_kv_dtype\":\"${DSV41_INDEXER_KV_DTYPE}\""
+        [[ -n "${DSV41_INDEXER_SPARSE_LOGITS}" ]] && _ac="${_ac},\"indexer_sparse_logits\":${DSV41_INDEXER_SPARSE_LOGITS}"
+        DSV41_ATTENTION_CONFIG="${_ac}}"
+        unset _ac
+    fi
 
     DSV41_TOOL_PARSER="${DSV41_TOOL_PARSER:-deepseek_v41}"
     DSV41_REASONING_PARSER="${DSV41_REASONING_PARSER:-deepseek_v41}"

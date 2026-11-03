@@ -32,6 +32,35 @@ MAXTOK=${MAXTOK:-200}
 cleanup() { rc=$?; echo "[matrix] exiting (rc=$rc) — cancelling job $JOB"; scancel "$JOB" 2>/dev/null; }
 trap cleanup EXIT
 
+# PRE-FLIGHT: resolve bench_sweep.py BEFORE waiting on the server.
+#
+# This cost 0.52 GPU-h to learn (2026-11-03, job 2706883). The server came up
+# fine, the matrix ran, and every single cell failed with
+#     python3: can't open file 'bench_sweep.py': No such file or directory
+# because this script copied sweep_when_ready.sh's `cd $D; python3
+# bench_sweep.py` without checking that the file is there. It is NOT: it lives
+# in /cluster/home (persistent), while $D is on /cluster/work, which NRIS
+# auto-purges -- the purge had already eaten both bench_sweep.py and
+# sweep_when_ready.sh from $D.
+#
+# Checking here, before the health wait, makes the EXIT trap a FEATURE: a
+# missing dependency cancels a still-PENDING job and costs zero GPU-h, instead
+# of being discovered after the allocation is spent. Validate every dependency
+# before consuming an allocation, not after.
+BENCH="${BENCH_PY:-}"
+if [ -z "$BENCH" ]; then
+  for cand in "$D/bench_sweep.py" "$HOME/bench_sweep.py" "$D/deploys/$(basename "${DEPLOY_BRANCH:-}")/bench_sweep.py"; do
+    [ -f "$cand" ] && { BENCH="$cand"; break; }
+  done
+fi
+if [ -z "$BENCH" ] || [ ! -f "$BENCH" ]; then
+  echo "[matrix] FATAL: bench_sweep.py not found (looked in \$BENCH_PY, $D, \$HOME)."
+  echo "[matrix]        Nothing measurable — cancelling job $JOB before it costs anything."
+  exit 1
+fi
+echo "[matrix] using bench driver: $BENCH"
+python3 -c "import json,urllib.request" 2>/dev/null || { echo "[matrix] FATAL: python3 stdlib unusable"; exit 1; }
+
 job_alive() { squeue -j "$JOB" -h -o "%T" 2>/dev/null | grep -qE "RUNNING|PENDING|COMPLETING"; }
 
 # READY_WAIT is generous ON PURPOSE. The first version hardcoded 3600s, which
@@ -62,14 +91,14 @@ curl -sf --max-time 5 "http://${NODE}:8000/health" >/dev/null 2>&1 \
 
 URL="http://${NODE}:8000"
 echo "[matrix] warmup (DISCARDED)"
-python3 bench_sweep.py --url "$URL" --model "$MODEL" --levels 1 --max-tokens 32 >/dev/null 2>&1 || true
+python3 "$BENCH" --url "$URL" --model "$MODEL" --levels 1 --max-tokens 32 >/dev/null 2>&1 || true
 
 for cell in $MATRIX; do
   ptok=${cell%%:*}; levels=${cell##*:}
   echo ""
   echo "[matrix] ===== prompt_tokens=${ptok}  levels=${levels} ====="
   job_alive || { echo "[matrix] job died mid-matrix at ptok=${ptok}"; exit 1; }
-  python3 bench_sweep.py --url "$URL" --model "$MODEL" \
+  python3 "$BENCH" --url "$URL" --model "$MODEL" \
       --levels "$levels" --max-tokens "$MAXTOK" \
       --prompt-tokens "$ptok" --chars-per-token 4.0 \
       2>&1 | tee -a "${OUT}_ptok${ptok}.txt"

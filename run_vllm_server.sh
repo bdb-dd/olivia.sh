@@ -1046,10 +1046,43 @@ if [[ "${IS_DSV41}" == "1" ]]; then
     #   DSV41_INDEXER_KV_DTYPE=mxfp4 DSV41_INDEXER_SPARSE_LOGITS=true
     DSV41_INDEXER_KV_DTYPE="${DSV41_INDEXER_KV_DTYPE:-}"
     DSV41_INDEXER_SPARSE_LOGITS="${DSV41_INDEXER_SPARSE_LOGITS:-}"
+
+    # SPARSE-MLA PREFILL WORKSPACE — the cheapest KV-pool lever on this shape.
+    #
+    # FlashMLA-sparse reserves a prefill workspace of
+    #     factor * max_model_len * 576 * 2 bytes
+    # (flashmla_sparse.py get_prefill_workspace_size), and vLLM defaults `factor`
+    # to 5 when max_model_len <= 256K. At our 131072 that is **720 MiB** —
+    # against a MEASURED KV pool of 1.08 GiB (1106 MiB) on job 2697324. The
+    # prefill workspace is **65% the size of our entire KV cache.**
+    #
+    # Upstream expects this to be irrelevant; the source comment reads "This fits
+    # nicely below the typical MoE workspace size of >2GB so this is 'free'".
+    # That holds on a big-HBM box. On a weight-dominated single-node fit, where
+    # 748B of params leave ~1 GiB for cache, it is the opposite of free. An
+    # upstream default tuned for a different memory regime.
+    #
+    # vLLM documents it as a pool lever: "Lower values return memory to the KV
+    # cache at long max_model_len; the minimum of 2 leaves room for a full-length
+    # request's context-parallel shard." Projected from the measured pool:
+    #     factor 5 -> 720 MiB workspace, 229,815 tok, 1.75x conc @131K  (default)
+    #     factor 3 -> 432 MiB,           ~289,663 tok, 2.21x
+    #     factor 2 -> 288 MiB,           ~319,586 tok, 2.44x            (+39% pool)
+    # Cost is NOT bandwidth — unlike CPU_OFFLOAD_GB there is no host traffic. It
+    # makes a prefill step attend in more chunks when it holds more context, so
+    # the price is prefill latency on long prompts, not decode throughput.
+    #
+    # Left UNSET (= vLLM's 5) so this does not change behaviour untested; `2` is
+    # the first thing to try when more concurrency is wanted, ahead of
+    # CPU_OFFLOAD_GB. Note it scales with max_model_len too, so lowering
+    # MAX_MODEL_LEN shrinks the workspace proportionally — the two compound.
+    DSV41_SPARSE_MLA_WORKSPACE_FACTOR="${DSV41_SPARSE_MLA_WORKSPACE_FACTOR:-}"
+
     if [[ -z "${DSV41_ATTENTION_CONFIG:-}" ]]; then
         _ac="{\"backend\":\"FLASHMLA_SPARSE_DSV41\""
         [[ -n "${DSV41_INDEXER_KV_DTYPE}" ]] && _ac="${_ac},\"indexer_kv_dtype\":\"${DSV41_INDEXER_KV_DTYPE}\""
         [[ -n "${DSV41_INDEXER_SPARSE_LOGITS}" ]] && _ac="${_ac},\"indexer_sparse_logits\":${DSV41_INDEXER_SPARSE_LOGITS}"
+        [[ -n "${DSV41_SPARSE_MLA_WORKSPACE_FACTOR}" ]] && _ac="${_ac},\"sparse_mla_prefill_workspace_factor\":${DSV41_SPARSE_MLA_WORKSPACE_FACTOR}"
         DSV41_ATTENTION_CONFIG="${_ac}}"
         unset _ac
     fi
@@ -1579,6 +1612,13 @@ VLLM_ARGS=(
 # forward. This is the lever that lets a model whose per-GPU shard exceeds the
 # 96 GB HBM (e.g. single-node GLM-5.2-AWQ, ~104 GB/GPU) fit — trading some decode
 # latency for HBM freed up for KV. Only emitted when set > 0.
+# Chunked-prefill activation buffers scale with the chunk size, so a smaller
+# chunk lowers the transient peak and leaves more steady-state room for KV.
+# Generic rather than per-model: every preset here runs --enable-chunked-prefill.
+if [[ -n "${MAX_NUM_BATCHED_TOKENS:-}" ]]; then
+    VLLM_ARGS+=("--max-num-batched-tokens" "${MAX_NUM_BATCHED_TOKENS}")
+fi
+
 if [[ -n "${CPU_OFFLOAD_GB:-}" && "${CPU_OFFLOAD_GB}" != "0" ]]; then
     VLLM_ARGS+=("--cpu-offload-gb" "${CPU_OFFLOAD_GB}")
 fi

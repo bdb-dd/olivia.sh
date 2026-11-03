@@ -34,12 +34,25 @@ trap cleanup EXIT
 
 job_alive() { squeue -j "$JOB" -h -o "%T" 2>/dev/null | grep -qE "RUNNING|PENDING|COMPLETING"; }
 
+# READY_WAIT is generous ON PURPOSE. The first version hardcoded 3600s, which
+# means the driver CANCELS OUR OWN JOB (via the EXIT trap) when the cluster is
+# merely busy rather than broken. Observed 2026-11-03: four nodes had >=4 free
+# GPUs and none was usable -- two RESERVED for other accounts, two IDLE+PLANNED
+# and held for higher-priority jobs -- so a devel job at priority 20019 simply
+# waited. Walltime counts from job START, so waiting longer costs nothing;
+# cancelling costs a resubmit and another queue round.
+READY_WAIT=${READY_WAIT:-7200}
 NODE=""
-for i in $(seq 1 360); do
+_iters=$((READY_WAIT / 10))
+for i in $(seq 1 "$_iters"); do
   job_alive || { echo "[matrix] job $JOB gone before it was ready"; exit 1; }
   NODE=$(squeue -j "$JOB" -h -o "%N" 2>/dev/null | tr -d ' ')
   if [ -n "$NODE" ] && curl -sf --max-time 5 "http://${NODE}:8000/health" >/dev/null 2>&1; then
     echo "[matrix] server healthy on $NODE after ~$((i*10))s"; break
+  fi
+  # Heartbeat every 5 min so a long wait is visibly a WAIT, not a hang.
+  if [ $((i % 30)) -eq 0 ]; then
+    echo "[matrix] still waiting (~$((i*10))s/${READY_WAIT}s) state=$(squeue -j "$JOB" -h -o '%T' 2>/dev/null) node=${NODE:-none}"
   fi
   sleep 10
 done

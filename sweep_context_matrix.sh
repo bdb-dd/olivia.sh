@@ -28,6 +28,13 @@ cd "$D" || exit 1
 # context:levels -- see the pairing rationale above
 MATRIX=${MATRIX:-"1024:1,4,16,64 8192:1,4,16 32768:1,2,4 131072:1"}
 MAXTOK=${MAXTOK:-200}
+# MEASURED, not assumed. With the default 4.0 the requested context came out ~27%
+# short on every cell of the 2026-11-03 baseline: 1024->790, 8192->5896,
+# 32768->23397, 131072->93402 (ratio 0.713-0.771, mean 0.729). So this
+# tokenizer averages ~5.48 chars/token on English prose, and a "131072" cell was
+# really ~93K. Labelling a context budget you did not actually test is worse than
+# testing the wrong one.
+CPT=${CPT:-5.48}
 
 cleanup() { rc=$?; echo "[matrix] exiting (rc=$rc) — cancelling job $JOB"; scancel "$JOB" 2>/dev/null; }
 trap cleanup EXIT
@@ -90,18 +97,32 @@ curl -sf --max-time 5 "http://${NODE}:8000/health" >/dev/null 2>&1 \
   || { echo "[matrix] SERVER NEVER BECAME HEALTHY (job still alive: $(job_alive && echo yes || echo no))"; exit 1; }
 
 URL="http://${NODE}:8000"
-echo "[matrix] warmup (DISCARDED)"
-python3 "$BENCH" --url "$URL" --model "$MODEL" --levels 1 --max-tokens 32 >/dev/null 2>&1 || true
-
+# PER-CELL WARMUP, because a single global warmup is not enough.
+#
+# On the 2026-11-03 baseline the FIRST cell was badly contaminated: at
+# concurrency 1 with a 790-token prompt it managed 30.8 tok/s at TTFT 4.79s,
+# while the NEXT cell -- a longer 5896-token prompt -- did 102.7 tok/s at TTFT
+# 0.23s. A short prompt cannot be 3x slower than a long one; the first cell was
+# paying for JIT, kernel autotuning and DeepGEMM warmup. The old single
+# `--levels 1 --max-tokens 32` pass was far too light to cover every shape.
+#
+# This matters more than tidiness: in a two-point A/B (THP off vs on) a
+# cold-start artefact in the first cell is indistinguishable from a real effect.
 for cell in $MATRIX; do
   ptok=${cell%%:*}; levels=${cell##*:}
   echo ""
-  echo "[matrix] ===== prompt_tokens=${ptok}  levels=${levels} ====="
+  echo "[matrix] ===== prompt_tokens=${ptok} (cpt ${CPT})  levels=${levels} ====="
   job_alive || { echo "[matrix] job died mid-matrix at ptok=${ptok}"; exit 1; }
+  echo "[matrix] warming this cell (DISCARDED)"
+  python3 "$BENCH" --url "$URL" --model "$MODEL" \
+      --levels "$levels" --max-tokens 32 \
+      --prompt-tokens "$ptok" --chars-per-token "$CPT" >/dev/null 2>&1 || true
+  # `tee` without -a: appending left the previous run's failure text at the top
+  # of every result file, so a stale error read as part of a good run.
   python3 "$BENCH" --url "$URL" --model "$MODEL" \
       --levels "$levels" --max-tokens "$MAXTOK" \
-      --prompt-tokens "$ptok" --chars-per-token 4.0 \
-      2>&1 | tee -a "${OUT}_ptok${ptok}.txt"
+      --prompt-tokens "$ptok" --chars-per-token "$CPT" \
+      2>&1 | tee "${OUT}_ptok${ptok}.txt"
 done
 echo ""
 echo "[matrix] complete — results at ${OUT}_ptok*.txt"

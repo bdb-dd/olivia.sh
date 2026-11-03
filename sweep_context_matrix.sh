@@ -28,6 +28,34 @@ cd "$D" || exit 1
 # context:levels -- see the pairing rationale above
 MATRIX=${MATRIX:-"1024:1,4,16,64 8192:1,4,16 32768:1,2,4 131072:1"}
 MAXTOK=${MAXTOK:-200}
+# ---------------------------------------------------------------------------
+# HOW TO READ THE OUTPUT -- two columns mean different things, and one of them
+# is untrustworthy at long context.
+#
+#  * median_per_stream_tok_s is the DEFENSIBLE server-side number. It is
+#    tokens / r["total"], timed from inside one_request AFTER the prompt is
+#    built and JSON-encoded.
+#  * agg_tok_s is total_tokens / wall, where wall brackets thread start/join --
+#    so it INCLUDES per-request prompt construction and json.dumps. A 128K-token
+#    prompt is ~700 KB of text, and that client-side work measured ~2.5 s/request
+#    on 2026-11-03: agg read 44.5 tok/s where per-stream read 103.7. At long
+#    context agg measures OUR PYTHON, not the server. Use it only for short
+#    prompts or high concurrency, where the cost overlaps.
+#
+#  * TTFT here is CACHE-WARM. The per-cell warmup above replays the same prompts
+#    (build_prompt is seeded by request index), and the server runs with
+#    --enable-prefix-caching, so the measured pass gets cached prefill: TTFT at
+#    ~128K fell 3.00 s -> 0.21 s between the un-warmed and warmed harnesses.
+#    That is the realistic MULTI-TURN case (history already cached) and it
+#    cleanly isolates decode -- but it is NOT cold prefill. For cold TTFT, warm
+#    with different prompts than you measure.
+#
+# A caution that cost a wrong conclusion: on the un-warmed harness agg showed a
+# 2.43x "decay" from 5.9K to 93K context, which was read as confirming a missing
+# Blackwell optimisation. It was cold start plus client overhead. On the fixed
+# harness decode is FLAT -- 109.4 at 1K vs 103.7 at 128K, -5% over 120x context,
+# which is what CSA2 attending to top-k blocks should look like.
+# ---------------------------------------------------------------------------
 # MEASURED, not assumed. With the default 4.0 the requested context came out ~27%
 # short on every cell of the 2026-11-03 baseline: 1024->790, 8192->5896,
 # 32768->23397, 131072->93402 (ratio 0.713-0.771, mean 0.729). So this

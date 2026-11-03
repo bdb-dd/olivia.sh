@@ -1291,6 +1291,42 @@ start_server_job() {
         fi
     fi
 
+    # FORWARD THE TUNING KNOBS. Without this, every override documented in
+    # run_vllm_server.sh is INERT through `olivia.sh server start`.
+    #
+    # Discovered 2026-11-03: only CONTAINER_DIR/CONTAINER/MODEL/NUM_NODES/
+    # TP_SIZE/PP_SIZE/HF_HOME/CHAT_TEMPLATE_FILE reached the job. `sbatch`'s
+    # --export=ALL exports the REMOTE shell's environment, and ssh does not
+    # carry arbitrary local variables, so anything not in this prefix was simply
+    # dropped. `DSV41_ENGRAM_USE_THP=true ./olivia.sh server start dsv41`
+    # silently served with use_thp=false and produced a duplicate baseline.
+    # QOS and TIME_LIMIT appeared to work only because olivia.sh consumes them
+    # itself for sbatch options rather than forwarding them.
+    #
+    # That made CPU_OFFLOAD_GB, MAX_MODEL_LEN, GPU_MEM_UTIL, CUDAGRAPH_MODE,
+    # KV_CACHE_DTYPE and every per-model knob unreachable -- including the
+    # fallback ladders in README/CLAUDE.md that recommend them.
+    #
+    # A whitelist rather than blanket forwarding: env_vars is echoed below and
+    # lands on a shared login node's process list, so secrets must never ride
+    # here (HF_TOKEN deliberately goes over stdin instead). The guard below
+    # refuses anything that looks like a credential even if it matches a prefix.
+    local _k _v _fwd=""
+    for _k in $(compgen -v | grep -E '^(DSV4|DSV41|GLM5|GLM52|GLM53|GLM53_FLASH|GLM47|KIMI|ORNITH|QWEN38|BOREALIS|LAGUNA|INKLING|MINIMAX)_[A-Z0-9_]+$|^(MAX_MODEL_LEN|MAX_NUM_SEQS|MAX_NUM_BATCHED_TOKENS|GPU_MEM_UTIL|CUDAGRAPH_MODE|KV_CACHE_DTYPE|FORCE_KV_CACHE_DTYPE|CPU_OFFLOAD_GB|KV_OFFLOAD_GB|ENABLE_SPECULATIVE|IDLE_TIMEOUT|SERVED_MODEL_NAME|ATTENTION_BACKEND|ENFORCE_EAGER)$|^VLLM_[A-Z0-9_]+$' 2>/dev/null | sort -u); do
+        case "$_k" in
+            *TOKEN*|*SECRET*|*PASSWORD*|*PASSWD*|*APIKEY*|*API_KEY*|*_KEY)
+                warn "refusing to forward ${_k} (looks like a credential; env vars are echoed and visible in \`ps\`)"
+                continue ;;
+        esac
+        _v="${!_k}"
+        [[ -z "$_v" ]] && continue
+        _fwd+=" ${_k}=$(printf '%q' "$_v")"
+    done
+    if [[ -n "$_fwd" ]]; then
+        env_vars+="$_fwd"
+        info "forwarding tuning knobs:${_fwd}"
+    fi
+
     # Debug: echo the exact command being submitted so regressions like
     # "didn't request 2 nodes" are visible at submission time.
     echo "    sbatch opts: ${sbatch_opts}" >&2

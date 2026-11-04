@@ -1062,20 +1062,32 @@ if [[ "${IS_DSV41}" == "1" ]]; then
     # 748B of params leave ~1 GiB for cache, it is the opposite of free. An
     # upstream default tuned for a different memory regime.
     #
-    # vLLM documents it as a pool lever: "Lower values return memory to the KV
-    # cache at long max_model_len; the minimum of 2 leaves room for a full-length
-    # request's context-parallel shard." Projected from the measured pool:
-    #     factor 5 -> 720 MiB workspace, 229,815 tok, 1.75x conc @131K  (default)
-    #     factor 3 -> 432 MiB,           ~289,663 tok, 2.21x
-    #     factor 2 -> 288 MiB,           ~319,586 tok, 2.44x            (+39% pool)
-    # Cost is NOT bandwidth — unlike CPU_OFFLOAD_GB there is no host traffic. It
-    # makes a prefill step attend in more chunks when it holds more context, so
-    # the price is prefill latency on long prompts, not decode throughput.
+    # ❌ MEASURED 2026-11-04 (job 2710025): THIS DOES NOT ENLARGE THE KV POOL.
     #
-    # Left UNSET (= vLLM's 5) so this does not change behaviour untested; `2` is
-    # the first thing to try when more concurrency is wanted, ahead of
-    # CPU_OFFLOAD_GB. Note it scales with max_model_len too, so lowering
-    # MAX_MODEL_LEN shrinks the workspace proportionally — the two compound.
+    # vLLM's field docs say "Lower values return memory to the KV cache at long
+    # max_model_len", and from the 720 MiB figure above I projected factor 2
+    # would give +39% pool (~319,586 tokens, 2.44x concurrency at 131K).
+    #
+    # It gave nothing. With factor 2 confirmed applied in both the serve args and
+    # the resolved config:
+    #     Available KV cache memory: 1.08 GiB   (baseline: 1.08 GiB)
+    #     GPU KV cache size:  229,861 tokens    (baseline: 229,815 — +0.02%)
+    #     Max concurrency @131072: 1.75x        (baseline: 1.75x)
+    # Throughput moved +1.0..+1.7% per stream and +3% peak aggregate, which is
+    # run-to-run noise.
+    #
+    # WHY I WAS WRONG, because the mistake is more useful than the knob: I
+    # assumed the prefill workspace competes with the KV pool. Upstream's comment
+    # -- "This fits nicely below the typical MoE workspace size of >2GB so this
+    # is 'free'" -- actually means the workspace is carved out of an ALREADY
+    # RESERVED allocation, so changing the factor neither costs nor saves KV. I
+    # read "free" as "negligible on a big box, significant on ours" and built
+    # arithmetic on a relationship I never verified. The formula was right; the
+    # assumption that the two quantities compete was not.
+    #
+    # Keep the knob exposed (it is harmless and the docs may become true on
+    # another shape), but it is NOT a pool lever here. The real ladder is now
+    # CPU_OFFLOAD_GB first, then MAX_MODEL_LEN, then HiSparse.
     DSV41_SPARSE_MLA_WORKSPACE_FACTOR="${DSV41_SPARSE_MLA_WORKSPACE_FACTOR:-}"
 
     if [[ -z "${DSV41_ATTENTION_CONFIG:-}" ]]; then

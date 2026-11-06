@@ -1101,14 +1101,23 @@ if [[ "${IS_DSV41}" == "1" ]]; then
     # target checkpoint" (speculative.py): vLLM points the draft config at the
     # target and rewrites `architectures` itself.
     #
-    # num_speculative_tokens is DERIVED, not chosen: speculative.py does
-    # `self.num_speculative_tokens = block_size` from the checkpoint's
-    # `dspark_block_size`, which this model sets to **5**, and the validator
-    # rejects a value disagreeing with the trained block size. So leaving this
-    # EMPTY (vLLM derives 5) is correct, and anything but 5 is an error.
+    # num_speculative_tokens MUST BE PASSED. I first read speculative.py's
+    # `self.num_speculative_tokens = block_size` (from the checkpoint's
+    # `dspark_block_size`) and concluded it was derived, so left this empty.
+    # Job 2730546 rejected that at 1m25s:
+    #     num_speculative_tokens must be provided with speculative model unless
+    #     the draft model config contains an n_predict parameter
+    # The pydantic validator runs BEFORE that assignment, so the derivation never
+    # gets a chance. Reading one code path is not the same as reading the order
+    # they execute in.
+    #
+    # 5 because that is the checkpoint's trained `dspark_block_size`, and the
+    # DSpark validator rejects a count that disagrees with the trained block size
+    # — so this is a required constant, not a tuning knob. Raise it only if a
+    # future checkpoint trains a larger block.
     # The checkpoint also carries dspark_target_layer_ids [37,38,39],
     # markov_rank 256, 128 routed / 3 activated draft experts — all read from it.
-    DSV41_SPECULATIVE_TOKENS="${DSV41_SPECULATIVE_TOKENS:-}"
+    DSV41_SPECULATIVE_TOKENS="${DSV41_SPECULATIVE_TOKENS:-5}"
 
     if [[ -z "${DSV41_ATTENTION_CONFIG:-}" ]]; then
         _ac="{\"backend\":\"FLASHMLA_SPARSE_DSV41\""
@@ -1720,13 +1729,9 @@ if [[ "${USE_SPECULATIVE}" == "1" ]]; then
     # ENABLE_SPECULATIVE=1 on dsv41 fell through to the generic `else` and
     # silently enabled NGRAM speculation instead of the model's own DSpark.
     if [[ "${IS_DSV41}" == "1" ]]; then
-        if [[ -n "${DSV41_SPECULATIVE_TOKENS}" ]]; then
-            SPEC_CONFIG='{"method": "dspark", "num_speculative_tokens": '${DSV41_SPECULATIVE_TOKENS}'}'
-        else
-            # Omit the count so vLLM derives it from dspark_block_size (5) —
-            # safer than naming a number the validator may reject.
-            SPEC_CONFIG='{"method": "dspark"}'
-        fi
+        # The count is required (see the knob above) — an empty value would be
+        # rejected at config validation, so fall back to the trained 5.
+        SPEC_CONFIG='{"method": "dspark", "num_speculative_tokens": '${DSV41_SPECULATIVE_TOKENS:-5}'}'
     elif [[ "${IS_GLM_MOE}" == "1" ]]; then
         # GLM-4.7/GLM-5.1 use MTP (Multi-Token Prediction) speculative decoding
         SPEC_CONFIG='{"method": "mtp", "num_speculative_tokens": '${MTP_SPECULATIVE_TOKENS}'}'

@@ -414,6 +414,45 @@ More KV tokens out of **less than half** the memory — about 2.6x the tokens pe
 
 **Still on the table:** `DSV41_ENGRAM_USE_THP=true` (confirmed legal at DP=1 — the single most promising next knob, since ~259 GiB of table behind 4 KiB pages is ~68M PTEs under random hash lookup); a real `bench_sweep.py` run including long context; and DSpark speculative decode.
 
+#### Tuning results — what each lever actually costs (2026-11-06)
+
+All at TP=4 on one node. `median_per_stream_tok_s` is the defensible number; see the
+sweep driver's header for why `agg_tok_s` is unusable at long context.
+
+| config | KV pool | 1 stream | agg @64 | note |
+|---|---|---|---|---|
+| baseline (131072) | 1.08 GiB / 229,815 tok | **109.4** | **2454** | 1.75x concurrency at full window |
+| `MAX_MODEL_LEN=262144` | 0.59 GiB | — | — | ❌ **refused** — pool *shrank*; see below |
+| 262144 + `WORKSPACE_FACTOR=2` | 0.85 GiB / 264,522 tok | 109.3 | 2465 | ✅ **256K serves**; 255,817-tok request at **95.4** |
+| `CPU_OFFLOAD_GB=10` | **11.64 GiB** | 64.0 | 831 | capacity ×10.8, throughput −66% |
+
+**Raising `MAX_MODEL_LEN` alone fails, and the reason is the prefill workspace.**
+FlashMLA-sparse reserves `factor × max_model_len × 1152` bytes, default factor 5. Doubling
+the window doubled the workspace (0.70 → 1.41 GiB) and the pool *fell* 1.08 → 0.59 GiB, so
+vLLM refused: *"0.84 GiB KV cache is needed … available 0.59 GiB"*. It does **not** auto-fit
+downward. Factor 2 returns enough to make 262144 fit.
+
+> ⚠️ **The workspace factor is regime-dependent, and I got this wrong once.** Measured at
+> `max_model_len=131072` it has **zero** effect, and on that basis it was recorded as "not a
+> lever". It is decisive at 262144. vLLM's docstring — "lower values return memory to the KV
+> cache **at long max_model_len**" — meant that literally. Testing one operating point and
+> generalising was the error.
+
+**`CPU_OFFLOAD_GB` converts weights→KV at ~1:1 but spends throughput at ~1:3.** 10 GB
+offloaded returned 10.56 GiB of pool (~106%), enough for ~19 concurrent streams at 128K or
+1M context — while costing 41% of single-stream and 66% of aggregate throughput. The cause
+is documented behaviour: `--cpu-offload-gb` evicts **by layer order, blind to access
+frequency**, so it moves hot layers and pays NVLink-C2C traffic every token. Contrast the
+Engram offload, which is surgical and free. **Use the minimum offload that reaches the
+target** — 10 GB was ~10× more than needed for most goals.
+
+**128 concurrent streams work** (first tested here): 1089.6 tok/s aggregate, 0 failures.
+
+**Conversion rates do not generalise between mechanisms.** Workspace factor → pool ran ~31%;
+weight offload → pool ran ~106%. And tokens-per-GiB is not constant across windows: 212,792
+at `max_model_len` 131072 vs 311,202 at 262144. **Linear extrapolation across regimes is
+invalid here** — measure each operating point.
+
 #### How it got here — three runs, three one-line faults, all ours
 **Allocation spent: ~3.9 GPU-h for the whole campaign** (measured: `cost` reported `Used 9.10` GPU-h for the 2026.2 period afterwards, up from 4.95 before the first dsv41 serve). Breakdown worth keeping, because most of it was not the work:
 

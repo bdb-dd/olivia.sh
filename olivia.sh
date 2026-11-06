@@ -1311,8 +1311,14 @@ start_server_job() {
     # lands on a shared login node's process list, so secrets must never ride
     # here (HF_TOKEN deliberately goes over stdin instead). The guard below
     # refuses anything that looks like a credential even if it matches a prefix.
+    # TRITON_CACHE_DIR / DG_JIT_CACHE_DIR / TORCHINDUCTOR_CACHE_DIR are in the
+    # list for CONCURRENT JOBS. They default to a SHARED $PWD/cache/* on the
+    # cluster, which is fine for one server at a time but means two jobs with
+    # different configs JIT different artifacts into the same directories. Being
+    # able to point each job at its own cache root keeps a weird failure in one
+    # from being attributed to the other.
     local _k _v _fwd=""
-    for _k in $(compgen -v | grep -E '^(DSV4|DSV41|GLM5|GLM52|GLM53|GLM53_FLASH|GLM47|KIMI|ORNITH|QWEN38|BOREALIS|LAGUNA|INKLING|MINIMAX)_[A-Z0-9_]+$|^(MAX_MODEL_LEN|MAX_NUM_SEQS|MAX_NUM_BATCHED_TOKENS|GPU_MEM_UTIL|CUDAGRAPH_MODE|KV_CACHE_DTYPE|FORCE_KV_CACHE_DTYPE|CPU_OFFLOAD_GB|KV_OFFLOAD_GB|ENABLE_SPECULATIVE|IDLE_TIMEOUT|SERVED_MODEL_NAME|ATTENTION_BACKEND|ENFORCE_EAGER)$|^VLLM_[A-Z0-9_]+$' 2>/dev/null | sort -u); do
+    for _k in $(compgen -v | grep -E '^(DSV4|DSV41|GLM5|GLM52|GLM53|GLM53_FLASH|GLM47|KIMI|ORNITH|QWEN38|BOREALIS|LAGUNA|INKLING|MINIMAX)_[A-Z0-9_]+$|^(MAX_MODEL_LEN|MAX_NUM_SEQS|MAX_NUM_BATCHED_TOKENS|GPU_MEM_UTIL|CUDAGRAPH_MODE|KV_CACHE_DTYPE|FORCE_KV_CACHE_DTYPE|CPU_OFFLOAD_GB|KV_OFFLOAD_GB|ENABLE_SPECULATIVE|IDLE_TIMEOUT|SERVED_MODEL_NAME|ATTENTION_BACKEND|ENFORCE_EAGER|TRITON_CACHE_DIR|DG_JIT_CACHE_DIR|TORCHINDUCTOR_CACHE_DIR)$|^VLLM_[A-Z0-9_]+$' 2>/dev/null | sort -u); do
         case "$_k" in
             *TOKEN*|*SECRET*|*PASSWORD*|*PASSWD*|*APIKEY*|*API_KEY*|*_KEY)
                 warn "refusing to forward ${_k} (looks like a credential; env vars are echoed and visible in \`ps\`)"

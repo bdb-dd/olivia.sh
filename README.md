@@ -512,7 +512,38 @@ That is **per table**, across two Engram layers (1 and 14) → **~47.2 GiB per r
 
 Why it is worth the allocation once unblocked: **748B parameters on a single node.** vLLM sizes V4.1-Flash at ~614 GB VRAM (a GB200 tray, or an 8-GPU H200 node); our node has 384 GB. The gap closes because 196.6B of those parameters are Engram n-gram tables, held by only two layers and read sparsely by token lookup — `--engram-config {"cpu_offload":true}` parks them in pinned Grace memory over NVLink-C2C (~900 GB/s, ~800 GB available) and the cards hold only the backbone. KV is 890 B/token, so a 1M-token prompt costs under 1 GB of global KV. If it serves, it is the largest model we have run on four GPUs, and the first where cold-parameter offload is what makes it possible at all.
 
-### GLM-5.3-Flash (`glm53_flash`) — BUILT; loads, captures, one config line from serving · updated 2026-11-02
+### GLM-5.3-Flash (`glm53_flash`) — ✅ **SERVES** · validated 2026-11-06 (job 2732602)
+
+The `GLM53_FLASH_MAX_NUM_SEQS=128` cap holds, on the fifth serve attempt. Engine up,
+`Application startup complete`, 0 failures across the matrix.
+
+| streams | aggregate | per stream | p95 TTFT |
+|---|---|---|---|
+| 1 | 95.2 | 95.3 | 0.19s |
+| 4 | 302.8 | 75.8 | 0.32s |
+| 16 | **694.8** | 43.6 | 0.54s |
+| 64 | 464.1 ⚠️ | 8.4 | **23.90s** ⚠️ |
+
+Decode is flat across context like dsv41 — 95.3 / 94.4 / 93.5 / **90.3** tok/s per stream at
+1K / 8K / 32K / 131K.
+
+**⚠️ Run this preset at ≤16 concurrent.** Aggregate *falls* from 16 → 64 streams and p95 TTFT
+blows out ~44× (0.54s → 23.90s). It degrades rather than saturates past ~16.
+
+**The cap also grew the pool, which was not the goal.** KDA state blocks are reserved *per
+sequence*, so requesting 128 slots instead of vLLM's default 1024 freed the difference:
+**208,476 → 367,414 KV tokens (+76%)** and concurrency at 131072 **1.59× → 2.80×**. The default
+was costing capacity as well as crashing the engine.
+
+Backend is **`FLASH_ATTN_MLA_SPARSE`**, unchanged by the in-place `has_cutedsl` container patch
+— a side effect that was flagged as a risk and is now ruled out.
+
+> 📊 **Compared with `dsv41` on the same node shape, this preset loses on both axes:**
+> glm53_flash (320B / 18B active) 95.3 single-stream, peak ~695 @16; dsv41 (748B) 109.4
+> single-stream, peak **2454 @64**. dsv41 is the better engine here despite 2.3× the
+> parameters — so prefer it unless you specifically need Flash's multimodality or MIT licence.
+
+### How it got here — five attempts · updated 2026-11-02
 
 **Allocation spent so far: ~5 GPU-h of 6000** (measured: `cost` reported `Used 4.95` GPU-h for the whole 2026.2 period on 2026-11-02, superseding the ~3 GPU-h estimate previously recorded here). Weights prefetched and verified; container built and verified; **three serve attempts**. The third got all the way through weight load **and full CUDA-graph capture** before dying on a vLLM *default* — so the model, the arch support and our container are all proven; what remained was one missing argument. No throughput numbers yet.
 

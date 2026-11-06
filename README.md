@@ -425,6 +425,29 @@ sweep driver's header for why `agg_tok_s` is unusable at long context.
 | `MAX_MODEL_LEN=262144` | 0.59 GiB | — | — | ❌ **refused** — pool *shrank*; see below |
 | 262144 + `WORKSPACE_FACTOR=2` | 0.85 GiB / 264,522 tok | 109.3 | 2465 | ✅ **256K serves**; 255,817-tok request at **95.4** |
 | `CPU_OFFLOAD_GB=10` | **11.64 GiB** | 64.0 | 831 | capacity ×10.8, throughput −66% |
+| **1M**: `1048576` + factor 2 + offload 5 | 3.07 GiB / **1,479,244 tok** | 76.2 | — | ✅ **full native window**; 1,023,096-tok request at **49.7**; 11.3× at 128K |
+| **DSpark** + offload 4 | — | **120.2** | 574 @16 | ✅ **132.0 at 131K** — best single-stream; aggregate @16 −47% |
+
+### Three operating points, because the axes are genuinely opposed
+
+No single config maximises both aggregate and single-stream throughput. Pick by workload:
+
+| want | config | gets | costs |
+|---|---|---|---|
+| **batch throughput** | baseline (no offload, no DSpark) | **2454 tok/s @64**, 128 streams OK | 131K context, 1.75× at full window |
+| **long context / concurrency** | `MAX_MODEL_LEN=1048576` `DSV41_SPARSE_MLA_WORKSPACE_FACTOR=2` `CPU_OFFLOAD_GB=5` | **1M window**, 1.41× at 1M, **11.3× at 128K** | −30% throughput |
+| **low latency** | `ENABLE_SPECULATIVE=1` `CPU_OFFLOAD_GB=4` | **132.0 tok/s single-stream** at 131K | aggregate @16 −47% |
+
+**DSpark pays for its own offload.** Acceptance length **2.27 → 3.00** of 5 proposed. Against
+the *no-offload* baseline it is +27% at 131K and +10% at 1K, despite the 4 GB offload it needs
+to fit its draft stages (layers 37–39, each a 128-expert MoE) — those alone would cost ~25%.
+But it is a latency setting, not a default: at 16 streams aggregate falls 1081 → 574, the usual
+speculative-decode shape where drafts become wasted work once the batch saturates the GPU.
+One point does not fit — 32K measured −9% — and is recorded unexplained rather than rationalised.
+
+**Context ladder, each step needing the one before:** 131,072 → 262,144 (needs factor 2) →
+1,048,576 (needs factor 2 **and** offload 5). Raising `MAX_MODEL_LEN` alone fails at every step.
+
 
 **Raising `MAX_MODEL_LEN` alone fails, and the reason is the prefill workspace.**
 FlashMLA-sparse reserves `factor × max_model_len × 1152` bytes, default factor 5. Doubling

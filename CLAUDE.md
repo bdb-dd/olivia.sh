@@ -817,7 +817,25 @@ skipped, and `VLLM_ENGINE_READY_TIMEOUT_S=3600` because the first load is long.
 #    container is v0.32.1.dev0, so it already carries the arch.
 
 # 3. Serve on ONE node, TP=4, Engram in Grace memory. Use devel (see QOS above).
+#    PICK AN OPERATING POINT — the axes are opposed and no config wins both.
+#    All three measured 2026-11-06; see README "## Performance" for the numbers.
+
+# (a) BATCH THROUGHPUT — the default. 2454 tok/s @64 streams, 128 streams OK.
+#     Costs: 131K context, only 1.75x concurrency at the full window.
 QOS=devel TIME_LIMIT=02:00:00 ./olivia.sh server start dsv41
+
+# (b) LONG CONTEXT / CONCURRENCY — the FULL 1M native window, 11.3x at 128K.
+#     Costs ~30% throughput. Both knobs are REQUIRED: MAX_MODEL_LEN alone fails
+#     because the prefill workspace scales with it and eats the pool.
+MAX_MODEL_LEN=1048576 DSV41_SPARSE_MLA_WORKSPACE_FACTOR=2 CPU_OFFLOAD_GB=5 \
+  QOS=devel TIME_LIMIT=02:00:00 ./olivia.sh server start dsv41
+
+# (c) LOW LATENCY — DSpark speculative decode. 132.0 tok/s single-stream at 131K,
+#     the best measured. Costs 47% of aggregate at 16 streams, so NOT a default.
+#     The offload is not optional: DSpark's draft stages need resident memory.
+ENABLE_SPECULATIVE=1 CPU_OFFLOAD_GB=4 \
+  QOS=devel TIME_LIMIT=02:00:00 ./olivia.sh server start dsv41
+
 ./olivia.sh server watch
 
 # Fallback / tuning ladder, revised against measurement:

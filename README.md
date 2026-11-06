@@ -255,6 +255,37 @@ export ANTHROPIC_BASE_URL=http://localhost:8002 ANTHROPIC_AUTH_TOKEN=x && claude
 
 Latest measured throughput / latency. **Update this section after every sweep** (with the date + config).
 
+### Overview — peak aggregate throughput per preset, sorted by efficiency
+
+Every figure below is the **largest aggregate** recorded in that preset's own section; the
+`per GPU` column divides it by the allocation. Sorted by that, because GPU-hours are what we
+actually spend.
+
+| preset | model | GPUs | peak aggregate | per GPU |
+|---|---|---:|---:|---:|
+| `ornith_gh200` | 35B MoE FP8 | 1 | 4,621 tok/s | **4,621** |
+| `qwen38` | 27B dense FP8 | 1 | 3,162 tok/s | **3,162** |
+| `borealis` | 27B Gemma-3 BF16 | 1 | 2,666 tok/s | **2,666** |
+| `lagunas21` | Laguna S 2.1 FP8 | 4 | 7,751 tok/s | **1,938** |
+| `dsv41` | **748B** + Engram offload | 4 | 2,465 tok/s | **616** |
+| `laguna` | Laguna M.1 FP8 | 4 | 2,056 tok/s | **514** |
+| `glm53_flash` | 320B/18B `glm5_next` | 4 | 695 tok/s | **174** |
+| `glm51` | 744B AWQ | 8 | 895 tok/s | **112** |
+| `ornith` | 397B MoE FP8 | 8 | 845 tok/s | **106** |
+| `kimi27` | 1T int4, eager | 8 | 591 tok/s | **74** |
+| `glm52` | 744B FP8, eager | 12 | 419 tok/s | **35** |
+
+⚠️ **Read this as a rough ranking, not a benchmark.** The sweeps differ in `max_tokens`
+(256 vs 512), concurrency ceiling, prompt length and whether reasoning was on, so the numbers
+are not strictly comparable across rows. They are, however, each reproducible from the
+configuration recorded in that preset's section.
+
+Two things the ranking makes plain: **small models on one card dominate throughput-per-GPU**,
+and among the large models **`dsv41` is the standout** — 616 tok/s/GPU against `glm52`'s 35 for
+a comparable parameter count, i.e. ~18× better use of the same allocation. `dsv41` is also the
+only large preset serving a **1M context** (see its section for the three operating points).
+Presets not listed have never served: `glm53`, `glm52_awq`, `dsv4flash` (blocked), `glm47`.
+
 ### Ornith 1.0 `ornith_gh200` — 35B MoE FP8 on 1× GH200, CUDAGraph · 2026-07-16/17
 Concurrency sweep (`bench_sweep.py`, `max_tokens=512`, warm/JIT-cached pass on the pinned-commit rebuild):
 
@@ -387,7 +418,7 @@ Stable 1→64 (0 failures, no decode wedge — RayExecutorV2). Single-stream is 
 
 ### GLM-5.3 (`glm53` / `glm53_v27`) — not yet run
 No allocation spent. GLM-5.3's weights were still unpublished as of 2026-08-17 (announced 2026-08-14, open weights promised ~2 weeks out), so neither preset has been prefetched, built, or served. `glm53` is expected to match the GLM-5.2 row above exactly — it is the same base on the same container.
-### DeepSeek-V4.1-Flash (`dsv41`) — ✅ **SERVING AND BENCHMARKED** · 2026-11-03
+### DeepSeek-V4.1-Flash (`dsv41`) — ✅ **SERVING, BENCHMARKED AND TUNED** · 2026-11-03, tuning 2026-11-06
 **748B parameters generating on four GPUs**, job 2697324 on gpu-1-50. Engine init 119.71 s, CUDA graphs captured 100%, zero errors, `OpenAI server is ready to accept requests`. A completion returned `dsv41 online` with reasoning split into its own field, so the `deepseek_v41` tokenizer/tool/reasoning parsers all resolve.
 
 | streams | aggregate | per stream |
@@ -543,7 +574,7 @@ Backend is **`FLASH_ATTN_MLA_SPARSE`**, unchanged by the in-place `has_cutedsl` 
 > single-stream, peak **2454 @64**. dsv41 is the better engine here despite 2.3× the
 > parameters — so prefer it unless you specifically need Flash's multimodality or MIT licence.
 
-### How it got here — five attempts · updated 2026-11-02
+### How it got here — five attempts · updated 2026-11-06
 
 **Allocation spent so far: ~5 GPU-h of 6000** (measured: `cost` reported `Used 4.95` GPU-h for the whole 2026.2 period on 2026-11-02, superseding the ~3 GPU-h estimate previously recorded here). Weights prefetched and verified; container built and verified; **three serve attempts**. The third got all the way through weight load **and full CUDA-graph capture** before dying on a vLLM *default* — so the model, the arch support and our container are all proven; what remained was one missing argument. No throughput numbers yet.
 

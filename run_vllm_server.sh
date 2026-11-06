@@ -1090,6 +1090,26 @@ if [[ "${IS_DSV41}" == "1" ]]; then
     # CPU_OFFLOAD_GB first, then MAX_MODEL_LEN, then HiSparse.
     DSV41_SPARSE_MLA_WORKSPACE_FACTOR="${DSV41_SPARSE_MLA_WORKSPACE_FACTOR:-}"
 
+    # DSPARK — the only speculative-decode method V4.1 has, and the biggest
+    # untapped single-stream lever (measured baseline: ~109 tok/s per stream).
+    #
+    # V4.1 DROPPED classic MTP. vLLM is explicit: "V4.1 has no classic-MTP draft:
+    # its checkpoints ship DSpark stages under mtp.*, so only V4 gets an MTP
+    # architecture here ... method='mtp' on V4.1 is rejected." Never pass mtp.
+    #
+    # No draft model needed -- "DeepSeek DSpark can ship the weights inside the
+    # target checkpoint" (speculative.py): vLLM points the draft config at the
+    # target and rewrites `architectures` itself.
+    #
+    # num_speculative_tokens is DERIVED, not chosen: speculative.py does
+    # `self.num_speculative_tokens = block_size` from the checkpoint's
+    # `dspark_block_size`, which this model sets to **5**, and the validator
+    # rejects a value disagreeing with the trained block size. So leaving this
+    # EMPTY (vLLM derives 5) is correct, and anything but 5 is an error.
+    # The checkpoint also carries dspark_target_layer_ids [37,38,39],
+    # markov_rank 256, 128 routed / 3 activated draft experts — all read from it.
+    DSV41_SPECULATIVE_TOKENS="${DSV41_SPECULATIVE_TOKENS:-}"
+
     if [[ -z "${DSV41_ATTENTION_CONFIG:-}" ]]; then
         _ac="{\"backend\":\"FLASHMLA_SPARSE_DSV41\""
         [[ -n "${DSV41_INDEXER_KV_DTYPE}" ]] && _ac="${_ac},\"indexer_kv_dtype\":\"${DSV41_INDEXER_KV_DTYPE}\""
@@ -1695,7 +1715,19 @@ fi
 
 # Speculative decoding (method depends on model)
 if [[ "${USE_SPECULATIVE}" == "1" ]]; then
-    if [[ "${IS_GLM_MOE}" == "1" ]]; then
+    # DSV41 FIRST — and this branch MUST exist. IS_DSV4 excludes V4.1 (substring
+    # trap) and IS_GLM_MOE/IS_ORNITH do not match it, so without this,
+    # ENABLE_SPECULATIVE=1 on dsv41 fell through to the generic `else` and
+    # silently enabled NGRAM speculation instead of the model's own DSpark.
+    if [[ "${IS_DSV41}" == "1" ]]; then
+        if [[ -n "${DSV41_SPECULATIVE_TOKENS}" ]]; then
+            SPEC_CONFIG='{"method": "dspark", "num_speculative_tokens": '${DSV41_SPECULATIVE_TOKENS}'}'
+        else
+            # Omit the count so vLLM derives it from dspark_block_size (5) —
+            # safer than naming a number the validator may reject.
+            SPEC_CONFIG='{"method": "dspark"}'
+        fi
+    elif [[ "${IS_GLM_MOE}" == "1" ]]; then
         # GLM-4.7/GLM-5.1 use MTP (Multi-Token Prediction) speculative decoding
         SPEC_CONFIG='{"method": "mtp", "num_speculative_tokens": '${MTP_SPECULATIVE_TOKENS}'}'
     elif [[ "${IS_DSV4}" == "1" ]]; then

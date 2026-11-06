@@ -554,8 +554,31 @@ fi
 #     (mtp.0.hc_attn_base, ...), and vLLM registers DeepSeekV4MTPModel. This is a
 #     verified-present head, so MTP is left ON by default here — the opposite call
 #     from Ornith, whose FP8 declared MTP and shipped nothing.
+# Detect DeepSeek-V4.1-Flash. This MUST be tested before IS_DSV4, and IS_DSV4 must
+# exclude it, because "DeepSeek-V4" is a substring of "DeepSeek-V4.1-Flash" — the
+# same trap GLM-5.3 vs GLM-5.3-Flash set. They are different architectures
+# (DeepseekV41ForCausalLM vs DeepseekV4ForCausalLM) with different serve contracts,
+# and letting 4.1 inherit the 4.0 profile would hand it the wrong attention backend
+# and a tilelang mhc path it does not use.
+#
+# From the published config + vLLM's recipe (2026-11-02):
+#   - 552B backbone + 196.6B Engram, only 8B active per prompt token and 16B per
+#     output token; 40 layers, 384 routed + 1 shared expert, 6 active; 1M ctx via
+#     YaRN (factor 16 over 65536); vision-language; MIT.
+#   - Quant is fp8 with weight_block_size [32,32] and expert_dtype fp4.
+#   - CSA2 attention (Full/Reindex/Reuse modes) + a two-level hierarchical indexer,
+#     with FP4 main KV shared across layers → **890 bytes per token**. KV is
+#     therefore almost free; WEIGHTS set the capacity limit, not cache.
+#   - **V4.1 DROPPED the MTP module.** Despite num_nextn_predict_layers=3 in the
+#     config, DSpark is the only speculative method for this checkpoint. Do not
+#     try `--speculative-config method=mtp` here.
+IS_DSV41=0
+if [[ "${MODEL}" == *"V4.1"* ]] || [[ "${MODEL}" == *"v4.1"* ]] || [[ "${MODEL}" == *"V4_1"* ]]; then
+    IS_DSV41=1
+fi
+
 IS_DSV4=0
-if [[ "${MODEL}" == *"DeepSeek-V4"* ]] || [[ "${MODEL}" == *"deepseek-v4"* ]]; then
+if [[ "${IS_DSV41}" == "0" ]] && { [[ "${MODEL}" == *"DeepSeek-V4"* ]] || [[ "${MODEL}" == *"deepseek-v4"* ]]; }; then
     IS_DSV4=1
 fi
 
@@ -568,6 +591,19 @@ fi
 if [[ "${IS_KIMI}" == "1" && -z "${CUDAGRAPH_MODE}" ]]; then
     CUDAGRAPH_MODE="NONE"
 fi
+
+# DeepSeek-V4.1-Flash does not support torch.compile, so vLLM's default
+# FULL_AND_PIECEWISE dies at capture. Hand the compilation config an explicit
+# FULL_DECODE_ONLY instead (see the IS_DSV41 block): decode graphs are kept, which
+# is where the throughput is, and prefill is left uncompiled. We therefore do NOT
+# set CUDAGRAPH_MODE for 4.1 — the compilation-config flag carries it, and the
+# IS_DSV41 block logs the chosen mode once it has actually been resolved.
+#
+# NOTE: an informational echo used to live here and referenced
+# ${DSV41_CUDAGRAPH_MODE} — which this early in the script is still UNSET. Under
+# `set -euo pipefail` that is fatal, so every dsv41 serve died in 1 second
+# (job 2694557). `bash -n` cannot see it: the syntax is valid, the ordering is
+# not. The message now sits next to the assignment.
 
 # GLM-5.2: CUDAGraph capture hits an illegal-memory-access during capture_model
 # (the same eager-only story as Kimi — verified 2026-06-18, job 1308936 died with
@@ -620,7 +656,7 @@ fi
 # any OpenAI tool-using client (Claude Code via anthropic_proxy.py, etc.).
 # ``${VAR+x}`` distinguishes "user explicitly set (even to 0)" from "unset".
 if [[ -z "${ENABLE_AUTO_TOOL_CHOICE+x}" ]]; then
-    if [[ "${IS_GLM_MOE}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" || "${IS_ORNITH}" == "1" || "${IS_QWEN38}" == "1" || "${IS_DSV4}" == "1" ]]; then
+    if [[ "${IS_GLM_MOE}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" || "${IS_ORNITH}" == "1" || "${IS_QWEN38}" == "1" || "${IS_DSV4}" == "1" || "${IS_DSV41}" == "1" ]]; then
         ENABLE_AUTO_TOOL_CHOICE=1
     else
         ENABLE_AUTO_TOOL_CHOICE=0
@@ -632,7 +668,15 @@ fi
 # matches typical Claude Code usage (which requests max_tokens=32000).
 # Other models keep the conservative 32K default.
 if [[ -z "${MAX_MODEL_LEN+x}" ]]; then
-    if [[ "${IS_DSV4}" == "1" ]]; then
+    if [[ "${IS_DSV41}" == "1" ]]; then
+        # Native window is 1,048,576 (YaRN x16 over 65536). Unusually, the full 1M
+        # is nearly affordable here: KV is 890 BYTES per token (FP4 latents shared
+        # across layers), so a 1M prompt holds under 1 GB of global KV plus a fixed
+        # 128-token sliding window per layer. 131072 is still the default because
+        # weights, not cache, are what is tight on 96 GB cards — but raising this
+        # costs far less than on any other preset we run.
+        MAX_MODEL_LEN=131072
+    elif [[ "${IS_DSV4}" == "1" ]]; then
         # Native window is 1,048,576 (YaRN x16). Default to 131072: the full 1M
         # would consume the entire KV budget for a single sequence. Raise it
         # explicitly for long-context runs (the context ladder does exactly that).
@@ -660,8 +704,18 @@ if [[ -z "${MAX_MODEL_LEN+x}" ]]; then
         # DeepSeek-V4-Flash: the full 1M would spend the whole KV budget on one
         # sequence. The hybrid attention makes that budget go unusually far
         # (only 11 of 45 layers hold a KV cache, and those are MLA with
-        # kv_lora_rank=512), so this is a starting point, not a ceiling — raise it
-        # explicitly once the KV pool size is known from a real serve.
+        # kv_lora_rank=512) — but the budget itself is the constraint here, not
+        # the per-token cost.
+        #
+        # MEASURED on-cluster (job 2673772, 2026-10-30, TP=4 @ util 0.9):
+        #   Available KV cache memory: 2.52 GiB per rank
+        #   GPU KV cache size:         208,476 tokens
+        #   Maximum concurrency @131072: 1.59x
+        # So 320B of FP8 weights leave ~2.5 GiB per card and this window already
+        # spends the pool on ~1.6 sequences. Raising it is only worthwhile for
+        # single-stream long-context work; LOWERING it is what buys concurrency
+        # (e.g. 32768 -> ~6.4x). This is the lever, not --gpu-memory-utilization,
+        # which that run showed is already at its ceiling.
         MAX_MODEL_LEN=131072
     elif [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_LAGUNA}" == "1" ]]; then
         # GLM-5.1 ~205K, GLM-5.2/5.3 ~1M, Kimi K2.6 ~256K, Laguna M.1 ~256K native —
@@ -830,6 +884,253 @@ if [[ "${IS_GLM53_FLASH}" == "1" && "${IS_AWQ}" == "0" ]]; then
         echo "[WARN] (FP8 KV cache for this model is Blackwell-only; set FORCE_KV_CACHE_DTYPE=1 to override.)"
         KV_CACHE_DTYPE=""
     fi
+
+    # DECODE CONCURRENCY IS CAPPED BY THE KDA STATE CACHE, NOT BY KV.
+    #
+    # glm5_next is a HYBRID: NoPE sparse-MLA layers interleaved with KDA linear
+    # attention, and every KDA layer carries a per-sequence recurrent state —
+    # what vLLM accounts for as a "Mamba cache block". One block per decode
+    # sequence, drawn from the same budget as the KV pool, and that budget is
+    # thin: ~2.5 GiB per rank, which came to 202 blocks on-cluster.
+    #
+    # vLLM's default max_num_seqs is 1024, so it refuses to capture and the
+    # engine dies 8.6 minutes in — AFTER the full weight load AND a clean 51/51
+    # PIECEWISE + 2/2 FULL capture (job 2673772, 2026-10-30):
+    #     ValueError: max_num_seqs (1024) exceeds available Mamba cache blocks (202).
+    # That error suggests raising --gpu-memory-utilization as the alternative.
+    # On this shape it is NOT available: the same run logged the caching
+    # allocator failing to map 20 MB with ~14 MB free on all four ranks, so 0.9
+    # is already the ceiling. Hence a cap rather than more memory.
+    #
+    # 128, well under the measured 202, because A HIGHER CAP BUYS NOTHING HERE.
+    # This is a startup guard, not a throughput setting: the KV pool binds first
+    # at every context we actually run. 208,476 tokens / max_model_len gives the
+    # reachable concurrency — 1.6 at 131072, 6.4 at 32768, 25 at 8192, 51 at 4096
+    # — so a cap of 128 only starts to bind below ~1.6K context, far under any
+    # sweep we drive (<= 64 streams). Spending the margin on headroom we cannot
+    # reach would be the wrong trade, because the block count DOES drift run to
+    # run with memory-profiling noise: a cap at 192 sits 5% under the measured
+    # count and would fail again on a slightly tighter profile, costing another
+    # full weight load and capture to find out. 128 keeps 37% margin and is a
+    # CUDA-graph capture size, so no graph is wasted rounding up.
+    GLM53_FLASH_MAX_NUM_SEQS="${GLM53_FLASH_MAX_NUM_SEQS:-128}"
+fi
+
+# DeepSeek-V4.1-Flash runtime profile — and THE reason this preset exists on
+# GH200 rather than a bigger box.
+#
+# vLLM's own sizing says V4.1-Flash wants ~614 GB of VRAM, i.e. a GB200 NVL4 tray
+# (768 GB) or an 8-GPU H200 node (1128 GB). Our node is 4 x 96 = 384 GB, so it does
+# not fit — UNLESS the Engram tables leave the GPUs. They are the ideal candidate:
+# 196.6B parameters (259.5 GiB, ~47.2 GiB per rank at TP4) that are **sparsely
+# accessed by token-based hash lookup**, held by only two layers (1 and 14, each a
+# ~384M-row x 256 table). Keeping them resident would consume half of every 96 GB
+# card; `--engram-config {"cpu_offload":true}` parks them in **pinned host memory**
+# so the cards hold only the backbone.
+#
+# This is a better fit on GH200 than almost anywhere else: Grace is attached over
+# NVLink-C2C at ~900 GB/s, roughly an order of magnitude more than a PCIe host hop,
+# and there is ~800 GB of LPDDR5X per node to hold the tables. It is also finer
+# grained than our CPU_OFFLOAD_GB lever: --cpu-offload-gb evicts by layer order,
+# blind to access frequency, whereas this moves exactly the cold structure.
+# CPU_OFFLOAD_GB remains available on top if the backbone itself still does not fit.
+if [[ "${IS_DSV41}" == "1" ]]; then
+    # Block-FP8 → DeepGEMM lane (same as glm52/qwen38/dsv4). Skip the JIT warmup;
+    # vLLM's recipe sets this too.
+    if [[ "${VLLM_USE_DEEP_GEMM_EXPLICIT}" == "0" ]]; then
+        export VLLM_USE_DEEP_GEMM=1
+    fi
+    export VLLM_DEEP_GEMM_WARMUP="${VLLM_DEEP_GEMM_WARMUP:-skip}"
+
+    # First load is genuinely long (510 GB of shards, Engram tables staged into
+    # pinned host memory). vLLM's recipe raises its own readiness timeout to an
+    # hour for exactly this reason; without it the engine is declared dead while
+    # still loading.
+    export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-3600}"
+    export VLLM_USE_RUST_FRONTEND="${VLLM_USE_RUST_FRONTEND:-1}"
+
+    # fp8 KV is REQUIRED, as with DeepSeek-V4 — and this is the OPPOSITE of
+    # GLM-5.3-Flash, where fp8 KV is Blackwell-only and Hopper must run BF16.
+    # Four MLA-family models now, four different KV rules: never generalise one.
+    KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+
+    # Engram to pinned host memory (see the comment block above). Override with
+    # DSV41_ENGRAM_CPU_OFFLOAD=false only on a card large enough to hold ~47 GiB
+    # of tables per rank beside the backbone — not ours.
+    #
+    # Note: `cpu_offload` is ALREADY vLLM's default for this model
+    # (config/engram.py: `cpu_offload: bool = True`), so passing it changes
+    # nothing by itself. It is passed explicitly anyway — this is the flag the
+    # whole single-node fit depends on, and an explicit value documents that and
+    # keeps an upstream default-flip from silently un-fitting the preset.
+    DSV41_ENGRAM_CPU_OFFLOAD="${DSV41_ENGRAM_CPU_OFFLOAD:-true}"
+
+    # TRANSPARENT HUGE PAGES for the offloaded tables — the one Engram knob our
+    # shape can actually use, and OFF for the first serve on purpose.
+    #
+    # The offloaded tables are read by **UVA lookup**: the GPU addresses host
+    # memory directly over NVLink-C2C rather than copying pages in. With ~259 GiB
+    # of table behind 4 KiB pages that is ~68M page-table entries, walked by a
+    # *random, sparse, token-driven hash* — close to the worst case for TLB
+    # locality. `use_thp` backs the private tables with 2 MiB pages instead,
+    # cutting entries by ~512x. On a workload whose access pattern is pure random
+    # lookup into a host table, that is the obvious thing to try.
+    #
+    # Constraints checked against vLLM's own validator (config/engram.py):
+    #   * requires cpu_offload=true  — we set that.
+    #   * requires dp_shared_memory=false. `resolve_dp_shared_memory` only turns
+    #     that on when data_parallel_size > 1; we run TP=4 / DP=1, so it stays
+    #     off and THP is legal here. (It would NOT be on a DP shape.)
+    #   * best effort — it falls back to ordinary pinned pages, so a kernel
+    #     without THP available degrades rather than fails.
+    # Cost: it PREFAULTS the tables at startup, so first load gets slower — which
+    # is why VLLM_ENGINE_READY_TIMEOUT_S is already 3600 above.
+    #
+    # Default OFF because the first serve of a 748B model should move one
+    # variable at a time; this is the FIRST optimisation to try once it serves
+    # clean, ahead of DSpark spec decode.
+    DSV41_ENGRAM_USE_THP="${DSV41_ENGRAM_USE_THP:-false}"
+
+    # V4.1-Flash does NOT support torch.compile, so the default
+    # FULL_AND_PIECEWISE dies at capture. FULL_DECODE_ONLY is what the recipe
+    # uses; it keeps decode graphs (the throughput win) without compiling prefill.
+    DSV41_CUDAGRAPH_MODE="${DSV41_CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"
+    if [[ -z "${CUDAGRAPH_MODE}" ]]; then
+        echo "[INFO] DeepSeek-V4.1: cudagraph_mode=${DSV41_CUDAGRAPH_MODE} via --compilation-config (no torch.compile support)"
+    fi
+
+    # Sparse-MLA backend for this arch. NOTE the FLASHINFER prefix: this is the
+    # hard dependency that currently BLOCKS the preset, because our build
+    # uninstalls flashinfer when `import flashinfer` fails on the cute-dsl skew.
+    # Set DSV41_ATTENTION_CONFIG="" to let vLLM auto-select and find out what it
+    # picks without flashinfer present.
+    # BACKEND: FLASHMLA, not FLASHINFER — and this was wrong until 2026-11-02.
+    #
+    # v0.32.1 registers THREE V4.1 sparse-MLA backends (v1/attention/backends/
+    # registry.py), not one:
+    #   FLASHMLA_SPARSE_DSV41      -> vllm.models.deepseek_v41.sparse_mla
+    #   FLASHINFER_MLA_SPARSE_DSV41-> ...deepseek_v41.nvidia.flashinfer_sparse
+    #   FLASHMLA_MEGA_ATTN_DSV41   -> ...deepseek_v41.sparse_mla (mega attention)
+    # Only the middle one needs flashinfer, and our container does not ship it.
+    # FLASHMLA_SPARSE_DSV41 runs on vLLM's OWN compiled `_flashmla_C.abi3.so`
+    # (39 MB, verified present in the sandbox), so it needs nothing extra.
+    #
+    # This is the same lesson GLM-5.3-Flash taught by accident: it served its
+    # NoPE sparse-MLA layers on FLASH_ATTN_MLA_SPARSE with flashinfer absent.
+    # Naming a flashinfer backend explicitly would turn a working default into a
+    # hard failure, so prefer the compiled path and keep flashinfer optional.
+    # Set DSV41_ATTENTION_CONFIG="" to let vLLM auto-select, or name
+    # FLASHMLA_MEGA_ATTN_DSV41 to try mega attention (same KV geometry).
+    # INDEXER TUNING IS BLACKWELL-ONLY — do not set it here. Job 2694626 died
+    # 25 s in, after the Engram tables had already offloaded, on:
+    #     ValueError: indexer_kv_dtype='mxfp4' requires Blackwell datacenter
+    #     GPUs (sm_10x, e.g. B200/GB200); ... earlier architectures are not
+    #     supported.
+    # Both values had been copied from vLLM's recipe, which targets B200/GB200:
+    #   * indexer_kv_dtype=mxfp4      -> needs sm_10x. GH200 is sm_90.
+    #   * indexer_sparse_logits=true  -> needs mxfp4 AND an SM100-class GPU AND
+    #                                    DeepGEMM >= 2.8 (config/attention.py).
+    # Leaving indexer_kv_dtype unset means "auto", which per vLLM's own docstring
+    # "picks the model's default (... fp8 for the DeepSeek sparse indexer)" —
+    # i.e. exactly the Hopper-correct choice, chosen by the backend rather than
+    # guessed by us. The allowed set is auto|bf16|fp8|mxfp4|nvfp4.
+    #
+    # Worth knowing what we are giving up: indexer_sparse_logits scores only
+    # candidate blocks instead of walking the whole context, costing O(candidate
+    # blocks) per query regardless of length. It "pays off for long contexts
+    # (roughly 32K and beyond)" — precisely our 131072 window — so this is a real
+    # loss on Hopper, not a knob we would not have wanted. It is simply not
+    # available, and asking for it is fatal rather than ignored.
+    #
+    # The two knobs stay reachable for a future Blackwell box:
+    #   DSV41_INDEXER_KV_DTYPE=mxfp4 DSV41_INDEXER_SPARSE_LOGITS=true
+    DSV41_INDEXER_KV_DTYPE="${DSV41_INDEXER_KV_DTYPE:-}"
+    DSV41_INDEXER_SPARSE_LOGITS="${DSV41_INDEXER_SPARSE_LOGITS:-}"
+
+    # SPARSE-MLA PREFILL WORKSPACE — the cheapest KV-pool lever on this shape.
+    #
+    # FlashMLA-sparse reserves a prefill workspace of
+    #     factor * max_model_len * 576 * 2 bytes
+    # (flashmla_sparse.py get_prefill_workspace_size), and vLLM defaults `factor`
+    # to 5 when max_model_len <= 256K. At our 131072 that is **720 MiB** —
+    # against a MEASURED KV pool of 1.08 GiB (1106 MiB) on job 2697324. The
+    # prefill workspace is **65% the size of our entire KV cache.**
+    #
+    # Upstream expects this to be irrelevant; the source comment reads "This fits
+    # nicely below the typical MoE workspace size of >2GB so this is 'free'".
+    # That holds on a big-HBM box. On a weight-dominated single-node fit, where
+    # 748B of params leave ~1 GiB for cache, it is the opposite of free. An
+    # upstream default tuned for a different memory regime.
+    #
+    # ❌ MEASURED 2026-11-04 (job 2710025): THIS DOES NOT ENLARGE THE KV POOL.
+    #
+    # vLLM's field docs say "Lower values return memory to the KV cache at long
+    # max_model_len", and from the 720 MiB figure above I projected factor 2
+    # would give +39% pool (~319,586 tokens, 2.44x concurrency at 131K).
+    #
+    # It gave nothing. With factor 2 confirmed applied in both the serve args and
+    # the resolved config:
+    #     Available KV cache memory: 1.08 GiB   (baseline: 1.08 GiB)
+    #     GPU KV cache size:  229,861 tokens    (baseline: 229,815 — +0.02%)
+    #     Max concurrency @131072: 1.75x        (baseline: 1.75x)
+    # Throughput moved +1.0..+1.7% per stream and +3% peak aggregate, which is
+    # run-to-run noise.
+    #
+    # WHY I WAS WRONG, because the mistake is more useful than the knob: I
+    # assumed the prefill workspace competes with the KV pool. Upstream's comment
+    # -- "This fits nicely below the typical MoE workspace size of >2GB so this
+    # is 'free'" -- actually means the workspace is carved out of an ALREADY
+    # RESERVED allocation, so changing the factor neither costs nor saves KV. I
+    # read "free" as "negligible on a big box, significant on ours" and built
+    # arithmetic on a relationship I never verified. The formula was right; the
+    # assumption that the two quantities compete was not.
+    #
+    # Keep the knob exposed (it is harmless and the docs may become true on
+    # another shape), but it is NOT a pool lever here. The real ladder is now
+    # CPU_OFFLOAD_GB first, then MAX_MODEL_LEN, then HiSparse.
+    DSV41_SPARSE_MLA_WORKSPACE_FACTOR="${DSV41_SPARSE_MLA_WORKSPACE_FACTOR:-}"
+
+    # DSPARK — the only speculative-decode method V4.1 has, and the biggest
+    # untapped single-stream lever (measured baseline: ~109 tok/s per stream).
+    #
+    # V4.1 DROPPED classic MTP. vLLM is explicit: "V4.1 has no classic-MTP draft:
+    # its checkpoints ship DSpark stages under mtp.*, so only V4 gets an MTP
+    # architecture here ... method='mtp' on V4.1 is rejected." Never pass mtp.
+    #
+    # No draft model needed -- "DeepSeek DSpark can ship the weights inside the
+    # target checkpoint" (speculative.py): vLLM points the draft config at the
+    # target and rewrites `architectures` itself.
+    #
+    # num_speculative_tokens MUST BE PASSED. I first read speculative.py's
+    # `self.num_speculative_tokens = block_size` (from the checkpoint's
+    # `dspark_block_size`) and concluded it was derived, so left this empty.
+    # Job 2730546 rejected that at 1m25s:
+    #     num_speculative_tokens must be provided with speculative model unless
+    #     the draft model config contains an n_predict parameter
+    # The pydantic validator runs BEFORE that assignment, so the derivation never
+    # gets a chance. Reading one code path is not the same as reading the order
+    # they execute in.
+    #
+    # 5 because that is the checkpoint's trained `dspark_block_size`, and the
+    # DSpark validator rejects a count that disagrees with the trained block size
+    # — so this is a required constant, not a tuning knob. Raise it only if a
+    # future checkpoint trains a larger block.
+    # The checkpoint also carries dspark_target_layer_ids [37,38,39],
+    # markov_rank 256, 128 routed / 3 activated draft experts — all read from it.
+    DSV41_SPECULATIVE_TOKENS="${DSV41_SPECULATIVE_TOKENS:-5}"
+
+    if [[ -z "${DSV41_ATTENTION_CONFIG:-}" ]]; then
+        _ac="{\"backend\":\"FLASHMLA_SPARSE_DSV41\""
+        [[ -n "${DSV41_INDEXER_KV_DTYPE}" ]] && _ac="${_ac},\"indexer_kv_dtype\":\"${DSV41_INDEXER_KV_DTYPE}\""
+        [[ -n "${DSV41_INDEXER_SPARSE_LOGITS}" ]] && _ac="${_ac},\"indexer_sparse_logits\":${DSV41_INDEXER_SPARSE_LOGITS}"
+        [[ -n "${DSV41_SPARSE_MLA_WORKSPACE_FACTOR}" ]] && _ac="${_ac},\"sparse_mla_prefill_workspace_factor\":${DSV41_SPARSE_MLA_WORKSPACE_FACTOR}"
+        DSV41_ATTENTION_CONFIG="${_ac}}"
+        unset _ac
+    fi
+
+    DSV41_TOOL_PARSER="${DSV41_TOOL_PARSER:-deepseek_v41}"
+    DSV41_REASONING_PARSER="${DSV41_REASONING_PARSER:-deepseek_v41}"
+    DSV41_MAX_NUM_SEQS="${DSV41_MAX_NUM_SEQS:-128}"
 fi
 
 # --- GLM-5.2-family multi-node bits that are QUANT-INDEPENDENT --------------
@@ -882,7 +1183,7 @@ fi
 # from whatever is installed — if nothing works, the error will tell us what
 # to install.
 if [[ -z "${VLLM_ATTENTION_BACKEND}" ]]; then
-    if [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_ORNITH}" == "1" || "${IS_QWEN38}" == "1" || "${IS_BOREALIS}" == "1" || "${IS_DSV4}" == "1" || "${IS_GLM53_FLASH}" == "1" ]]; then
+    if [[ "${IS_GLM5}" == "1" || "${IS_KIMI}" == "1" || "${IS_ORNITH}" == "1" || "${IS_QWEN38}" == "1" || "${IS_BOREALIS}" == "1" || "${IS_DSV4}" == "1" || "${IS_GLM53_FLASH}" == "1" || "${IS_DSV41}" == "1" ]]; then
         # Don't force FLASH_ATTN — these need vLLM to auto-select a special backend:
         #   GLM-5.3-Flash HYBRID *and* sparse-MLA in one model: 34 KDA linear-attn
         #     layers (need a GDN kernel + recurrent state) interleaved with 11 NoPE
@@ -1352,6 +1653,13 @@ VLLM_ARGS=(
 # forward. This is the lever that lets a model whose per-GPU shard exceeds the
 # 96 GB HBM (e.g. single-node GLM-5.2-AWQ, ~104 GB/GPU) fit — trading some decode
 # latency for HBM freed up for KV. Only emitted when set > 0.
+# Chunked-prefill activation buffers scale with the chunk size, so a smaller
+# chunk lowers the transient peak and leaves more steady-state room for KV.
+# Generic rather than per-model: every preset here runs --enable-chunked-prefill.
+if [[ -n "${MAX_NUM_BATCHED_TOKENS:-}" ]]; then
+    VLLM_ARGS+=("--max-num-batched-tokens" "${MAX_NUM_BATCHED_TOKENS}")
+fi
+
 if [[ -n "${CPU_OFFLOAD_GB:-}" && "${CPU_OFFLOAD_GB}" != "0" ]]; then
     VLLM_ARGS+=("--cpu-offload-gb" "${CPU_OFFLOAD_GB}")
 fi
@@ -1416,7 +1724,15 @@ fi
 
 # Speculative decoding (method depends on model)
 if [[ "${USE_SPECULATIVE}" == "1" ]]; then
-    if [[ "${IS_GLM_MOE}" == "1" ]]; then
+    # DSV41 FIRST — and this branch MUST exist. IS_DSV4 excludes V4.1 (substring
+    # trap) and IS_GLM_MOE/IS_ORNITH do not match it, so without this,
+    # ENABLE_SPECULATIVE=1 on dsv41 fell through to the generic `else` and
+    # silently enabled NGRAM speculation instead of the model's own DSpark.
+    if [[ "${IS_DSV41}" == "1" ]]; then
+        # The count is required (see the knob above) — an empty value would be
+        # rejected at config validation, so fall back to the trained 5.
+        SPEC_CONFIG='{"method": "dspark", "num_speculative_tokens": '${DSV41_SPECULATIVE_TOKENS:-5}'}'
+    elif [[ "${IS_GLM_MOE}" == "1" ]]; then
         # GLM-4.7/GLM-5.1 use MTP (Multi-Token Prediction) speculative decoding
         SPEC_CONFIG='{"method": "mtp", "num_speculative_tokens": '${MTP_SPECULATIVE_TOKENS}'}'
     elif [[ "${IS_DSV4}" == "1" ]]; then
@@ -1559,6 +1875,47 @@ if [[ "${IS_DSV4}" == "1" ]]; then
     [[ "${ENABLE_AUTO_TOOL_CHOICE}" == "1" ]] && VLLM_ARGS+=("--enable-auto-tool-choice")
     [[ -n "${SERVED_MODEL_NAME}" ]] && VLLM_ARGS+=("--served-model-name" "${SERVED_MODEL_NAME}")
     VLLM_ARGS+=("--trust-remote-code")
+fi
+
+# DeepSeek-V4.1-Flash serve arguments.
+if [[ "${IS_DSV41}" == "1" ]]; then
+    VLLM_ARGS+=("--tokenizer-mode" "deepseek_v41")
+    [[ -n "${DSV41_TOOL_PARSER}" ]] && VLLM_ARGS+=("--tool-call-parser" "${DSV41_TOOL_PARSER}")
+    [[ -n "${DSV41_REASONING_PARSER}" ]] && VLLM_ARGS+=("--reasoning-parser" "${DSV41_REASONING_PARSER}")
+    [[ "${ENABLE_AUTO_TOOL_CHOICE}" == "1" ]] && VLLM_ARGS+=("--enable-auto-tool-choice")
+    [[ -n "${SERVED_MODEL_NAME}" ]] && VLLM_ARGS+=("--served-model-name" "${SERVED_MODEL_NAME}")
+    VLLM_ARGS+=("--trust-remote-code")
+
+    # THE headline flag: park Engram's sparsely-accessed tables in pinned host
+    # memory so 96 GB cards only hold the backbone.
+    VLLM_ARGS+=("--engram-config" "{\"cpu_offload\":${DSV41_ENGRAM_CPU_OFFLOAD},\"use_thp\":${DSV41_ENGRAM_USE_THP}}")
+
+    # Sparse-MLA backend + indexer dtypes. Empty string = let vLLM auto-select
+    # (useful for discovering what it picks when flashinfer is absent).
+    if [[ -n "${DSV41_ATTENTION_CONFIG}" ]]; then
+        VLLM_ARGS+=("--attention-config" "${DSV41_ATTENTION_CONFIG}")
+    fi
+
+    # No torch.compile on this arch — decode-only graphs.
+    VLLM_ARGS+=("--compilation-config" "{\"cudagraph_mode\":\"${DSV41_CUDAGRAPH_MODE}\"}")
+
+    # Vision encoder replicated across the TP group rather than sharded; at 32
+    # layers / hidden 1024 it is small enough that data mode is the cheaper choice
+    # (same call as Kimi's MoonViT).
+    VLLM_ARGS+=("--mm-encoder-tp-mode" "data")
+
+    [[ -n "${DSV41_MAX_NUM_SEQS}" ]] && VLLM_ARGS+=("--max-num-seqs" "${DSV41_MAX_NUM_SEQS}")
+
+    if [[ "${DSV41_ENABLE_PREFIX_CACHING:-1}" == "1" ]]; then
+        VLLM_ARGS+=("--enable-prefix-caching")
+    fi
+fi
+
+# GLM-5.3-Flash: cap decode concurrency to the KDA state-cache budget. See the
+# runtime-profile block above for why 192, and why raising the memory
+# utilisation is not the alternative the vLLM error message suggests it is.
+if [[ "${IS_GLM53_FLASH}" == "1" && -n "${GLM53_FLASH_MAX_NUM_SEQS:-}" ]]; then
+    VLLM_ARGS+=("--max-num-seqs" "${GLM53_FLASH_MAX_NUM_SEQS}")
 fi
 
 # Qwen3.8 27B dense — same Qwen3.5 parser family as Ornith, different shape.

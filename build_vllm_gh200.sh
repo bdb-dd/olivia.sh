@@ -1168,20 +1168,50 @@ PYPATCH_LL_BF16_QUACK
 # Installing quack is not an option: quack-kernels 0.6.4 pins
 # nvidia-cutlass-dsl==4.6.2 while vLLM v0.27.1 pins 4.6.0 -- mutually
 # unsatisfiable, and bumping cutlass-dsl is what broke Ornith. Reporting the
-# capability honestly makes callers take their existing non-cutedsl fallback,
-# which is the same remedy as PYPATCH_LL_BF16_QUACK above.
-python3 - <<'PYEOF' || echo "  has_cutedsl patch skipped (anchor absent, OK on other vLLM versions)"
-import glob, sys
-hits = glob.glob('/usr/local/lib/python3.12/dist-packages/vllm/utils/import_utils.py')
+# capability honestly makes callers take their existing non-cutedsl fallback
+# (a Triton kernel in the same file), which is the same remedy as
+# PYPATCH_LL_BF16_QUACK above.
+#
+# THIS PATCH WAS A SILENT NO-OP FROM 2026-08-19 TO 2026-11-02. It targeted the
+# INSTALLED tree, /usr/local/lib/.../dist-packages/vllm/utils/import_utils.py --
+# but vLLM is not pip-installed until ~770 lines below this point, so the file
+# did not exist yet. glob returned [], the for-loop body never ran, and nothing
+# printed: an empty loop exits 0, so even the `|| echo ... skipped` could not
+# fire. Two consequences, both paid for in GPU time: the DeepSeek-V4-Flash bug
+# this was written for (job 2043640) was never actually fixed, and dsv41 died
+# the same way on job 2694691 -- with the exact traceback the comment above
+# predicts, down to the quack.compile_utils import.
+#
+# Fixed by targeting the SOURCE tree like its two neighbours do, so `pip install .`
+# carries it into the installed copy -- and by FAILING LOUDLY when the file is
+# absent instead of vanishing. Phase 4 additionally verifies the INSTALLED copy,
+# because a patch is only real once it survives the install.
+python3 - <<'PYEOF'
+import os, sys
+f = "/opt/vllm/vllm/utils/import_utils.py"
 old = '    return _has_module("cutlass")'
 new = '    return _has_module("cutlass") and _has_module("quack")'
-for p in hits:
-    s = open(p).read()
-    if new in s:
-        print('  has_cutedsl already requires quack'); break
-    if old not in s:
-        print('  has_cutedsl anchor not found (OK)'); break
-    open(p, 'w').write(s.replace(old, new, 1))
+if not os.path.exists(f):
+    # NOT fatal: this script builds every preset, and vllm/utils/import_utils.py
+    # is a recent refactor. v0.19.x / v0.20.0 / v0.21.0 (glm51, gemma-4, laguna,
+    # devstral...) predate it, and those builds must not die here. Absence is
+    # only a problem for a vLLM new enough to HAVE cute-dsl indexer paths, and
+    # on those the file exists -- so warn loudly and let Phase 4 be the gate.
+    print("  PYPATCH_HAS_CUTEDSL_QUACK: %s absent -- assuming this vLLM predates\n"
+          "    vllm/utils/import_utils.py. If this build is for dsv4/dsv41/glm53*,\n"
+          "    that assumption is WRONG and the gating check is missing: expect\n"
+          "    ModuleNotFoundError: No module named 'quack' inside the attention\n"
+          "    forward. Phase 4 verifies the installed copy either way." % f)
+    raise SystemExit(0)
+s = open(f).read()
+if new in s:
+    print('  has_cutedsl already requires quack')
+elif old not in s:
+    print('  WARNING: has_cutedsl anchor not found -- upstream may have '
+          'refactored it. VERIFY has_cutedsl() by hand before serving dsv4/dsv41.')
+else:
+    open(f, 'w').write(s.replace(old, new, 1))
+    assert new in open(f).read(), "write-back verification failed"
     print('  PYPATCH_HAS_CUTEDSL_QUACK: has_cutedsl() now also requires quack')
 PYEOF
 
@@ -1708,10 +1738,67 @@ pip install --no-cache-dir --root-user-action=ignore --constraint /tmp/constrain
 # Needed when xgrammar went in via --no-deps; a harmless no-op otherwise.
 pip install --no-cache-dir --root-user-action=ignore apache-tvm-ffi 2>&1 | tail -3 || echo "apache-tvm-ffi not available, continuing..."
 
-# Install flashinfer (use --no-deps to avoid pulling torch)
+# Install flashinfer AND the cute-DSL it imports.
+#
+# This is the fix for the long-standing "cute-dsl skew" that made us strip
+# flashinfer entirely. Root cause (diagnosed 2026-11-02): flashinfer declares
+# `nvidia-cutlass-dsl>=4.6.2a0`, and we installed it with `--no-deps` -- which is
+# correct for keeping pip away from NGC's torch, but ALSO dropped cutlass-dsl. So
+# `import flashinfer` failed on a missing/stale `cutlass.cute`, the probe below
+# uninstalled it, and vLLM fell back to Triton/CUTLASS. The SAME `--no-deps`
+# dependency-dropping bug as tilelang's z3-solver.
+#
+# Why fix it rather than keep stripping -- and a correction to my first version
+# of this comment, which claimed GLM-5.3-Flash NEEDS flashinfer for sparse MLA.
+# It does not. Job 2673772 (2026-10-30) loaded and captured GLM-5.3-Flash with
+# flashinfer ABSENT: the selector logged
+#   "Using FLASH_ATTN_MLA_SPARSE attention backend out of potential backends:
+#    ['FLASH_ATTN_MLA_SPARSE', 'FLASHMLA_SPARSE']"
+# -- neither of which is a flashinfer backend -- plus DEEPGEMM for the FP8 MoE
+# and a PYNCCL fall-back for the all-reduce ("FlashInfer All Reduce is disabled
+# because flashinfer is not available"). So on Hopper the NoPE sparse-MLA path
+# is served by FlashAttention, and flashinfer is a PERFORMANCE option here, not
+# a requirement.
+#
+# It is still worth having: DeepSeek-V4.1-Flash asks for
+# `FLASHINFER_MLA_SPARSE_DSV41` by name, FlashInfer all-reduce and the
+# top-p/top-k sampler are otherwise unavailable to every preset, and shipping a
+# dependency-complete install is the point. But it must NOT gate a serve
+# attempt: nothing here blocks GLM-5.3-Flash.
+#
+# What changed upstream to make this fixable: the old conflict was real --
+# quack-kernels 0.6.4 pinned nvidia-cutlass-dsl==4.6.2 while vLLM v0.27.1 pinned
+# 4.6.0, mutually unsatisfiable, and bumping cutlass-dsl is what broke Ornith.
+# Modern vLLM pins a CONSISTENT set (v0.32.0: flashinfer 0.7.0.post1 +
+# cutlass-dsl 4.8.0 + quack 0.6.5), so matching vLLM's own pins is now coherent.
+#
+# Pins are READ FROM THE CLONED SOURCE rather than hardcoded, so this tracks
+# whatever VLLM_VERSION is being built instead of drifting out of date.
+VLLM_REQ_CUDA="/opt/vllm/requirements/cuda.txt"
+FI_PIN="$(grep -oE '^flashinfer-python==[^ ]+' "${VLLM_REQ_CUDA}" 2>/dev/null | head -1)"
+CUTLASS_PIN="$(grep -oE '^nvidia-cutlass-dsl(\[[a-z0-9]+\])?==[^ ]+' "${VLLM_REQ_CUDA}" 2>/dev/null | head -1)"
 echo ""
+echo "Installing the cute-DSL stack flashinfer imports..."
+echo "  vLLM pins: flashinfer='${FI_PIN:-<unpinned>}' cutlass-dsl='${CUTLASS_PIN:-<unpinned>}'"
+
+# cutlass-dsl WITH deps on purpose: it has NO torch dependency (verified on PyPI),
+# and its `[cu13]` extra resolves the nvidia-cutlass-dsl-libs-* packages that
+# `cutlass.cute` actually loads. --no-deps here would reproduce the original bug.
+pip install --no-cache-dir --root-user-action=ignore "${CUTLASS_PIN:-nvidia-cutlass-dsl[cu13]}" 2>&1 | tail -3 || {
+    echo "Warning: nvidia-cutlass-dsl install failed; flashinfer will not import."
+}
+
+# flashinfer itself stays --no-deps: it DOES declare torch, and letting pip resolve
+# that would replace NGC's build -- the one thing this whole script exists to avoid.
 echo "Installing flashinfer-python..."
-pip install --no-cache-dir --root-user-action=ignore --no-deps flashinfer-python 2>&1 | tail -5 || echo "flashinfer not available for ARM64, continuing..."
+pip install --no-cache-dir --root-user-action=ignore --no-deps "${FI_PIN:-flashinfer-python}" 2>&1 | tail -5 || echo "flashinfer not available for ARM64, continuing..."
+
+# NOTE: quack-kernels is deliberately NOT installed. It depends on torch, and our
+# PYPATCH_LL_BF16_QUACK / PYPATCH_HAS_CUTEDSL_QUACK patches exist precisely to make
+# vLLM's capability checks require quack so those cute-DSL kernel paths stay
+# DISABLED on this stack. Installing it would re-enable untested paths; flashinfer
+# needs cutlass-dsl, not quack. Keep the blast radius to the dependency that is
+# actually missing.
 
 # Install flash-attention for ARM64 (may need to build from source)
 # CRITICAL: Use --no-deps to prevent flash-attn from pulling in PyPI torch!
@@ -1915,12 +2002,27 @@ fi
 # left untouched. Idempotent. (Ornith also forces the Triton GDN prefill kernel at
 # serve time via --additional-config; see run_vllm_server.sh IS_ORNITH.)
 if python3 -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('flashinfer') else 1)" 2>/dev/null; then
-    if python3 -c "import flashinfer" 2>/dev/null; then
+    if python3 -c "import flashinfer" 2>/tmp/fi_probe.txt; then
         echo "[flashinfer] imports cleanly — keeping"
+        python3 -c "import flashinfer; print('[flashinfer] version:', getattr(flashinfer,'__version__','unknown'))" 2>/dev/null || true
+        python3 -c "import cutlass.cute as _c; print('[cute-dsl]   cutlass.cute imports OK')" 2>/dev/null \
+            || echo "[cute-dsl]   cutlass.cute does NOT import (flashinfer may still fail lazily)"
     else
-        echo "[flashinfer] present but import FAILS on this stack (cute-dsl skew) — uninstalling so vLLM falls back to Triton/CUTLASS"
+        # Print the ACTUAL error. The old code sent it to /dev/null, which is why
+        # "cute-dsl skew" was a guess for months rather than a diagnosis.
+        echo "[flashinfer] present but import FAILS — uninstalling so vLLM falls back to Triton/CUTLASS"
+        echo "[flashinfer] ---- why it failed ----"
+        tail -5 /tmp/fi_probe.txt | sed -e "s/^/[flashinfer]   /"
+        echo "[flashinfer] ------------------------"
+        echo "[flashinfer] NOTE: measured 2026-11-02 — this is SURVIVABLE. glm53_flash"
+        echo "[flashinfer]       served its NoPE sparse-MLA layers on FLASH_ATTN_MLA_SPARSE"
+        echo "[flashinfer]       and dsv41 uses FLASHMLA_SPARSE_DSV41; both are compiled"
+        echo "[flashinfer]       into vLLM and need no flashinfer. You lose FlashInfer"
+        echo "[flashinfer]       all-reduce and the FLASHINFER_* backend variants only."
+        echo "[flashinfer]       If the error names cutlass/cute, the cutlass-dsl pin is wrong."
         pip uninstall -y flashinfer-python flashinfer 2>/dev/null || true
     fi
+    rm -f /tmp/fi_probe.txt
 fi
 
 # Leave the vLLM SOURCE tree before importing: `pip install .` ran from /opt/vllm,
@@ -1986,6 +2088,27 @@ PREBUILT = bool(os.environ.get("OLIVIA_PREBUILT"))
 print("=" * 50)
 print("Final Installation Verification")
 print("=" * 50)
+
+# has_cutedsl() must agree with reality, or every dsv4/dsv41 worker dies INSIDE
+# the attention forward on `from quack.compile_utils import make_fake_tensor`.
+# Checked on the INSTALLED package because the patch is applied to the source
+# tree and only becomes real if `pip install .` carried it -- the failure mode
+# that made PYPATCH_HAS_CUTEDSL_QUACK a silent no-op for ten weeks.
+try:
+    from vllm.utils.import_utils import has_cutedsl, _has_module
+except ImportError:
+    # Older vLLM has no vllm/utils/import_utils.py, and no cute-dsl indexer
+    # paths to gate either. Nothing to verify.
+    print("\ncute-dsl gating: n/a for this vLLM (no vllm.utils.import_utils)")
+else:
+    _cut, _qk = _has_module("cutlass"), _has_module("quack")
+    print(f"\ncute-dsl gating: cutlass={_cut} quack={_qk} has_cutedsl()={has_cutedsl()}")
+    if _cut and not _qk and has_cutedsl():
+        print("  FAIL: cute-dsl present, quack absent, yet has_cutedsl() is True.")
+        print("        PYPATCH_HAS_CUTEDSL_QUACK did not survive the install.")
+        print("        dsv4/dsv41 WILL die in the attention forward. Do not deploy.")
+        sys.exit(1)
+    print("  OK: cute-dsl capability is reported honestly")
 
 # Check PyTorch
 import torch

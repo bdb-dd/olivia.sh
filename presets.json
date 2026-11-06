@@ -185,6 +185,23 @@
       "storage": "work",
       "description": "DeepSeek-V4-Flash-0731 MoE (256+1 experts, 6 active), block-FP8 ~167 GB, 1 node TP=4, 1M ctx via YaRN. ⚠️ BLOCKED on vLLM v0.27.1 + NGC 26.07: its compressor unconditionally uses cutedsl at head_dim=512 on CUDA, which needs `quack`, and quack-kernels pins nvidia-cutlass-dsl==4.6.2 against vLLM 4.6.0 — unsatisfiable. Preset kept for a future vLLM. See README"
     },
+    "dsv41": {
+      "aliases": [
+        "deepseek-v4.1",
+        "deepseek-v4.1-flash",
+        "dsv41flash",
+        "v41flash",
+        "deepseek_v41"
+      ],
+      "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+      "nodes": 1,
+      "gpus": 4,
+      "pp": 1,
+      "container_prefix": "glm53flash",
+      "index": 1,
+      "storage": "work",
+      "description": "DeepSeek-V4.1-Flash — 552B backbone + 196B Engram memory, 8B active per prompt token / 16B per output token, 40 layers, 384+1 experts (6 active), 1M ctx via YaRN, vision-language, MIT. Arch DeepseekV41ForCausalLM, native in vLLM from v0.30.0 → REUSES the glm53flash container (v0.32.1.dev0), no build. THE POINT OF THIS PRESET: Engram's 196.6B-param hash tables (259.5 GiB, ~47 GiB/rank at TP4) are SPARSELY accessed by token lookup, so `--engram-config {cpu_offload:true}` parks them in pinned Grace host memory and the 96 GB cards hold only the backbone. KV is near-free (890 B/token, FP4 latents shared across layers) so WEIGHTS, not cache, set capacity. ⚠️ Needs fp8 KV (like dsv4, INVERSE of GLM-5.3-Flash) and the FLASHINFER_MLA_SPARSE_DSV41 backend — so it is BLOCKED until flashinfer imports in our container. DSpark is the only spec-decode method (V4.1 dropped MTP)"
+    },
     "lagunas21": {
       "aliases": [
         "laguna-s-2.1",

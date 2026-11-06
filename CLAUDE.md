@@ -132,6 +132,7 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 | `glm52_awq` | `cyankiwi/GLM-5.2-AWQ-INT4` | **8 (2 nodes × 4)** | TP=4 + **PP=2**. AWQ/compressed-tensors INT4 (~411 GB) fits 8 GPUs, so it costs **8 GPU-h/hour instead of 12**. Same DSA skip-topk indexer as the FP8, so it needs PR#45895 → runs on the **glm53** (vLLM v0.27.1) container where that is native. Weights live on the **persistent** tier and are already cached. Auto-applies `VLLM_PP_LAYER_PARTITION=38,40` (see below). **Not yet served.** |
 | `glm53` | `zai-org/GLM-5.3-FP8` | 12 (3 nodes × 4) | GLM-5.2's **same base, re-post-trained** — identical arch, so it **reuses the glm52 container** (index 1, no rebuild) and inherits the whole 5.2 runtime profile. **Weights not public yet** (Z.ai promised them ~2 weeks after the 2026-08-14 launch); confirm the repo id when they land. |
 | `glm53_v27` | `zai-org/GLM-5.3-FP8` | 12 (3 nodes × 4) | Same model on its **own** `vllm-glm53-1` container built from **vLLM v0.27.1 + NGC 26.07**, no PR graft. The upgrade path off glm52's pinned-main build — **unvalidated**. |
+| `dsv41` | `deepseek-ai/DeepSeek-V4.1-Flash-1017` | **4 (1 node)** | **552B backbone + 196B Engram**, only 8B active per prompt token / 16B per output token. Arch `DeepseekV41ForCausalLM`, native from vLLM v0.30.0 -> **reuses the glm53flash container, no build**. vLLM sizes it at ~614 GB VRAM, which our 384 GB node cannot hold -- so `--engram-config {"cpu_offload":true}` moves the sparsely-accessed Engram tables (259.5 GiB, ~47 GiB/rank) into **pinned Grace host memory** and the cards hold only the backbone. **fp8 KV required** (inverse of GLM-5.3-Flash). ✅ **SERVES + BENCHED 2026-11-03** (job 2697324): 112 tok/s single, peak **2454 tok/s @64 streams**, decode flat across a 120x context range, 0 failures. Backend is **`FLASHMLA_SPARSE_DSV41`** (compiled into vLLM) — NOT the flashinfer variant; flashinfer is not needed. KV measured **1.08 GiB/rank = 229,815 tokens**, so the recipe's 890 B/token does not reconcile (~3.4-5 KB/token observed; the pool also funds the indexer, SWA and compressor caches). |
 | `glm53_flash` | `zai-org/GLM-5.3-Flash` | **4 (1 node)** | ⚠️ **A DIFFERENT MODEL from `glm53`, not a variant of it.** 320B total / 18B active, new arch `Glm5NextForConditionalGeneration`, new pretrain, natively multimodal. 34 KDA linear-attn + 11 NoPE sparse-MLA layers, 288 experts, mHC, native FP8 ~306 GiB, 1M ctx, MIT. **One node at TP=4.** Own container from **source: vLLM v0.32.0 + NGC 26.07** (`glm5_next` is native from v0.30.0). **Hopper: BF16 KV only.** |
 | `glm53_flash_prebuilt` | `zai-org/GLM-5.3-Flash` | 4 (1 node) | Same model from the **prebuilt** `vllm/vllm-openai:glm53-flash` image, container index 2. **Fallback only** — the primary path while `glm5_next` was in no public release; use if the source build regresses. |
 | `glm52_awq` (aliases `glm-5.2-awq`, `glm52awq`) | `cyankiwi/GLM-5.2-AWQ-INT4` | 8 (2 nodes × 4) | TP=4 + PP=2. **AWQ-INT4 (~415 GiB)** — fits 8×GH200 (the preferred path over 3-node FP8), **persistent** (projects) tier. **Reuses the glm52 container** (same vLLM main + PR#45895 + DeepGEMM — the DSA indexer needs are architectural, not FP8-specific); build `glm52`, serve `glm52_awq`. Same GLM-5.2 sparse-MLA → **bf16 KV** (no fp8 KV on GH200), eager. **Untested on-cluster:** MoE-FP16 kernel + the PP=2 indexer-aligned layer partition (`38,40`) need first-serve verification; multi-node PP wedge applies → proxy serialization. |
@@ -734,6 +735,134 @@ glm52 container is the fallback and needs no rebuild.
 CUDAGRAPH_MODE=PIECEWISE ./olivia.sh server start glm53_v27 --model RedHatAI/GLM-5.2-FP8
 ```
 
+### DeepSeek-V4.1-Flash (preset `dsv41`) — 748B on ONE node, via Grace memory
+
+The first preset where **non-HBM memory for cold parameters is the enabling trick**,
+not an optimisation.
+
+**The arithmetic.** vLLM's recipe sizes V4.1-Flash at **~614 GB of VRAM** — a GB200
+NVL4 tray (768 GB) or an 8-GPU H200 node (1128 GB). Our node is **4 × 96 = 384 GB**.
+It does not fit, and no quantisation choice closes that gap. What closes it is that
+~196.6B of those parameters are **Engram**: an n-gram conditional memory held by just
+**two layers (1 and 14)**, each a ~384M-row × 256 hash table, **accessed sparsely by
+token lookup**. Resident they cost **~47.2 GiB per rank at TP4** — half of every
+96 GB card. `--engram-config {"cpu_offload":true}` puts them in **pinned host
+memory** instead, leaving the GPUs holding only the backbone.
+
+**Why this suits GH200 particularly.** Grace sits behind **NVLink-C2C at ~900 GB/s**,
+roughly an order of magnitude above a PCIe host hop, with ~800 GB of LPDDR5X per node
+to hold the tables. A cold, sparsely-read structure behind a 900 GB/s link is close
+to the ideal case for host offload. It is also *finer grained* than our
+`CPU_OFFLOAD_GB` lever, which evicts by layer order and is blind to access frequency;
+this moves exactly the cold structure. `CPU_OFFLOAD_GB` still stacks on top if the
+backbone alone is tight.
+
+**KV is almost free, which is unusual here.** CSA2 assigns each attention layer one of
+three static modes (Full / Reindex / Reuse), sharing main KV and indexer K across
+layers, and the main KV is **FP4** (E2M1, one E4M3 scale per 16 channels) → **890
+bytes per token**, about a quarter of V4-Flash. A 1M-token prompt therefore holds
+under 1 GB of global KV. **Weights, not cache, set capacity** — the opposite of every
+other large preset here, and why raising `MAX_MODEL_LEN` is cheap on this one.
+
+| | `dsv4flash` (V4) | `dsv41` (V4.1) |
+|---|---|---|
+| arch | `DeepseekV4ForCausalLM` | **`DeepseekV41ForCausalLM`** |
+| KV per token | ~3.5 KB | **890 B** (FP4, shared across layers) |
+| spec decode | MTP (layout-mismatched, off) | **DSpark only — V4.1 DROPPED MTP** |
+| cold params | — | **196.6B Engram → host memory** |
+
+⚠️ **`DeepSeek-V4.1` contains `DeepSeek-V4` as a substring**, so `IS_DSV41` is tested
+first and `IS_DSV4` excludes it — the same trap GLM-5.3 vs GLM-5.3-Flash set.
+
+**Runtime (`IS_DSV41`):** `--tokenizer-mode deepseek_v41`, `deepseek_v41` tool and
+reasoning parsers, `--engram-config`, `--attention-config` (backend
+**`FLASHMLA_SPARSE_DSV41`** — the compiled path; indexer dtype left at `auto`,
+because `mxfp4` is Blackwell-only), **`--kv-cache-dtype fp8`
+(REQUIRED — the inverse of GLM-5.3-Flash, where fp8 KV is Blackwell-only)**,
+`--mm-encoder-tp-mode data`, `--max-num-seqs 128`, the DeepGEMM lane with warmup
+skipped, and `VLLM_ENGINE_READY_TIMEOUT_S=3600` because the first load is long.
+**This arch does not support torch.compile**, so the compilation config pins
+`cudagraph_mode=FULL_DECODE_ONLY`; the default `FULL_AND_PIECEWISE` dies at capture.
+
+> ✅ **NOT blocked — that claim was wrong, and three serve attempts proved it.**
+> v0.32.1 registers **three** V4.1 sparse-MLA backends, not one:
+> `FLASHMLA_SPARSE_DSV41` (vLLM's own compiled `_flashmla_C`),
+> `FLASHINFER_MLA_SPARSE_DSV41` (needs flashinfer) and `FLASHMLA_MEGA_ATTN_DSV41`
+> (same KV geometry — a drop-in A/B). **Only the middle one needs flashinfer**, and
+> the preset now defaults to the compiled path, so flashinfer is irrelevant here.
+>
+> ⚠️ **Do NOT set the indexer knobs from vLLM's recipe.** `indexer_kv_dtype=mxfp4`
+> requires **sm_10x (datacenter Blackwell)** and `indexer_sparse_logits` requires
+> mxfp4 **plus** an SM100-class GPU — both fatal on Hopper (job 2694626 died 25 s in,
+> *after* the Engram tables had offloaded). Leave `indexer_kv_dtype` unset so it
+> resolves to `auto` → **fp8**, the Hopper-correct value. Blackwell-only knobs stay
+> reachable via `DSV41_INDEXER_KV_DTYPE` / `DSV41_INDEXER_SPARSE_LOGITS`.
+> Losing sparse logits is a real cost — it would make the indexer pay O(candidate
+> blocks) instead of walking the whole context, and it "pays off roughly 32K and
+> beyond" — but it is a **silicon** limit (FP4 tensor cores), not a version gate.
+>
+> 🧠 **The Engram offload works, measured:** all four ranks log
+> `Engram table offloaded to pinned host memory: 96,002,514 rows x 256, 23.60 GiB
+> per rank` — per table, two Engram layers, so **~47.2 GiB/rank and ~188.8 GiB of
+> Grace LPDDR5X node-wide**, half the node's entire HBM. Read by **UVA** over
+> NVLink-C2C, not staged copies, which is why GH200 suits this at all.
+
+#### DeepSeek-V4.1-Flash Usage
+
+```bash
+# 1. Prefetch (~510 GB). Work tier: the persistent tier has ~173 GB free after Flash.
+./olivia.sh prefetch dsv41
+
+# 2. NO BUILD. DeepseekV41ForCausalLM is native from v0.30.0 and the glm53flash
+#    container is v0.32.1.dev0, so it already carries the arch.
+
+# 3. Serve on ONE node, TP=4, Engram in Grace memory. Use devel (see QOS above).
+#    PICK AN OPERATING POINT — the axes are opposed and no config wins both.
+#    All three measured 2026-11-06; see README "## Performance" for the numbers.
+
+# (a) BATCH THROUGHPUT — the default. 2454 tok/s @64 streams, 128 streams OK.
+#     Costs: 131K context, only 1.75x concurrency at the full window.
+QOS=devel TIME_LIMIT=02:00:00 ./olivia.sh server start dsv41
+
+# (b) LONG CONTEXT / CONCURRENCY — the FULL 1M native window, 11.3x at 128K.
+#     Costs ~30% throughput. Both knobs are REQUIRED: MAX_MODEL_LEN alone fails
+#     because the prefill workspace scales with it and eats the pool.
+MAX_MODEL_LEN=1048576 DSV41_SPARSE_MLA_WORKSPACE_FACTOR=2 CPU_OFFLOAD_GB=5 \
+  QOS=devel TIME_LIMIT=02:00:00 ./olivia.sh server start dsv41
+
+# (c) LOW LATENCY — DSpark speculative decode. 132.0 tok/s single-stream at 131K,
+#     the best measured. Costs 47% of aggregate at 16 streams, so NOT a default.
+#     The offload is not optional: DSpark's draft stages need resident memory.
+ENABLE_SPECULATIVE=1 CPU_OFFLOAD_GB=4 \
+  QOS=devel TIME_LIMIT=02:00:00 ./olivia.sh server start dsv41
+
+./olivia.sh server watch
+
+# Fallback / tuning ladder, revised against measurement:
+#   a) MORE CONCURRENCY. Short context is capped by our own MAX_NUM_SEQS=128, not
+#      by the pool (which holds ~217 streams at 1K). Long context is pool-bound:
+#      1.75x at 131072. gpu_memory_utilization is NOT a lever — it is already at
+#      its ceiling (the allocator fails to map 20 MB with ~20 MB free).
+#   b) LONGER CONTEXT. Raising MAX_MODEL_LEN alone FAILS: the sparse-MLA prefill
+#      workspace scales with it (factor x max_model_len x 1152 B), so 262144 at
+#      the default factor 5 shrank the pool 1.08 -> 0.59 GiB and vLLM refused
+#      (0.84 GiB needed for one request). Pair it with
+#      DSV41_SPARSE_MLA_WORKSPACE_FACTOR=2.
+#   c) backbone/pool still tight -> CPU_OFFLOAD_GB (stacks on Engram; Grace has
+#      ~800 GB). Treat the first run as measuring the weight-GB -> KV-GB rate.
+#   d) capture problems -> DSV41_CUDAGRAPH_MODE=NONE
+#   e) single-stream speed -> ENABLE_SPECULATIVE=1 (DSpark; never MTP, which V4.1
+#      dropped and vLLM rejects). num_speculative_tokens must be 5, the trained
+#      dspark_block_size — it is NOT derived; the pydantic validator demands it
+#      before vLLM's own `num_speculative_tokens = block_size` line can run.
+#      ⚠️ DSPARK IS MEMORY-GATED, SO IT MUST COME AFTER (c), NOT BEFORE.
+#      Its draft stages (dspark_target_layer_ids [37,38,39], each a 128-expert
+#      MoE) have to be resident. At the default budget job 2730626 loaded fine
+#      and then died at 9m54s with `No available memory for the cache blocks`
+#      — there is no KV headroom left to pay for the draft. Pair it with
+#      CPU_OFFLOAD_GB rather than running it on a bare config.
+```
+
 ### GLM-5.3-Flash (presets `glm53_flash` / `glm53_flash_prebuilt`) — 320B on ONE node
 
 ⚠️ **`GLM-5.3-Flash` is not a variant of `GLM-5.3`. They are different models, and
@@ -778,11 +907,27 @@ Verified from the published `config.json` + `model.safetensors.index.json`
    three different KV-dtype rules across four MLA-family models, so **never
    generalise a KV-dtype setting between them.** The server script clears a stray
    `KV_CACHE_DTYPE=fp8*` with a warning (`FORCE_KV_CACHE_DTYPE=1` overrides).
-2. **FlashInfer ≥ 0.6.18** is required for NoPE sparse MLA (`qk_rope_head_dim=0`).
-   The recipe's own troubleshooting maps "Sparse-MLA initialization error" to an
-   older FlashInfer. The glm53 container has 0.6.17 — **which is why that container
-   cannot be reused here.** The v0.32.0 build pulls **0.7.0.post1**, so the source
-   build clears this on its own; it only needs checking if you pin an older vLLM.
+2. ~~**FlashInfer ≥ 0.6.18** is required for NoPE sparse MLA~~ — **MEASURED FALSE
+   on Hopper.** The recipe says so and maps "Sparse-MLA initialization error" to an
+   older FlashInfer, but job 2673772 loaded this model and captured CUDA graphs
+   51/51 + 2/2 with **flashinfer entirely absent**: the selector logged `Using
+   FLASH_ATTN_MLA_SPARSE attention backend out of potential backends:
+   ['FLASH_ATTN_MLA_SPARSE', 'FLASHMLA_SPARSE']` — neither is a flashinfer backend —
+   with PYNCCL all-reduce and DEEPGEMM FP8 MoE. The NoPE sparse-MLA path is served by
+   **FlashAttention** here. What flashinfer's absence actually costs is FlashInfer
+   all-reduce and the `FLASHINFER_*` backend variants, not the ability to serve.
+
+3. **THE REAL BLOCKER WAS `max_num_seqs`.** `glm5_next` is a hybrid, and each of its
+   34 KDA linear-attention layers holds a per-sequence recurrent state that vLLM
+   accounts for as a **"Mamba cache block"** — one per decode sequence, drawn from
+   the same budget as KV. At TP=4 / util 0.9 that budget is 2.52 GiB/rank = **202
+   blocks**, against vLLM's default `max_num_seqs` of **1024**. So the engine died
+   **8.6 minutes in, AFTER a full weight load and a clean capture**:
+   `ValueError: max_num_seqs (1024) exceeds available Mamba cache blocks (202)`.
+   Capped at **128** (`GLM53_FLASH_MAX_NUM_SEQS`) — deliberately well under 202,
+   because the count drifts with memory-profiling noise and the KV pool binds first
+   at every usable context anyway (1.59x at 131072), so margin beats headroom we
+   cannot reach.
 
 **Version floor: v0.30.0, and the recipe page is wrong about it.** vLLM's recipe
 says "vLLM 0.29.0+". That is incorrect — **v0.29.0's `registry.py` contains zero
@@ -864,17 +1009,17 @@ BUILD_TIME_LIMIT=02:30:00 ./olivia.sh build glm53_flash --sif
 QOS=devel TIME_LIMIT=02:00:00 ./olivia.sh server start glm53_flash
 ./olivia.sh server watch
 #
-#    ⚠️ FIRST-SERVE UNKNOWN: FlashInfer is NOT in this container — the build
-#    installs it then uninstalls it, because `import flashinfer` fails on this stack
-#    (cute-dsl skew) and our Ornith-era guard strips it. vLLM's recipe says
-#    FlashInfer >=0.6.18 is required for the NoPE sparse-MLA layers (11 of 45). It
-#    may still work via vLLM's own compiled _flashmla_C (GLM-5.2's DSA served on
-#    Hopper without flashinfer). If engine init dies with a sparse-MLA
-#    initialisation error, THAT is the cause, and the fix is to resolve the cute-dsl
-#    skew so flashinfer imports — not to drop it.
+#    ✅ ANSWERED (job 2673772): flashinfer is NOT needed. The model loads and
+#    captures 51/51 + 2/2 without it, on FLASH_ATTN_MLA_SPARSE. The "cute-dsl skew"
+#    was also our own bug — `--no-deps` silently dropped flashinfer's
+#    nvidia-cutlass-dsl dependency — fixed in 36c7858, but it gates nothing.
+#    What this preset still needs is one serve to validate the max_num_seqs cap.
 
 # Fallback ladder, in the order to try it:
-#   a) KV pool too small / OOM at init   -> GPU_MEM_UTIL=0.93 (then 0.94)
+#   a) KV pool too small -> NOT GPU_MEM_UTIL. Measured: 0.90 is already the
+#      ceiling — the allocator failed to map 20 MB with ~14 MB free on all four
+#      ranks, so 0.93/0.94 OOM earlier. Lower MAX_MODEL_LEN instead (concurrency
+#      is pool / context), or CPU_OFFLOAD_GB.
 #   b) CUDAGraph capture IMA (upstream #54317, seen on 4×B200)
 #                                        -> CUDAGRAPH_MODE=NONE (eager, like glm52/kimi)
 #   c) once it serves clean, THEN try    -> ENABLE_SPECULATIVE=1   (MTP, ~7 GiB)

@@ -297,19 +297,51 @@
     "ornith": {
       "aliases": [
         "ornith-397b",
-        "ornith-1.0-397b",
+        "ornith-1.5-397b",
         "ornith397b",
-        "ornith-1.0",
+        "ornith-1.5",
         "ornith-flagship"
       ],
-      "model": "deepreinforce-ai/Ornith-1.0-397B-FP8",
+      "model": "ornith-ai/Ornith-1.5-397B-FP8",
       "nodes": 2,
       "gpus": 4,
       "pp": 2,
-      "container_prefix": "ornith",
+      "container_prefix": "glm53flash",
       "index": 1,
       "storage": "work",
-      "description": "Ornith 1.0 397B MoE (Qwen3.5) flagship, block-FP8 (~400 GB), 2-node TP=4+PP=2, native MTP (PP-gated), 256K ctx"
+      "description": "Ornith 1.5 397B MoE (Qwen3.5 hybrid GDN+full attn, 512 experts top-10) flagship, channel/token FP8 W8A8 (418 GB), 2-node TP=4+PP=2, 256K ctx (1M via YaRN). 1.5's FP8 SHIPS the MTP head (1.0's did not). Runs on the glm53flash container (vLLM v0.32.1; qwen3_5_moe native since 0.19.1) — no build"
+    },
+    "ornith_1n": {
+      "aliases": [
+        "ornith-1n",
+        "ornith-397b-1node",
+        "ornith-offload",
+        "ornith_offload"
+      ],
+      "model": "ornith-ai/Ornith-1.5-397B-FP8",
+      "nodes": 1,
+      "gpus": 4,
+      "pp": 1,
+      "container_prefix": "glm53flash",
+      "index": 1,
+      "storage": "work",
+      "description": "Ornith 1.5 397B on ONE node (TP=4) — the dsv41 lesson: 418 GB of weights exceed 384 GB of HBM, so CPU_OFFLOAD_GB parks the excess in Grace LPDDR5X behind NVLink-C2C. Same weights as `ornith`; halves the GPU count and avoids the 2-node PP path"
+    },
+    "ornith_122b": {
+      "aliases": [
+        "ornith-122b",
+        "ornith-1.5-122b",
+        "ornith122b",
+        "ornith-122b-a10b"
+      ],
+      "model": "ornith-ai/Ornith-1.5-122B-FP8",
+      "nodes": 1,
+      "gpus": 4,
+      "pp": 1,
+      "container_prefix": "glm53flash",
+      "index": 1,
+      "storage": "projects",
+      "description": "Ornith 1.5 122B-A10B MoE (NEW size; Qwen3.5 hybrid GDN+full attn, 48 layers, 256 experts top-8) channel/token FP8 W8A8 (133 GB), single node TP=4, 256K ctx (1M via YaRN), MTP head shipped. Runs on the glm53flash container — no build"
     },
     "ornith_gh200": {
       "aliases": [

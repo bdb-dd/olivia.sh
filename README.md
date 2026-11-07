@@ -267,6 +267,7 @@ actually spend.
 | `qwen38` | 27B dense FP8 | 1 | 3,162 tok/s | **3,162** |
 | `borealis` | 27B Gemma-3 BF16 | 1 | 2,666 tok/s | **2,666** |
 | `lagunas21` | Laguna S 2.1 FP8 | 4 | 7,751 tok/s | **1,938** |
+| `ornith_122b` | Ornith 1.5 122B-A10B FP8 | 4 | 2,770 tok/s | **693** |
 | `dsv41` | **748B** + Engram offload | 4 | 2,465 tok/s | **616** |
 | `laguna` | Laguna M.1 FP8 | 4 | 2,056 tok/s | **514** |
 | `glm53_flash` | 320B/18B `glm5_next` | 4 | 695 tok/s | **174** |
@@ -285,6 +286,34 @@ and among the large models **`dsv41` is the standout** — 616 tok/s/GPU against
 a comparable parameter count, i.e. ~18× better use of the same allocation. `dsv41` is also the
 only large preset serving a **1M context** (see its section for the three operating points).
 Presets not listed have never served: `glm53`, `glm52_awq`, `dsv4flash` (blocked), `glm47`.
+
+### Ornith 1.5 `ornith_122b` — 122B-A10B FP8, 1 node × 4 GH200, TP=4 · 2026-11-08 (job 2754478)
+
+**New size in 1.5. Serves first time, no build** — `vllm-glm53flash-1-sandbox` (vLLM
+v0.32.1, transformers 5.19) carries `qwen3_5_moe` natively. Load **51 s**, 30.01 GiB/GPU,
+PIECEWISE + FULL CUDA graphs captured clean. **KV pool 52.95 GiB/GPU = 4,503,736 tokens,
+17.18× concurrency at the full 262,144 window** — only 12 of 48 layers hold KV (3:1
+GDN:full) with 2 KV heads, so the pool is ~20× dsv41's. Baseline config: spec decode off,
+`max_num_seqs` 128, prefix caching on, Triton GDN prefill, native 256K (no YaRN).
+
+`sweep_context_matrix.sh`, `max_tokens=200`, reasoning on, 0 failures in every cell:
+
+| context (actual tokens) | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| 1,040 — per-stream tok/s | **119.2** | 104.4 | 95.6 | 89.6 | 70.1 | 56.6 | 44.0 |
+| 1,040 — aggregate tok/s | 119.1 | 207.8 | 381.7 | 715.1 | 1,115 | 1,793 | **2,770** |
+| 8,036 — per-stream | 116.9 | | 93.5 | | 68.6 | | 45.7 |
+| 8,036 — aggregate | 116.0 | | 366.5 | | 1,049 | | 2,643 |
+| 32,012 — per-stream | 111.6 | | 87.5 | | 54.2 | | |
+| 127,922 — per-stream | 93.4 | | 69.7 | | | | |
+| 255,799 — per-stream | 71.8 | 62.6 | | | | | |
+
+- **Best single-node aggregate measured here** (dsv41 peaked at 2,465), at ~10B active.
+- Decode is **flat to 32K** (−6%) and keeps **60% of short-context speed at the full 256K**.
+- ⚠️ Read **per-stream** at long context: `agg_tok_s` includes client-side prompt
+  construction (a 256K prompt is ~1.4 MB of text), so it understates the server.
+- ⚠️ TTFTs (0.18 s @1K → 0.95 s @256K) are **prefix-cache warm** — each cell's discarded
+  warm-up pass sends the same prompt. They are not cold-prefill figures.
 
 ### Ornith 1.0 `ornith_gh200` — 35B MoE FP8 on 1× GH200, CUDAGraph · 2026-07-16/17
 Concurrency sweep (`bench_sweep.py`, `max_tokens=512`, warm/JIT-cached pass on the pinned-commit rebuild):

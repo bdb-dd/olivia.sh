@@ -241,7 +241,9 @@ export ANTHROPIC_BASE_URL=http://localhost:8002 ANTHROPIC_AUTH_TOKEN=x && claude
 | `kimi` | `moonshotai/Kimi-K2.6` | 8 (2 nodes × 4) | `vllm-kimi-4` | TP=4 + PP=2, native int4, MLA, multimodal, vLLM 0.21. Eager. reasoning_tokens on chat/completions |
 | `kimi27` | `moonshotai/Kimi-K2.7-Code` | 8 (2 nodes × 4) | `vllm-kimi-4` (shared) | Same arch + container as K2.6 (no rebuild); thinking-only |
 | `laguna` | `poolside/Laguna-M.1-FP8` | 4 | `vllm-laguna-1` | TP=4, single node. FP8 (~225 GB), dense attention (FLASH_ATTN), CUDAGraph on. vLLM v0.21.0, `poolside_v1` parsers |
-| `ornith` | `deepreinforce-ai/Ornith-1.0-397B-FP8` | 8 (2 nodes × 4) | `vllm-ornith-1` | **397B flagship.** TP=4 + PP=2, FP8 W8A8 (~400 GB). Qwen3.5 hybrid-attn MoE, 256K ctx, PIECEWISE capture + engine-as-actor Ray. MTP off (no head in FP8). Same multi-node PP wedge risk as glm51. vLLM main, transformers ≥5.8.1 |
+| `ornith` | `ornith-ai/Ornith-1.5-397B-FP8` | 8 (2 nodes × 4) | `vllm-glm53flash-1` (shared) | **Ornith 1.5 397B flagship.** TP=4 + PP=2, FP8 W8A8 (418 GB), 256K ctx. No build — qwen3_5_moe is native in the v0.32.1 container. 1.5 ships the MTP head (opt-in). *1.5 not yet run on 2 nodes; the measured 2-node row below is 1.0* |
+| `ornith_1n` | `ornith-ai/Ornith-1.5-397B-FP8` | **4 (1 node)** | `vllm-glm53flash-1` (shared) | **The 397B on ONE node**: 30 GiB/GPU of routed experts in Grace memory (`--cpu-offload-params experts`). ✅ Serves: 50 tok/s single-stream, 1.14M-token pool; aggregate capped by offload bandwidth (219 @64) |
+| `ornith_122b` | `ornith-ai/Ornith-1.5-122B-FP8` | 4 (1 node) | `vllm-glm53flash-1` (shared) | **New in 1.5.** 122B-A10B, FP8 W8A8 (133 GB, persistent tier), TP=4. ✅ **192 tok/s single-stream, 3,300 @64 with MTP (default on)**, 4.5M-token pool, 17× @256K |
 | `ornith_gh200` | `deepreinforce-ai/Ornith-1.0-35B-FP8` | 1 | `vllm-ornith-1` (shared) | **35B on a single GH200 card** (TP=1), ~3B active, hybrid linear+full attn, multimodal, 256K ctx — max single-user throughput. MTP off (no head in FP8). Shares the `ornith` container, `qwen3_xml`/`qwen3` parsers |
 | `gemma4` | Gemma 4 (31B, multimodal) | 1–2 | `vllm-gemma4-1` | vLLM v0.19.0, AWQ |
 | `devstral` | `mistralai/Devstral-2-123B-Instruct-2512` | 4 | `vllm-devstral-1` | TP=4 |
@@ -267,12 +269,13 @@ actually spend.
 | `qwen38` | 27B dense FP8 | 1 | 3,162 tok/s | **3,162** |
 | `borealis` | 27B Gemma-3 BF16 | 1 | 2,666 tok/s | **2,666** |
 | `lagunas21` | Laguna S 2.1 FP8 | 4 | 7,751 tok/s | **1,938** |
-| `ornith_122b` | Ornith 1.5 122B-A10B FP8 | 4 | 2,770 tok/s | **693** |
+| `ornith_122b` | Ornith 1.5 122B-A10B FP8, MTP | 4 | 3,300 tok/s | **825** |
 | `dsv41` | **748B** + Engram offload | 4 | 2,465 tok/s | **616** |
 | `laguna` | Laguna M.1 FP8 | 4 | 2,056 tok/s | **514** |
 | `glm53_flash` | 320B/18B `glm5_next` | 4 | 695 tok/s | **174** |
 | `glm51` | 744B AWQ | 8 | 895 tok/s | **112** |
-| `ornith` | 397B MoE FP8 | 8 | 845 tok/s | **106** |
+| `ornith` (1.0) | Ornith 1.0 397B MoE FP8, 2 nodes | 8 | 845 tok/s | **106** |
+| `ornith_1n` | Ornith 1.5 397B, 1 node, 30 GiB experts in Grace | 4 | 219 tok/s | **55** |
 | `kimi27` | 1T int4, eager | 8 | 591 tok/s | **74** |
 | `glm52` | 744B FP8, eager | 12 | 419 tok/s | **35** |
 
@@ -314,6 +317,76 @@ GDN:full) with 2 KV heads, so the pool is ~20× dsv41's. Baseline config: spec d
   construction (a 256K prompt is ~1.4 MB of text), so it understates the server.
 - ⚠️ TTFTs (0.18 s @1K → 0.95 s @256K) are **prefix-cache warm** — each cell's discarded
   warm-up pass sends the same prompt. They are not cold-prefill figures.
+
+#### `ornith_122b` + MTP — the shipped head, now the default · 2026-11-08 (job 2754533)
+
+`ENABLE_SPECULATIVE=1 ORNITH_SPEC_METHOD=mtp` (2 draft tokens). The head costs 1.2 GiB/GPU;
+KV pool 4.50M → **3.89M tokens (14.85× @256K)**. **Mean acceptance length 2.17.** 0 failures.
+
+| context | 1 stream: base → MTP | 4 streams (per-stream) | 16 streams (per-stream) | 64 streams (aggregate) |
+|---|---|---|---|---|
+| 1K | 119.2 → **192.1** (+61%) | 95.6 → 131.6 | 70.1 → 101.4 | 2,770 → **3,300** (+19%) |
+| 8K | 116.9 → 191.5 (+64%) | 93.5 → 138.1 | 68.6 → 91.4 | 2,643 → 2,578 (−2.5%) |
+| 32K | 111.6 → 183.2 (+64%) | 87.5 → 132.7 | 54.2 → 82.6 | |
+| 128K | 93.4 → 142.5 (+53%) | 69.7 → 88.2 | | |
+| 256K | 71.8 → 100.8 (+40%) | (2 streams) 62.6 → 84.5 | | |
+
+**192 tok/s is the fastest single stream of any preset** (ornith_gh200's 35B on one card:
+174). And unlike dsv41's DSpark (−47% aggregate @16), MTP here is **neutral-to-positive at
+batch** — 8K @64 is the only cell that regressed. So **MTP is now ON by default for the
+122B** (`ENABLE_SPECULATIVE=0` to disable); other Ornith sizes stay opt-in until measured.
+
+#### `ornith_122b` @ 1M via the model card's YaRN recipe — ❌ RUNS, BUT IS WRONG · 2026-11-08 (job 2754537)
+
+`MAX_MODEL_LEN=1048576` + the card's `--hf-overrides '{"rope_scaling": {yarn, factor 4}}'`.
+Pool 4,598,409 tokens (4.39× @1M), and the throughput matrix looks healthy all the way out —
+**an 878,117-token request decoded at 36.2 tok/s with 0 failures** (511K: 41.5). It means
+nothing. `needle_probe.py` (passcode planted at 2% depth, asked for at the end):
+
+| prompt tokens | passcode recovered | answer |
+|---|---|---|
+| 33,975 | ✅ | correct |
+| 207,148 | ✅ | correct (inside the native 262,144) |
+| **621,676** | ❌ | `ductductductductduct…` |
+
+**The card's recipe is a silent no-op on vLLM.** Ornith is `…ForConditionalGeneration`; the
+rotary embedding is built from `text_config.rope_parameters`, and vLLM applies a top-level
+`rope_scaling` override to the *outer* config, where nothing reads it. Only
+`VLLM_ALLOW_LONG_MAX_MODEL_LEN` lets the window grow, so every position past 262,144 runs on
+untrained plain M-RoPE. `ORNITH_YARN_FACTOR` now overrides `text_config` instead (commit
+`c7778ab`); its verification run is below. ⚠️ **Lesson: a throughput sweep cannot detect a
+broken position encoding — verify long context with a needle, not with tok/s.**
+
+### Ornith 1.5 `ornith_1n` — 397B on ONE node, experts in Grace memory · 2026-11-08 (job 2754516)
+
+The flagship's 418 GB (~97.4 GiB/GPU) exceeds a whole 96 GB card, so the dsv41 lesson
+applies — but refined: `CPU_OFFLOAD_GB=30` restricted to **`--cpu-offload-params experts`**
+(new in vLLM 0.32), so only routed-expert weights live in Grace LPDDR5X and are read by
+zero-copy UVA over NVLink-C2C. Logged **30.17 GiB/GPU offloaded**, 64.83 GiB/GPU resident,
+load 252 s, CUDA graphs clean, **KV 16.79 GiB/GPU = 1,142,125 tokens (4.36× @256K)**.
+0 failures.
+
+| context | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| 1K — per-stream tok/s | **50.3** | 33.1 | 21.8 | 13.7 | 8.2 | 5.1 | 3.4 |
+| 1K — aggregate | 50.3 | 66.0 | 87.2 | 109.3 | 130.7 | 164.0 | **218.8** |
+| 8K — per-stream | 50.7 | | 22.3 | | 8.6 | | |
+| 32K — per-stream | 49.7 | | 22.4 | 13.9 | | | |
+| 128K — per-stream | 45.4 | 31.9 | | | | | |
+| 256K — per-stream | 40.5 | | | | | | |
+
+**What it shows — the expert-offload hypothesis was half right.**
+- ✅ Single stream works: **50 tok/s**, and flat with context (−20% at 256K). At batch 1 each
+  token touches 10 of 512 experts, so only their rows cross C2C. A layer-order offload of
+  the same 30 GiB would stream *all* of it every step (~70 ms/step at ~450 GB/s → ≤14 tok/s).
+- ❌ Batch does not scale: aggregate **131 @16, 219 @64**. With more sequences per step,
+  top-10-of-512 routing touches nearly every expert, so each step reads most of the 30 GiB
+  over C2C — the ~70 ms/step floor above, ≈8 tok/s/stream at 16. **Offloaded bytes per step
+  are the ceiling, so the lever is the dsv41 rule: offload the minimum.** 20 GiB and
+  20 GiB + MTP are queued next.
+- For reference, the 1.0 397B on **2 nodes** (no offload) reached 81.5 single / 845 @16. One
+  node halves the GPUs and avoids cross-node PP, but at batch the 2-node shape is far better
+  per GPU (106 vs 33 tok/s/GPU @16). Use `ornith_1n` for **single-user / scarce-node** work.
 
 ### Ornith 1.0 `ornith_gh200` — 35B MoE FP8 on 1× GH200, CUDAGraph · 2026-07-16/17
 Concurrency sweep (`bench_sweep.py`, `max_tokens=512`, warm/JIT-cached pass on the pinned-commit rebuild):

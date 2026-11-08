@@ -1380,7 +1380,14 @@ elif [[ "${ENABLE_SPECULATIVE}" == "auto" ]]; then
     # Ornith 1.5 DOES ship the head, but it stays opt-in until measured here:
     # spec decode trades aggregate for single-stream (dsv41's DSpark lost 47% at
     # 16 streams), so it is an operating point, not a free default.
-    if [[ "${IS_ORNITH15}" == "1" && "${ENABLE_SPECULATIVE}" == "auto" ]]; then
+    # EXCEPT the 122B, where it is MEASURED (job 2754533 vs baseline 2754478,
+    # 2026-11-08): MTP x2 accepts 2.17 tokens/step, +40..64% single-stream at
+    # every context 1K-256K, +19% aggregate @64 at 1K, -2.5% @64 at 8K (the only
+    # regression), for 1.2 GiB/GPU and 4.50M -> 3.89M KV tokens. So on by default.
+    if [[ "${IS_ORNITH15}" == "1" && "${MODEL}" == *"122B"* && "${ENABLE_SPECULATIVE}" == "auto" ]]; then
+        USE_SPECULATIVE=1
+        echo "[INFO] Ornith 1.5 122B: MTP ON by default (measured +61% single-stream). ENABLE_SPECULATIVE=0 to disable."
+    elif [[ "${IS_ORNITH15}" == "1" && "${ENABLE_SPECULATIVE}" == "auto" ]]; then
         echo "[INFO] Ornith 1.5: spec decode OFF by default (MTP head IS shipped; DFlash drafter exists for 35B/397B). ENABLE_SPECULATIVE=1 [ORNITH_SPEC_METHOD=mtp|dflash] to enable."
     elif [[ "${IS_ORNITH}" == "1" && "${ENABLE_SPECULATIVE}" == "auto" ]]; then
         echo "[INFO] Ornith 1.0: MTP speculative decode OFF (FP8 checkpoint ships no MTP weights). ENABLE_SPECULATIVE=1 to force."
@@ -1965,11 +1972,24 @@ if [[ "${IS_ORNITH}" == "1" ]]; then
     if [[ -n "${ORNITH_MAX_NUM_SEQS}" ]]; then
         VLLM_ARGS+=("--max-num-seqs" "${ORNITH_MAX_NUM_SEQS}")
     fi
-    # YaRN, exactly as the 1.5 model card gives it for vLLM. MAX_MODEL_LEN must
-    # also be raised (the caller sets it; the 256K default is not changed here).
+    # YaRN. ⚠️ NOT the model card's form. The card gives a TOP-LEVEL
+    #   --hf-overrides '{"rope_scaling": {...}}'
+    # but Ornith is Qwen3_5MoeForConditionalGeneration: the text model builds its
+    # rotary embedding from text_config.rope_parameters (qwen3_5.py: get_rope(...,
+    # rope_parameters=config.rope_parameters)), and vLLM's _apply_dict_overrides
+    # just setattr()s a top-level `rope_scaling` onto the OUTER multimodal config,
+    # where nothing reads it. So the card's recipe leaves plain M-RoPE in place
+    # and only VLLM_ALLOW_LONG_MAX_MODEL_LEN lets the window exceed 262144 — the
+    # positions past it are untrained. Target the nested text config instead;
+    # _update_nested MERGES dicts, so mrope_section/interleaved/partial_rotary/
+    # theta are kept and only the scaling keys are added. vLLM's yarn branch
+    # builds MRotaryEmbedding(scaling_factor=...), so YaRN+M-RoPE is supported.
+    # max_position_embeddings is raised too: for yarn vLLM treats it as ALREADY
+    # scaled (config/model.py), so this is what lifts the derived max_model_len.
+    # MAX_MODEL_LEN must still be raised by the caller (the 256K default stays).
     if [[ -n "${ORNITH_YARN_FACTOR}" ]]; then
-        export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-        VLLM_ARGS+=("--hf-overrides" "{\"rope_scaling\": {\"rope_type\": \"yarn\", \"factor\": ${ORNITH_YARN_FACTOR}, \"original_max_position_embeddings\": 262144}}")
+        _YARN_MAXPOS=$(awk -v f="${ORNITH_YARN_FACTOR}" 'BEGIN{printf "%d", 262144*f}')
+        VLLM_ARGS+=("--hf-overrides" "{\"text_config\": {\"rope_parameters\": {\"rope_type\": \"yarn\", \"factor\": ${ORNITH_YARN_FACTOR}, \"original_max_position_embeddings\": 262144}, \"max_position_embeddings\": ${_YARN_MAXPOS}}}")
     fi
 fi
 

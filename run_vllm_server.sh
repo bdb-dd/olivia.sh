@@ -839,8 +839,15 @@ fi
 #     DOWN by measurement — dsv41's rule is "use the minimum that reaches the
 #     target".
 if [[ "${IS_ORNITH_397B}" == "1" && "${NUM_NODES}" -le 1 ]]; then
+    # MEASURED 2026-11-08 (experts-only, 0 failures each):
+    #   30 GiB (job 2754516): 50.3 single, 219 @64, pool 1,142,125 tokens
+    #   20 GiB (job 2760309): 59.3 single, 299 @64, pool   458,494 tokens (1.75x @256K)
+    # and a layer-order 20 GiB control (2759654): 38.7 single, 274 @64. So 20 is
+    # the default — every GiB offloaded is a GiB read over C2C per step under
+    # batch. Raise it only to buy KV pool (~1 GiB of pool per GiB, the dsv41
+    # rate) for more concurrent long-context streams.
     if [[ -z "${CPU_OFFLOAD_GB:-}" ]]; then
-        CPU_OFFLOAD_GB=30
+        CPU_OFFLOAD_GB=20
         echo "[INFO] single-node Ornith 397B: defaulting CPU_OFFLOAD_GB=${CPU_OFFLOAD_GB} — weights exceed HBM"
     fi
     # Experts-only whenever offloading on this shape, even if only the GB was

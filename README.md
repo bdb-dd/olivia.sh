@@ -242,7 +242,7 @@ export ANTHROPIC_BASE_URL=http://localhost:8002 ANTHROPIC_AUTH_TOKEN=x && claude
 | `kimi27` | `moonshotai/Kimi-K2.7-Code` | 8 (2 nodes × 4) | `vllm-kimi-4` (shared) | Same arch + container as K2.6 (no rebuild); thinking-only |
 | `laguna` | `poolside/Laguna-M.1-FP8` | 4 | `vllm-laguna-1` | TP=4, single node. FP8 (~225 GB), dense attention (FLASH_ATTN), CUDAGraph on. vLLM v0.21.0, `poolside_v1` parsers |
 | `ornith` | `ornith-ai/Ornith-1.5-397B-FP8` | 8 (2 nodes × 4) | `vllm-glm53flash-1` (shared) | **Ornith 1.5 397B flagship.** TP=4 + PP=2, FP8 W8A8 (418 GB), 256K ctx. No build — qwen3_5_moe is native in the v0.32.1 container. 1.5 ships the MTP head (opt-in). *1.5 not yet run on 2 nodes; the measured 2-node row below is 1.0* |
-| `ornith_1n` | `ornith-ai/Ornith-1.5-397B-FP8` | **4 (1 node)** | `vllm-glm53flash-1` (shared) | **The 397B on ONE node**: 30 GiB/GPU of routed experts in Grace memory (`--cpu-offload-params experts`). ✅ Serves: 50 tok/s single-stream, 1.14M-token pool; aggregate capped by offload bandwidth (219 @64) |
+| `ornith_1n` | `ornith-ai/Ornith-1.5-397B-FP8` | **4 (1 node)** | `vllm-glm53flash-1` (shared) | **The 397B on ONE node**: 20 GiB/GPU of routed experts in Grace memory (`--cpu-offload-params experts`). ✅ Serves: **59 tok/s single-stream, 299 @64** at the 20 GiB default (458K-token pool); aggregate is offload-bandwidth-bound |
 | `ornith_122b` | `ornith-ai/Ornith-1.5-122B-FP8` | 4 (1 node) | `vllm-glm53flash-1` (shared) | **New in 1.5.** 122B-A10B, FP8 W8A8 (133 GB, persistent tier), TP=4. ✅ **192 tok/s single-stream, 3,300 @64 with MTP (default on)**, 4.5M-token pool, 17× @256K |
 | `ornith_gh200` | `deepreinforce-ai/Ornith-1.0-35B-FP8` | 1 | `vllm-ornith-1` (shared) | **35B on a single GH200 card** (TP=1), ~3B active, hybrid linear+full attn, multimodal, 256K ctx — max single-user throughput. MTP off (no head in FP8). Shares the `ornith` container, `qwen3_xml`/`qwen3` parsers |
 | `gemma4` | Gemma 4 (31B, multimodal) | 1–2 | `vllm-gemma4-1` | vLLM v0.19.0, AWQ |
@@ -275,7 +275,7 @@ actually spend.
 | `glm53_flash` | 320B/18B `glm5_next` | 4 | 695 tok/s | **174** |
 | `glm51` | 744B AWQ | 8 | 895 tok/s | **112** |
 | `ornith` (1.0) | Ornith 1.0 397B MoE FP8, 2 nodes | 8 | 845 tok/s | **106** |
-| `ornith_1n` | Ornith 1.5 397B, 1 node, 30 GiB experts in Grace | 4 | 219 tok/s | **55** |
+| `ornith_1n` | Ornith 1.5 397B, 1 node, 20 GiB experts in Grace | 4 | 299 tok/s | **75** |
 | `kimi27` | 1T int4, eager | 8 | 591 tok/s | **74** |
 | `glm52` | 744B FP8, eager | 12 | 419 tok/s | **35** |
 
@@ -357,6 +357,26 @@ untrained plain M-RoPE. `ORNITH_YARN_FACTOR` now overrides `text_config` instead
 `c7778ab`); its verification run is below. ⚠️ **Lesson: a throughput sweep cannot detect a
 broken position encoding — verify long context with a needle, not with tok/s.**
 
+#### `ornith_122b` @ 1M via the CORRECTED YaRN override — ✅ WORKS · 2026-11-08 (job 2759667)
+
+`MAX_MODEL_LEN=1048576 ORNITH_YARN_FACTOR=4` (MTP off, so only YaRN differs from job
+2754537). The override now targets `text_config.rope_parameters`. Three independent signs it
+took: the "greater than the derived max_model_len" warning is **gone** (derived =
+`max_seq_len=1048576`), weights load **0.1 GiB larger** (30.11 vs 30.01 GiB — a 4× rotary
+cache), and the needle:
+
+| prompt tokens | card recipe (2754537) | corrected (2759667) |
+|---|---|---|
+| 33,975 | ✅ | ✅ |
+| 207,148 | ✅ | ✅ |
+| 621,675 | ❌ `ductduct…` | ✅ |
+| **1,036,709** | — | ✅ (122.5 s, ~8.5K tok/s prefill) |
+
+**A full 1M-token context, correct, on one node.** Pool 4,591,062 tokens = 4.38× @1M.
+Per-stream decode (0 failures): 1K 119.9 · 128K 97.6 · 256K 77.9 · **512K 54.8 · 878K 36.2**;
+16 streams @1K 1,134 aggregate. **Static YaRN costs nothing measurable at short context**
+(119.9 vs 119.2 baseline) — the card's quality caveat for short inputs is untested here.
+
 ### Ornith 1.5 `ornith_1n` — 397B on ONE node, experts in Grace memory · 2026-11-08 (job 2754516)
 
 The flagship's 418 GB (~97.4 GiB/GPU) exceeds a whole 96 GB card, so the dsv41 lesson
@@ -406,6 +426,30 @@ Single-stream by context, layer-order 20 GiB: 38.7 (1K) · 39.1 (8K) · 38.6 (32
   mode is better. Read only what is safe: experts-only wins **batch-1 latency** even while
   offloading 50% more; layer-order at 20 GiB wins **every batch ≥4** and gives up 60% of the
   pool. Experts-only at 20 GiB (queued) is the run that separates mode from amount.
+
+#### Experts-only at 20 GiB — the separating run, and the new default · 2026-11-08 (job 2760309)
+
+Same amount as the control (20.61 vs 20.04 GiB/GPU offloaded), so **only the mode differs**.
+Resident 74.38 GiB/GPU, **pool 458,494 tokens (1.75× @256K)** — matches the control's
+453,354. 0 failures.
+
+| 1K aggregate | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| **experts-only 20 GiB** | **59.3** | **82.9** | **113.0** | **149.3** | **174.4** | **222.9** | **298.7** |
+| layer-order 20 GiB | 38.7 | 60.5 | 89.8 | 124.5 | 158.7 | 208.3 | 273.6 |
+| experts-only 30 GiB | 50.3 | 66.0 | 87.2 | 109.3 | 130.7 | 164.0 | 218.8 |
+
+Single-stream by context: **59.3 (1K) · 59.2 (8K) · 58.0 (32K) · 52.0 (128K) · 45.3 (256K)**
+vs layer-order's 38.7 → 32.9. 16 streams @8K: 186.8 vs 169.5.
+
+- ✅ **Expert-targeted offload wins every cell** at equal bytes: **+53% single-stream**,
+  +9% @64. The margin narrows with batch exactly as the mechanism predicts — a bigger batch
+  touches more experts, so expert-only reads converge toward reading everything.
+- ✅ **Amount matters more than I thought:** 30 → 20 GiB (both experts-only) is +18% single,
+  +36% @64. The dsv41 rule holds: **offload the minimum**. `CPU_OFFLOAD_GB` default is now
+  **20** (was 30); raise it only to buy pool (~1 GiB per GiB) for concurrent long contexts.
+- The 397B on one node is now **59 tok/s single-stream** — 73% of the 1.0 397B's 81.5 on
+  **twice the GPUs** — and holds 45 tok/s at 256K.
 
 - For reference, the 1.0 397B on **2 nodes** (no offload) reached 81.5 single / 845 @16. One
   node halves the GPUs and avoids cross-node PP, but at batch the 2-node shape is far better

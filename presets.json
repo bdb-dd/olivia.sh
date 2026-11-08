@@ -325,7 +325,7 @@
       "container_prefix": "glm53flash",
       "index": 1,
       "storage": "work",
-      "description": "Ornith 1.5 397B on ONE node (TP=4) — the dsv41 lesson: 418 GB of weights exceed 384 GB of HBM, so CPU_OFFLOAD_GB parks the excess in Grace LPDDR5X behind NVLink-C2C. Same weights as `ornith`; halves the GPU count and avoids the 2-node PP path"
+      "description": "Ornith 1.5 397B on ONE node (TP=4) — the dsv41 lesson: 418 GB of weights exceed 384 GB of HBM, so CPU_OFFLOAD_GB=20 (routed experts only) parks the excess in Grace LPDDR5X behind NVLink-C2C. Measured: 59 tok/s single-stream, 299 @64, 458K-token pool. Same weights as `ornith`; half the GPUs, no cross-node PP"
     },
     "ornith_122b": {
       "aliases": [

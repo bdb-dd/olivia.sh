@@ -384,6 +384,29 @@ load 252 s, CUDA graphs clean, **KV 16.79 GiB/GPU = 1,142,125 tokens (4.36× @25
   over C2C — the ~70 ms/step floor above, ≈8 tok/s/stream at 16. **Offloaded bytes per step
   are the ceiling, so the lever is the dsv41 rule: offload the minimum.** 20 GiB and
   20 GiB + MTP are queued next.
+#### The layer-order control — 20 GiB, non-selective · 2026-11-08 (job 2759654)
+
+An accident made useful: `CPU_OFFLOAD_PARAMS` was not forwarded by `olivia.sh` (fixed in
+`a87141e`), so this run offloaded **20.04 GiB/GPU in layer order** — dsv41's mode — instead
+of experts only. Resident 74.95 GiB/GPU, load 337 s, **KV 7.17 GiB = 453,354 tokens (1.73×
+@256K)**: 10 GiB less offload bought back 9.6 GiB of pool, the same ~1:1 rate dsv41 measured.
+
+| | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| layer-order 20 GiB — 1K aggregate | 38.7 | 60.5 | 89.8 | 124.5 | 158.7 | 208.3 | **273.6** |
+| experts-only 30 GiB — 1K aggregate | **50.3** | 66.0 | 87.2 | 109.3 | 130.7 | 164.0 | 218.8 |
+
+Single-stream by context, layer-order 20 GiB: 38.7 (1K) · 39.1 (8K) · 38.6 (32K) · 36.2
+(128K) · 32.9 (256K). 0 failures.
+
+- ❌ **My prediction was wrong.** I expected layer-order to cap at ~20 tok/s (all 20 GiB
+  read every step at an assumed ~450 GB/s). It reached **38.7**, which implies **~800 GB/s
+  effective over C2C** — about twice my assumption.
+- The two runs differ in **two** variables (mode and amount), so this does not yet say which
+  mode is better. Read only what is safe: experts-only wins **batch-1 latency** even while
+  offloading 50% more; layer-order at 20 GiB wins **every batch ≥4** and gives up 60% of the
+  pool. Experts-only at 20 GiB (queued) is the run that separates mode from amount.
+
 - For reference, the 1.0 397B on **2 nodes** (no offload) reached 81.5 single / 845 @16. One
   node halves the GPUs and avoids cross-node PP, but at batch the 2-node shape is far better
   per GPU (106 vs 33 tok/s/GPU @16). Use `ornith_1n` for **single-user / scarce-node** work.

@@ -459,6 +459,30 @@ The MTP head and its speculator cost **+3.14 GiB/GPU** (77.52 vs 74.38 GiB resid
 KV cache is needed, ...)`. Died at startup after a full load + capture (~7 min). Retrying at
 `CPU_OFFLOAD_GB=22`.
 
+#### Experts-only 22 GiB + MTP — a latency option, not a default · 2026-11-08 (job 2766587)
+
+22.12 GiB/GPU offloaded, resident 76.01, **pool 315,376 tokens (1.20× @256K)**, mean
+acceptance length **2.33**. 0 failures. Compared with experts-only 20 GiB, no MTP (2760309):
+
+| 1 stream | 1K | 8K | 32K | 128K | 256K |
+|---|---|---|---|---|---|
+| no MTP (20 GiB) | 59.3 | 59.2 | 58.0 | 52.0 | 45.3 |
+| **MTP (22 GiB)** | **75.6** | 54.3 | 26.7 | **63.2** | **51.8** |
+| MTP TTFT (s) | 0.40 | 1.36 | 5.09 | 0.71 | 1.28 |
+
+Aggregate @1K: 113 @4 (= no-MTP), 149 @8 (=), 187 vs 174 @16, 217 vs 223 @32, **229 vs 299
+@64 with p95 TTFT 45 s**.
+
+- When the prompt is prefix-cached, MTP is worth **+14 to +27%** single-stream.
+- ⚠️ The per-stream column includes TTFT, and the 8K/32K cells show TTFTs of 1.4–5.1 s where
+  the no-MTP run had ~0.4 s — i.e. **prefix-cache misses, not slower decode**. The 3.1 GiB
+  the head costs shrinks a pool that was already small; 8 streams × 32K is 256K of a 315K
+  pool, so the warm-up's prompts do not survive. The cause is inferred from TTFT, not
+  separately measured.
+- **So: off by default on `ornith_1n`** (unlike the 122B, whose 3.9M-token pool has room).
+  `ENABLE_SPECULATIVE=1 CPU_OFFLOAD_GB=22` for single-user latency work. At
+  `CPU_OFFLOAD_GB=20` it does not start with a 256K window (job 2760314, above).
+
 - For reference, the 1.0 397B on **2 nodes** (no offload) reached 81.5 single / 845 @16. One
   node halves the GPUs and avoids cross-node PP, but at batch the 2-node shape is far better
   per GPU (106 vs 33 tok/s/GPU @16). Use `ornith_1n` for **single-user / scarce-node** work.

@@ -451,6 +451,14 @@ vs layer-order's 38.7 → 32.9. 16 streams @8K: 186.8 vs 169.5.
 - The 397B on one node is now **59 tok/s single-stream** — 73% of the 1.0 397B's 81.5 on
   **twice the GPUs** — and holds 45 tok/s at 256K.
 
+#### Experts-only 20 GiB + MTP — ❌ does not fit a 256K window · 2026-11-08 (job 2760314)
+
+The MTP head and its speculator cost **+3.14 GiB/GPU** (77.52 vs 74.38 GiB resident), leaving
+3.52 GiB of KV against the **4.21 GiB one 262,144-token request needs**:
+`ValueError: To serve at least one request with the model's max seq len (262144), (4.21 GiB
+KV cache is needed, ...)`. Died at startup after a full load + capture (~7 min). Retrying at
+`CPU_OFFLOAD_GB=22`.
+
 - For reference, the 1.0 397B on **2 nodes** (no offload) reached 81.5 single / 845 @16. One
   node halves the GPUs and avoids cross-node PP, but at batch the 2-node shape is far better
   per GPU (106 vs 33 tok/s/GPU @16). Use `ornith_1n` for **single-user / scarce-node** work.

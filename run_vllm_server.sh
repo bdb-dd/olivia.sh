@@ -838,11 +838,17 @@ fi
 #     ~85 GiB budget at util 0.90 + activations/graphs + a KV pool), to be walked
 #     DOWN by measurement — dsv41's rule is "use the minimum that reaches the
 #     target".
-if [[ "${IS_ORNITH_397B}" == "1" && "${NUM_NODES}" -le 1 && -z "${CPU_OFFLOAD_GB:-}" ]]; then
-    CPU_OFFLOAD_GB=30
+if [[ "${IS_ORNITH_397B}" == "1" && "${NUM_NODES}" -le 1 ]]; then
+    if [[ -z "${CPU_OFFLOAD_GB:-}" ]]; then
+        CPU_OFFLOAD_GB=30
+        echo "[INFO] single-node Ornith 397B: defaulting CPU_OFFLOAD_GB=${CPU_OFFLOAD_GB} — weights exceed HBM"
+    fi
+    # Experts-only whenever offloading on this shape, even if only the GB was
+    # given: job 2759654 set CPU_OFFLOAD_GB=20 alone and silently got a
+    # layer-order offload. CPU_OFFLOAD_PARAMS=all selects the non-selective mode.
     CPU_OFFLOAD_PARAMS="${CPU_OFFLOAD_PARAMS:-experts}"
-    echo "[INFO] single-node Ornith 397B: defaulting CPU_OFFLOAD_GB=${CPU_OFFLOAD_GB} (params: ${CPU_OFFLOAD_PARAMS}) — weights exceed HBM"
 fi
+[[ "${CPU_OFFLOAD_PARAMS:-}" == "all" ]] && CPU_OFFLOAD_PARAMS=""
 
 # GLM-5.2 cold load is vLLM-pipeline-bound, not I/O-bound: the default loader
 # takes ~56 min for the ~415 GiB AWQ checkpoint (and MTP double-loads to ~84 min).

@@ -311,7 +311,7 @@ GDN:full) with 2 KV heads, so the pool is ~20× dsv41's. Baseline config: spec d
 | 127,922 — per-stream | 93.4 | | 69.7 | | | | |
 | 255,799 — per-stream | 71.8 | 62.6 | | | | | |
 
-- **Best single-node aggregate measured here** (dsv41 peaked at 2,465), at ~10B active.
+- Above dsv41 (2,465 peak), below `lagunas21` on the same 4 GPUs (5,230 @64, 7,751 @128).
 - Decode is **flat to 32K** (−6%) and keeps **60% of short-context speed at the full 256K**.
 - ⚠️ Read **per-stream** at long context: `agg_tok_s` includes client-side prompt
   construction (a 256K prompt is ~1.4 MB of text), so it understates the server.
@@ -331,8 +331,7 @@ KV pool 4.50M → **3.89M tokens (14.85× @256K)**. **Mean acceptance length 2.1
 | 128K | 93.4 → 142.5 (+53%) | 69.7 → 88.2 | | |
 | 256K | 71.8 → 100.8 (+40%) | (2 streams) 62.6 → 84.5 | | |
 
-**192 tok/s is the fastest single stream of any preset** (ornith_gh200's 35B on one card:
-174). And unlike dsv41's DSpark (−47% aggregate @16), MTP here is **neutral-to-positive at
+**192 tok/s ties `lagunas21` (192.8) for the fastest single stream measured here**, ahead of ornith_gh200's 174. `lagunas21` remains far ahead on aggregate, but falls off faster with context (47 tok/s at 200K vs 101 here at 256K — ⚠️ not like-for-like: this sweep's prompts are prefix-cache warm, and the Laguna TTFTs were cold). And unlike dsv41's DSpark (−47% aggregate @16), MTP here is **neutral-to-positive at
 batch** — 8K @64 is the only cell that regressed. So **MTP is now ON by default for the
 122B** (`ENABLE_SPECULATIVE=0` to disable); other Ornith sizes stay opt-in until measured.
 

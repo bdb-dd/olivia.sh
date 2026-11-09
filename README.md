@@ -487,6 +487,15 @@ Aggregate @1K: 113 @4 (= no-MTP), 149 @8 (=), 187 vs 174 @16, 217 vs 223 @32, **
   node halves the GPUs and avoids cross-node PP, but at batch the 2-node shape is far better
   per GPU (106 vs 33 tok/s/GPU @16). Use `ornith_1n` for **single-user / scarce-node** work.
 
+### Ornith 1.5 `ornith` — 397B, 2 nodes × 4 GH200, TP=4 + PP=2 · startup validated 2026-11-09, sweep pending
+
+Job 2762334 **served on the `vllm-glm53flash-1` container** (v0.32.1): Ray cluster of 8 GPUs,
+47.6–48.1 GiB/GPU, weights in ~127 s, **KV 34.6–35.1 GiB/GPU = 4,418,411 tokens**, startup
+complete with PIECEWISE capture. **No benchmark numbers:** `sweep_context_matrix.sh` took
+`squeue %N` as the hostname, which on two nodes is the compressed `gpu-1-[24,43]`, so it
+sent no requests and the idle watchdog cancelled the job after 20 min (4 GPU-h). Fixed in
+`5202f01`; the sweep is requeued as job 2777625.
+
 ### Ornith 1.0 `ornith_gh200` — 35B MoE FP8 on 1× GH200, CUDAGraph · 2026-07-16/17
 Concurrency sweep (`bench_sweep.py`, `max_tokens=512`, warm/JIT-cached pass on the pinned-commit rebuild):
 

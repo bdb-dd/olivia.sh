@@ -241,7 +241,7 @@ export ANTHROPIC_BASE_URL=http://localhost:8002 ANTHROPIC_AUTH_TOKEN=x && claude
 | `kimi` | `moonshotai/Kimi-K2.6` | 8 (2 nodes × 4) | `vllm-kimi-4` | TP=4 + PP=2, native int4, MLA, multimodal, vLLM 0.21. Eager. reasoning_tokens on chat/completions |
 | `kimi27` | `moonshotai/Kimi-K2.7-Code` | 8 (2 nodes × 4) | `vllm-kimi-4` (shared) | Same arch + container as K2.6 (no rebuild); thinking-only |
 | `laguna` | `poolside/Laguna-M.1-FP8` | 4 | `vllm-laguna-1` | TP=4, single node. FP8 (~225 GB), dense attention (FLASH_ATTN), CUDAGraph on. vLLM v0.21.0, `poolside_v1` parsers |
-| `ornith` | `ornith-ai/Ornith-1.5-397B-FP8` | 8 (2 nodes × 4) | `vllm-glm53flash-1` (shared) | **Ornith 1.5 397B flagship.** TP=4 + PP=2, FP8 W8A8 (418 GB), 256K ctx. No build — qwen3_5_moe is native in the v0.32.1 container. 1.5 ships the MTP head (opt-in). *1.5 not yet run on 2 nodes; the measured 2-node row below is 1.0* |
+| `ornith` | `ornith-ai/Ornith-1.5-397B-FP8` | 8 (2 nodes × 4) | `vllm-glm53flash-1` (shared) | **Ornith 1.5 397B flagship.** TP=4 + PP=2, FP8 W8A8 (418 GB), 256K ctx. No build — qwen3_5_moe is native in the v0.32.1 container. 1.5 ships the MTP head (opt-in). ✅ Serves: **79.6 tok/s single, 1,283 @64**, 4.42M-token pool, 0 failures (job 2777625) |
 | `ornith_1n` | `ornith-ai/Ornith-1.5-397B-FP8` | **4 (1 node)** | `vllm-glm53flash-1` (shared) | **The 397B on ONE node**: 20 GiB/GPU of routed experts in Grace memory (`--cpu-offload-params experts`). ✅ Serves: **59 tok/s single-stream, 299 @64** at the 20 GiB default (458K-token pool); aggregate is offload-bandwidth-bound |
 | `ornith_122b` | `ornith-ai/Ornith-1.5-122B-FP8` | 4 (1 node) | `vllm-glm53flash-1` (shared) | **New in 1.5.** 122B-A10B, FP8 W8A8 (133 GB, persistent tier), TP=4. ✅ **192 tok/s single-stream, 3,300 @64 with MTP (default on)**, 4.5M-token pool, 17× @256K |
 | `ornith_gh200` | `deepreinforce-ai/Ornith-1.0-35B-FP8` | 1 | `vllm-ornith-1` (shared) | **35B on a single GH200 card** (TP=1), ~3B active, hybrid linear+full attn, multimodal, 256K ctx — max single-user throughput. MTP off (no head in FP8). Shares the `ornith` container, `qwen3_xml`/`qwen3` parsers |
@@ -274,6 +274,7 @@ actually spend.
 | `laguna` | Laguna M.1 FP8 | 4 | 2,056 tok/s | **514** |
 | `glm53_flash` | 320B/18B `glm5_next` | 4 | 695 tok/s | **174** |
 | `glm51` | 744B AWQ | 8 | 895 tok/s | **112** |
+| `ornith` | Ornith 1.5 397B FP8, 2 nodes | 8 | 1,283 tok/s | **160** |
 | `ornith` (1.0) | Ornith 1.0 397B MoE FP8, 2 nodes | 8 | 845 tok/s | **106** |
 | `ornith_1n` | Ornith 1.5 397B, 1 node, 20 GiB experts in Grace | 4 | 299 tok/s | **75** |
 | `kimi27` | 1T int4, eager | 8 | 591 tok/s | **74** |
@@ -486,14 +487,28 @@ Aggregate @1K: 113 @4 (= no-MTP), 149 @8 (=), 187 vs 174 @16, 217 vs 223 @32, **
   node halves the GPUs and avoids cross-node PP, but at batch the 2-node shape is far better
   per GPU (106 vs 33 tok/s/GPU @16). Use `ornith_1n` for **single-user / scarce-node** work.
 
-### Ornith 1.5 `ornith` — 397B, 2 nodes × 4 GH200, TP=4 + PP=2 · startup validated 2026-11-09, sweep pending
+### Ornith 1.5 `ornith` — 397B, 2 nodes × 4 GH200, TP=4 + PP=2, PIECEWISE · 2026-11-09 (job 2777625)
 
-Job 2762334 **served on the `vllm-glm53flash-1` container** (v0.32.1): Ray cluster of 8 GPUs,
-47.6–48.1 GiB/GPU, weights in ~127 s, **KV 34.6–35.1 GiB/GPU = 4,418,411 tokens**, startup
-complete with PIECEWISE capture. **No benchmark numbers:** `sweep_context_matrix.sh` took
-`squeue %N` as the hostname, which on two nodes is the compressed `gpu-1-[24,43]`, so it
-sent no requests and the idle watchdog cancelled the job after 20 min (4 GPU-h). Fixed in
-`5202f01`; the sweep is requeued as job 2777625.
+**On the `vllm-glm53flash-1` container (v0.32.1), no build.** 47.6–48.1 GiB/GPU, weights in
+~127 s, **KV 4,418,411 tokens (16.9× @256K)**, PIECEWISE capture, engine-as-actor Ray. 0 failures,
+**no PP decode wedge**. (First attempt, job 2762334, served too but got no requests — the sweep's
+multi-node head-node bug, fixed in `5202f01`.)
+
+| context | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| 1K — per-stream | **79.6** | 71.6 | 41.4 | 38.2 | 32.1 | 26.9 | 20.0 |
+| 1K — aggregate | 79.6 | 142.9 | 165.4 | 305.0 | 512.6 | 857.4 | **1,269.7** |
+| 8K — per-stream / agg | 73.4 | | 42.3 | | 31.1 / 485 | | 20.9 / **1,283** |
+| 32K — per-stream | 76.0 | | 40.4 | | 29.2 | | |
+| 128K — per-stream | 71.8 | | 36.2 | | | | |
+| 256K — per-stream | 63.1 | 53.2 | | | | | |
+
+- vs the 1.0 397B on the same shape (pinned main `251f7e4`): single **79.6 vs 81.5** (same), and
+  it now scales to **64 streams** (1.0 was measured to 16: 845; 1.5 @16: 513 — the 1.0 sweep used
+  `max_tokens=256`, this one 200, so the @16 gap is not like-for-like).
+- vs `ornith_1n` (same weights, **half the GPUs**): +34% single (79.6 vs 59.3), **4.2× @64**
+  (1,270 vs 299), 9.6× the pool. Per GPU @64: **159** vs 75. **Use 2 nodes for batch/serving;
+  `ornith_1n` only when 2 nodes will not schedule.**
 
 ### Ornith 1.0 `ornith_gh200` — 35B MoE FP8 on 1× GH200, CUDAGraph · 2026-07-16/17
 Concurrency sweep (`bench_sweep.py`, `max_tokens=512`, warm/JIT-cached pass on the pinned-commit rebuild):

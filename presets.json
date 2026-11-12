@@ -688,6 +688,56 @@
       "status": "benchmarked 2026-07-16 — its 1.0 container is purge-hollowed",
       "perf": "174 tok/s single, 4,621 @64"
     },
+    "ornith-1.5-35b-256k": {
+      "aliases": [
+        "ornith-1.5-35b",
+        "ornith-1.5-35b-a3b",
+        "ornith_35b_15"
+      ],
+      "model": "ornith-ai/Ornith-1.5-35B-A3B-FP8",
+      "nodes": 1,
+      "gpus": 1,
+      "pp": 1,
+      "container_prefix": "glm53flash",
+      "index": 1,
+      "storage": "work",
+      "description": "Ornith 1.5 35B-A3B MoE (Qwen3.5 hybrid GDN+full attn, 40 layers, 256 experts top-8, ~3B active) channel/token FP8 W8A8 (39 GB) on ONE GH200 card (TP=1), 256K ctx. Ships the MTP head and has a published DFlash drafter (ornith-ai/Ornith-1.5-35B-A3B-DFlash). Runs on the glm53flash container — no build. Weights on the work tier (PI choice 2026-11-12)",
+      "family": "ornith",
+      "version": "1.5",
+      "params": "35b",
+      "active": "3b",
+      "quant": "FP8 W8A8 (channel/token)",
+      "ctx": "256k",
+      "status": "new 2026-11-12 — first serve pending",
+      "perf": "—"
+    },
+    "ornith-1.5-35b-256k-dflash": {
+      "aliases": [
+        "ornith-1.5-35b-dflash",
+        "ornith_35b_15_dflash"
+      ],
+      "model": "ornith-ai/Ornith-1.5-35B-A3B-FP8",
+      "nodes": 1,
+      "gpus": 1,
+      "pp": 1,
+      "container_prefix": "glm53flash",
+      "index": 1,
+      "storage": "work",
+      "env": {
+        "ENABLE_SPECULATIVE": "1",
+        "ORNITH_SPEC_METHOD": "dflash"
+      },
+      "description": "Ornith 1.5 35B on one GH200 with DFlash block-diffusion speculative decode (8 draft tokens, the card's recipe; drafter ornith-ai/Ornith-1.5-35B-A3B-DFlash). The test case for DFlash where verification is cheap: no offload, small active size. ⚠️ UNMEASURED until the 2026-11-12 run",
+      "family": "ornith",
+      "version": "1.5",
+      "params": "35b",
+      "active": "3b",
+      "quant": "FP8 W8A8 (channel/token)",
+      "ctx": "256k",
+      "variant": "dflash",
+      "status": "new 2026-11-12 — unmeasured",
+      "perf": "—"
+    },
     "devstral-2-123b-32k": {
       "aliases": [
         "devstral",

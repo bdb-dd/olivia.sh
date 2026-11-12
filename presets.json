@@ -648,18 +648,17 @@
       "storage": "projects",
       "env": {
         "MAX_MODEL_LEN": "1048576",
-        "ORNITH_YARN_FACTOR": "4",
-        "ENABLE_SPECULATIVE": "0"
+        "ORNITH_YARN_FACTOR": "4"
       },
-      "description": "Ornith 1.5 122B with a 1M-token window (YaRN x4 via text_config). ✅ Needle-verified at 1,036,709 tokens (job 2759667): 4.59M-token pool = 4.38x @1M, 54.8 tok/s @512K, 36.2 @878K. MTP is OFF here because that is the configuration verified; ENABLE_SPECULATIVE=1 to try MTP + 1M (untested). Static YaRN applies to every request; use plain `ornith_122b` unless you need >256K",
+      "description": "Ornith 1.5 122B with a 1M-token window (YaRN x4 via text_config), MTP ON (the 122B default). ✅ Needle-verified WITH MTP at 1,036,709 tokens (job 2851670, 2026-11-12) and without it (job 2759667). 4,034,670-token pool = 3.85x @1M. MTP is +34-64% single-stream at every context vs the MTP-off run. Static YaRN applies to every request; use plain ornith-1.5-122b-256k unless you need >256K. ENABLE_SPECULATIVE=0 restores the MTP-off configuration",
       "family": "ornith",
       "version": "1.5",
       "params": "122b",
       "active": "10b",
       "quant": "FP8 W8A8 (channel/token)",
       "ctx": "1m",
-      "status": "needle-verified 2026-11-08 (job 2759667)",
-      "perf": "120 tok/s @1K, 54.8 @512K, 36.2 @878K; 4.38x @1M"
+      "status": "needle-verified with MTP 2026-11-12 (job 2851670)",
+      "perf": "196 tok/s @1K, 140 @128K, 106 @256K, 70 @512K, 48.5 @878K; 3,321 @64; 3.85x @1M"
     },
     "ornith-1.0-35b-256k": {
       "aliases": [

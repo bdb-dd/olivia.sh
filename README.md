@@ -429,6 +429,24 @@ Per-stream decode (0 failures): 1K 119.9 · 128K 97.6 · 256K 77.9 · **512K 54.
 16 streams @1K 1,134 aggregate. **Static YaRN costs nothing measurable at short context**
 (119.9 vs 119.2 baseline) — the card's quality caveat for short inputs is untested here.
 
+#### `ornith-1.5-122b-1m` with MTP — ✅ needle-verified, now the variant's default · 2026-11-12 (job 2851670)
+
+Same as job 2759667 (corrected YaRN x4, 1M window) but with MTP on. Weights 31.33 GiB/GPU
+(30.11 + the 1.2 GiB head), **pool 4,034,670 tokens (3.85× @1M)**, mean acceptance length
+**2.27**, 0 failures. **Needle recovered at 33,977 / 207,148 / 621,676 / 1,036,709 tokens** — MTP
+does not disturb long-context retrieval.
+
+| context | MTP off (2759667) | **MTP on (2851670)** | gain |
+|---|---|---|---|
+| 1K | 119.9 | **196.1** | +64% |
+| 128K | 97.6 | **140.4** | +44% |
+| 256K | 77.9 | **105.9** | +36% |
+| 512K | 54.8 | **70.0** | +28% |
+| 878K | 36.2 | **48.5** | +34% |
+
+Aggregate @1K: 1,541 @16, **3,321 @64** (MTP-off 1M run: 1,134 @16). The `ornith-1.5-122b-1m`
+variant therefore no longer forces `ENABLE_SPECULATIVE=0`; it inherits the 122B's MTP default.
+
 ### Ornith 1.5 `ornith_1n` — 397B on ONE node, experts in Grace memory · 2026-11-08 (job 2754516)
 
 The flagship's 418 GB (~97.4 GiB/GPU) exceeds a whole 96 GB card, so the dsv41 lesson

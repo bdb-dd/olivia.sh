@@ -152,6 +152,57 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 
 **Per-preset GPU allocation:** `olivia.sh server start` reads resources from `get_preset_resources()` in `olivia.sh` and passes corresponding `--nodes`, `--gpus-per-node`, `--cpus-per-task` overrides to `sbatch`. `glm51` (2 nodes × 4) and `glm52`/`glm53` (3 nodes × 4) cross node boundaries; everything else runs single-node 4 GPUs. The `cluster` snapshot reports start-time/feasibility for 1-, 2-, and 3-node × 4-GPU shapes.
 
+### Preset names — `<family>-<version>-<params>-<ctx>[-Nn][-variant]` (since 2026-11-12)
+
+Every preset name says what it serves: model family and version, parameter count,
+the default max context (`32k` = 32768, `128k` = 131072, `256k` = 262144, `1m` =
+1048576), then **`-Nn` = number of nodes** on every multi-node preset and on a
+single-node shape of a model that also has a multi-node one (`…-397b-256k-2n` vs
+`…-1n`). A behaviour variant adds a word (`-lowlat`, `-mtp`, `-prebuilt`,
+`-vllm020`); a context variant changes `ctx` instead (`ornith-1.5-122b-1m`). The
+name is derived from the preset's card fields in `presets.json` and
+**`presets.py lint` enforces it** (run by `check_scripts.sh`), so it cannot drift.
+
+**Every previous name still works** — old canonical names and all old aliases are
+aliases now, so `./olivia.sh server start ornith_122b` and a router request for
+`model: "kimi27"` behave exactly as before. Older sections of this file use the
+old names. `./olivia.sh server card <preset>` prints a preset's model card (no SSH),
+and `server start` prints it before submitting.
+
+| New name | Was | Status |
+|---|---|---|
+| `glm-5.1-744b-128k-2n` | `glm51_v19` | benchmarked 2026-06-20 |
+| `glm-5.1-744b-128k-2n-vllm020` | `glm51_v20` | quarantined (same PP wedge as v0.19) |
+| `glm-5.2-744b-128k-3n` | `glm52` | benchmarked 2026-06-18 |
+| `glm-5.2-744b-128k-2n` | `glm52_awq` | never served on 2 nodes (container proven by the 1-node shape, glm-5.2-744b-128k-1n) |
+| `glm-5.3-744b-128k-3n` | `glm53` | not yet run (weights gated/unpublished) |
+| `glm-5.3-744b-128k-3n-vllm027` | `glm53_v27` | not yet run (upgrade-path container) |
+| `glm-5.3-flash-320b-128k` | `glm53_flash` | benchmarked 2026-11-06 (job 2732602) |
+| `glm-5.3-flash-320b-128k-prebuilt` | `glm53_flash_prebuilt` | fallback image |
+| `borealis-27b-128k` | `borealis` | benchmarked 2026-08-18 |
+| `deepseek-4-flash-304b-128k` | `dsv4flash` | BLOCKED on this stack (2026-08-19) |
+| `deepseek-4.1-flash-748b-128k` | `dsv41` | benchmarked + tuned 2026-11-06 |
+| `deepseek-4.1-flash-748b-1m` | `dsv41_1m` | benchmarked 2026-11-06 (job 2731395) |
+| `deepseek-4.1-flash-748b-128k-lowlat` | `dsv41_lowlat` | benchmarked 2026-11-06 (job 2731404) |
+| `laguna-s-2.1-118b-128k` | `lagunas21` | benchmarked 2026-08-18 |
+| `qwen-3.8-27b-256k` | `qwen38` | benchmarked 2026-08-18 |
+| `glm-4.7-358b-32k` | `glm47` | no current benchmark |
+| `kimi-k2.6-1t-128k-2n` | `kimi` | benchmarked 2026-06-20 (eager) |
+| `kimi-k2.7-code-1t-128k-2n` | `kimi27` | benchmarked 2026-06-20 (eager) |
+| `laguna-m.1-225b-128k` | `laguna` | benchmarked 2026-06-20 |
+| `ornith-1.5-397b-256k-2n` | `ornith` | benchmarked 2026-11-09 (job 2777625) |
+| `ornith-1.5-397b-1m-2n` | `ornith_1m` | NOT VERIFIED on the 397B (override needle-verified on the 122B) |
+| `ornith-1.5-397b-256k-1n` | `ornith_1n` | benchmarked 2026-11-08 (job 2760309) |
+| `ornith-1.5-397b-256k-1n-lowlat` | `ornith_1n_lowlat` | benchmarked 2026-11-08 (job 2766587) |
+| `ornith-1.5-122b-256k` | `ornith_122b` | benchmarked 2026-11-08 (jobs 2754478, 2754533) |
+| `ornith-1.5-122b-1m` | `ornith_122b_1m` | needle-verified 2026-11-08 (job 2759667) |
+| `ornith-1.0-35b-256k` | `ornith_gh200` | benchmarked 2026-07-16 — its 1.0 container is purge-hollowed |
+| `devstral-2-123b-32k` | `devstral` | no current benchmark |
+| `llama-3.3-70b-32k` | `llama` | no current benchmark |
+| `qwen-2.5-72b-32k` | `qwen` | no current benchmark |
+| `glm-5.2-744b-128k-1n` | `glm52_awq_1n` | benchmarked 2026-07-03 |
+| `glm-5.2-744b-128k-1n-mtp` | `glm52_awq_mtp` | experimental (local MTP-grafted checkpoint) |
+
 #### Prefetch Module
 ```bash
 ./olivia.sh prefetch glm51_v19                  # preset -> its default repo

@@ -1719,6 +1719,14 @@ cmd_server() {
                 action="deploy"
                 shift
                 ;;
+            card|info)
+                action="card"
+                shift
+                if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+                    preset="$1"
+                    shift
+                fi
+                ;;
             logs)
                 action="logs"
                 shift
@@ -1787,6 +1795,13 @@ cmd_server() {
     # Show help if no action
     if [[ -z "$action" ]]; then
         cmd_server_help
+        exit 0
+    fi
+
+    # `server card <preset>`: print the model card and stop — no SSH needed.
+    if [[ "$action" == "card" ]]; then
+        [[ -z "$preset" ]] && { error "Usage: ./olivia.sh server card <preset>"; exit 1; }
+        preset_query card "$preset"
         exit 0
     fi
 
@@ -1904,6 +1919,9 @@ cmd_server() {
                 kill_tunnel
             fi
 
+            # Model card: everything presets.json knows, before anything is spent.
+            [[ -n "$preset" ]] && { preset_query card "$preset" >&2 || true; echo "" >&2; }
+
             # Start server
             local job_id
             if ! job_id=$(start_server_job "$container" "$model" "$num_nodes" "$gpus_per_node" "$pp_size" "$preset"); then
@@ -1975,6 +1993,9 @@ cmd_server() {
                 kill_tunnel
             fi
             echo ""
+
+            # Model card: everything presets.json knows, before anything is spent.
+            [[ -n "$preset" ]] && { preset_query card "$preset" >&2 || true; echo "" >&2; }
 
             # Start server
             local job_id
@@ -2049,18 +2070,11 @@ Actions:
     logs                Tail logs of running server
     ssh, shell          Open a shell on the GPU node
     deploy              Upload run_vllm_server.sh to cluster
+    card <preset>       Print the preset's model card (no SSH; also shown at start)
 
-Presets (with default models):
-    glm51               GLM-5.1-AWQ (cyankiwi/GLM-5.1-AWQ-4bit) — 2 nodes × 4 GPUs, TP=4 + PP=2
-    glm52               GLM-5.2-FP8 (RedHatAI/GLM-5.2-FP8) — 3 nodes × 4 GPUs, TP=4 + PP=3 (needs vLLM main + PR#45895)
-    glm53               GLM-5.3-FP8 (zai-org/GLM-5.3-FP8) — 3 nodes × 4 GPUs, TP=4 + PP=3; reuses the glm52 container (weights not public yet)
-    glm53_v27           Same model on the glm53 container (vLLM v0.27.1 + NGC 26.07, no PR graft) — the upgrade path, unvalidated
-    glm47               GLM-4.7-AWQ (QuantTrio/GLM-4.7-AWQ)
-    ornith              Ornith 1.0 397B MoE FP8 flagship (deepreinforce-ai/Ornith-1.0-397B-FP8) — 2 nodes × 4 GPUs, TP=4 + PP=2, native MTP (PP-gated), 256K
-    ornith_gh200        Ornith 1.0 35B MoE FP8 — single GH200 card, TP=1, MTP, 256K (max single-user throughput)
-    devstral            Devstral 123B (mistralai/Devstral-2-123B-Instruct-2512)
-    llama               Llama 3.3 70B (meta-llama/Llama-3.3-70B-Instruct)
-    qwen                Qwen 2.5 72B (Qwen/Qwen2.5-72B-Instruct)
+Presets — <family>-<version>-<params>-<ctx>[-Nn][-variant]; the name in
+parentheses (and every older alias) still works. Model card: server card <preset>
+$(preset_query table)
 
 Options:
     --container, -c     Explicit container name
@@ -2072,6 +2086,8 @@ Options:
 
 Examples:
     ./olivia.sh server list                          List containers
+    ./olivia.sh server card ornith-1.5-122b-256k     What is this preset? (no SSH)
+    ./olivia.sh server start ornith-1.5-122b-256k    Start Ornith 1.5 122B (old name ornith_122b also works)
     ./olivia.sh server start glm47                   Start GLM-4.7 server
     ./olivia.sh server watch                         Monitor loading progress
     ./olivia.sh server start devstral                Start Devstral server

@@ -30,6 +30,9 @@ CLI::
     presets.py field <name> <field>        # model|served_name|nodes|gpus|pp|resources|prefix|index|port|storage|description
     presets.py shellvars <name>            # PRESET_*=... lines for `eval` in bash
     presets.py env <name>                  # KEY=VALUE server env defaults of a preset variant
+    presets.py card <name>                 # model card: everything presets.json knows
+    presets.py table                       # one line per preset: name, previous name, status
+    presets.py lint                        # names match <family>-<version>-<params>-<ctx>[-Nn][-variant]
     presets.py container <name> [index]    # vllm-<prefix>-<index>-sandbox
     presets.py list [--aliases]            # canonical preset names
     presets.py match <model-string>        # canonical preset a request `model` routes to (empty if none)
@@ -76,6 +79,30 @@ def _validated_env(canonical: str, env: dict) -> dict:
     return out
 
 
+# Model-card fields carried by a preset (all optional except for `lint`).
+CARD_FIELDS = ("family", "version", "params", "active", "quant", "ctx",
+               "variant", "node_suffix", "status", "perf")
+
+
+def derived_name(card: dict, nodes: int) -> str:
+    """<family>-<version>-<params>-<ctx>[-<N>n][-<variant>], lowercase.
+
+    The node suffix appears on every multi-node preset, and on a single-node
+    shape (`node_suffix: true`) of a model that also has a multi-node one — e.g.
+    ornith-1.5-397b-256k-2n vs ...-1n. A behaviour variant adds a word
+    (`-lowlat`, `-mtp`, `-prebuilt`); a context variant changes `ctx` instead.
+    """
+    parts = [card["family"]]
+    if card.get("version"):
+        parts.append(card["version"])
+    parts += [card["params"], card["ctx"]]
+    if nodes > 1 or card.get("node_suffix"):
+        parts.append(f"{nodes}n")
+    if card.get("variant"):
+        parts.append(card["variant"])
+    return "-".join(str(x) for x in parts).lower()
+
+
 @dataclass
 class Preset:
     canonical: str
@@ -94,6 +121,10 @@ class Preset:
     # low-latency shape of the same weights). olivia.sh exports each one only if
     # the caller has not set it, so an explicit `FOO=x ./olivia.sh ...` wins.
     env: dict = field(default_factory=dict)
+    # Model-card fields (see CARD_FIELDS). The canonical name is DERIVED from
+    # family/version/params/ctx/node-count/variant and `presets.py lint` enforces
+    # it, so a name always says what the preset is.
+    card: dict = field(default_factory=dict)
     known: bool = True  # False for synthesised custom presets
 
     @property
@@ -136,6 +167,7 @@ class Registry:
                 storage=spec.get("storage", self.defaults.get("storage", "projects")),
                 description=spec.get("description", ""),
                 env=_validated_env(canonical, spec.get("env", {})),
+                card={k: spec[k] for k in CARD_FIELDS if k in spec},
             )
         # Lower-cased alias/canonical -> canonical, for normalize().
         self._alias_index: dict = {}
@@ -252,6 +284,54 @@ def _cmd_shellvars(p: Preset) -> str:
     return "\n".join(lines)
 
 
+def _cmd_card(p: Preset) -> str:
+    """Everything presets.json knows about a preset, as a short model card."""
+    c = p.card
+    shape = (f"{p.nodes} node(s) x {p.gpus} GPU" + ("s" if p.gpus != 1 else "")
+             + (f", TP={p.gpus} + PP={p.pp}" if p.pp > 1 else f", TP={p.gpus}"))
+    rows = [
+        ("Preset", p.canonical + (f"   (aliases: {', '.join(p.aliases[:4])}{', ...' if len(p.aliases) > 4 else ''})" if p.aliases else "")),
+        ("Model", p.model or "<none>"),
+        ("Family", " ".join(x for x in (c.get("family", ""), c.get("version", "")) if x) or "—"),
+        ("Parameters", c.get("params", "—") + (f" total, {c['active']} active" if c.get("active") else "")),
+        ("Quantization", c.get("quant", "—")),
+        ("Context", c.get("ctx", "—")),
+        ("Shape", shape),
+        ("Container", p.container_name()),
+        ("Weights tier", p.storage),
+        ("Status", c.get("status", "—")),
+        ("Measured", c.get("perf", "—")),
+    ]
+    if p.env:
+        rows.append(("Preset env", " ".join(f"{k}={v}" for k, v in p.env.items())))
+    w = max(len(k) for k, _ in rows)
+    out = ["┌─ model card " + "─" * 50]
+    out += [f"│ {k:<{w}}  {v}" for k, v in rows]
+    if p.description:
+        out.append("│")
+        import textwrap
+        for line in textwrap.wrap(p.description, 96):
+            out.append(f"│ {line}")
+    out.append("└" + "─" * 63)
+    return "\n".join(out)
+
+
+def _lint(reg: "Registry") -> list:
+    """Naming-convention and card checks; returns human-readable problems."""
+    problems = []
+    for p in reg.all():
+        if p.canonical == "generic":
+            continue
+        missing = [k for k in ("family", "params", "ctx", "status") if k not in p.card]
+        if missing:
+            problems.append(f"{p.canonical}: missing card field(s) {', '.join(missing)}")
+            continue
+        want = derived_name(p.card, p.nodes)
+        if p.canonical != want:
+            problems.append(f"{p.canonical}: name does not match its card — expected {want!r}")
+    return problems
+
+
 def main(argv: list) -> int:
     if not argv:
         print(__doc__)
@@ -274,6 +354,24 @@ def main(argv: list) -> int:
             return 2
         print(_cmd_shellvars(reg.resolve(rest[0])))
         return 0
+    if cmd == "card":
+        if not rest:
+            print("usage: presets.py card <name>", file=sys.stderr)
+            return 2
+        print(_cmd_card(reg.resolve(rest[0])))
+        return 0
+    if cmd == "table":
+        for p in reg.all():
+            if p.canonical == "generic":
+                continue
+            old = p.aliases[0] if p.aliases else ""
+            print(f"    {p.canonical:38s} {('(' + old + ')') if old else '':22s} {p.card.get('status', '')}")
+        return 0
+    if cmd == "lint":
+        problems = _lint(reg)
+        for line in problems:
+            print(line)
+        return 1 if problems else 0
     if cmd == "env":
         if not rest:
             print("usage: presets.py env <name>", file=sys.stderr)

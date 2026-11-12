@@ -33,6 +33,9 @@ python3 -I check_heredoc_py.py "${SHELLS[@]}" || rc=1
 echo "== per-model knob use-before-assign =="
 python3 -I check_unbound_order.py run_vllm_server.sh || rc=1
 
+echo "== preset names match their model cards (presets.py lint) =="
+python3 -I presets.py lint || rc=1
+
 echo ""
 [[ $rc -eq 0 ]] && echo "ALL CHECKS PASSED" || echo "CHECKS FAILED — do not submit"
 exit $rc

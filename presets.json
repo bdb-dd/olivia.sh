@@ -37,8 +37,9 @@
     "storage": "projects"
   },
   "presets": {
-    "glm51_v19": {
+    "glm-5.1-744b-128k-2n": {
       "aliases": [
+        "glm51_v19",
         "glm51",
         "glm-5.1",
         "glm5.1"
@@ -50,10 +51,20 @@
       "container_prefix": "glm51",
       "index": 1,
       "storage": "work",
-      "description": "GLM-5.1 744B MoE+DSA, AWQ-4bit, vLLM v0.19.0 (recipe default)"
+      "description": "GLM-5.1 744B MoE+DSA, AWQ-4bit, vLLM v0.19.0 (recipe default)",
+      "family": "glm",
+      "version": "5.1",
+      "params": "744b",
+      "active": "40b",
+      "quant": "AWQ int4",
+      "ctx": "128k",
+      "status": "benchmarked 2026-06-20",
+      "perf": "~22 tok/s per stream, 895 @64 (PIECEWISE + NCCL all-reduce)"
     },
-    "glm51_v20": {
-      "aliases": [],
+    "glm-5.1-744b-128k-2n-vllm020": {
+      "aliases": [
+        "glm51_v20"
+      ],
       "model": "cyankiwi/GLM-5.1-AWQ-4bit",
       "nodes": 2,
       "gpus": 4,
@@ -61,10 +72,20 @@
       "container_prefix": "glm51",
       "index": 2,
       "storage": "work",
-      "description": "GLM-5.1 on vLLM v0.20.0 + RayExecutorV2 (quarantined; same wedge)"
+      "description": "GLM-5.1 on vLLM v0.20.0 + RayExecutorV2 (quarantined; same wedge)",
+      "family": "glm",
+      "version": "5.1",
+      "params": "744b",
+      "active": "40b",
+      "quant": "AWQ int4",
+      "ctx": "128k",
+      "variant": "vllm020",
+      "status": "quarantined (same PP wedge as v0.19)",
+      "perf": "diagnostic only"
     },
-    "glm52": {
+    "glm-5.2-744b-128k-3n": {
       "aliases": [
+        "glm52",
         "glm-5.2",
         "glm5.2"
       ],
@@ -75,10 +96,19 @@
       "container_prefix": "glm52",
       "index": 1,
       "storage": "work",
-      "description": "GLM-5.2 744B MoE+DSA, block-FP8, 3-node TP=4+PP=3"
+      "description": "GLM-5.2 744B MoE+DSA, block-FP8, 3-node TP=4+PP=3",
+      "family": "glm",
+      "version": "5.2",
+      "params": "744b",
+      "active": "40b",
+      "quant": "block FP8",
+      "ctx": "128k",
+      "status": "benchmarked 2026-06-18",
+      "perf": "5.6 tok/s single (eager), 419 @64"
     },
-    "glm52_awq": {
+    "glm-5.2-744b-128k-2n": {
       "aliases": [
+        "glm52_awq",
         "glm-5.2-awq",
         "glm5.2-awq",
         "glm52-awq",
@@ -91,10 +121,19 @@
       "container_prefix": "glm52",
       "index": 1,
       "storage": "projects",
-      "description": "GLM-5.2 744B MoE+DSA, AWQ-INT4 (~415 GiB), 2-node TP=4+PP=2 (reuses the glm52 container; persistent tier). VALIDATED on the glm52 container; the glm53/v0.27.1 container is an untested alternative (PR#45895 native there rather than grafted)."
+      "description": "GLM-5.2 744B MoE+DSA, AWQ-INT4 (~415 GiB), 2-node TP=4+PP=2 (reuses the glm52 container; persistent tier). VALIDATED on the glm52 container; the glm53/v0.27.1 container is an untested alternative (PR#45895 native there rather than grafted).",
+      "family": "glm",
+      "version": "5.2",
+      "params": "744b",
+      "active": "40b",
+      "quant": "AWQ int4",
+      "ctx": "128k",
+      "status": "never served on 2 nodes (container proven by the 1-node shape, glm-5.2-744b-128k-1n)",
+      "perf": "—"
     },
-    "glm53": {
+    "glm-5.3-744b-128k-3n": {
       "aliases": [
+        "glm53",
         "glm-5.3",
         "glm5.3"
       ],
@@ -105,10 +144,19 @@
       "container_prefix": "glm52",
       "index": 1,
       "storage": "work",
-      "description": "GLM-5.3 744B MoE+DSA, block-FP8, 3-node TP=4+PP=3 — GLM-5.2's base re-post-trained, so it REUSES the glm52 container (no rebuild). Weights unreleased as of 2026-08-17"
+      "description": "GLM-5.3 744B MoE+DSA, block-FP8, 3-node TP=4+PP=3 — GLM-5.2's base re-post-trained, so it REUSES the glm52 container (no rebuild). Weights unreleased as of 2026-08-17",
+      "family": "glm",
+      "version": "5.3",
+      "params": "744b",
+      "active": "40b",
+      "quant": "block FP8",
+      "ctx": "128k",
+      "status": "not yet run (weights gated/unpublished)",
+      "perf": "—"
     },
-    "glm53_v27": {
+    "glm-5.3-744b-128k-3n-vllm027": {
       "aliases": [
+        "glm53_v27",
         "glm53-v27",
         "glm-5.3-v27",
         "glm53v27"
@@ -120,10 +168,20 @@
       "container_prefix": "glm53",
       "index": 1,
       "storage": "work",
-      "description": "GLM-5.3 on a modern vLLM release (v0.27.1 + NGC 26.07, no PR graft) — own container, the upgrade path off glm52's pinned-main build"
+      "description": "GLM-5.3 on a modern vLLM release (v0.27.1 + NGC 26.07, no PR graft) — own container, the upgrade path off glm52's pinned-main build",
+      "family": "glm",
+      "version": "5.3",
+      "params": "744b",
+      "active": "40b",
+      "quant": "block FP8",
+      "ctx": "128k",
+      "variant": "vllm027",
+      "status": "not yet run (upgrade-path container)",
+      "perf": "—"
     },
-    "glm53_flash": {
+    "glm-5.3-flash-320b-128k": {
       "aliases": [
+        "glm53_flash",
         "glm53-flash",
         "glm-5.3-flash",
         "glm5.3-flash",
@@ -137,10 +195,19 @@
       "container_prefix": "glm53flash",
       "index": 1,
       "storage": "projects",
-      "description": "GLM-5.3-Flash 320B/18B-active multimodal MoE — a DIFFERENT model from the 744B `glm53`: new arch Glm5NextForConditionalGeneration (45 layers = 34 KDA linear-attn + 11 NoPE sparse-MLA, 288 experts, mHC), native FP8 ~306 GiB, 1M ctx, MIT. Fits ONE node at TP=4 (tighter than glm47-AWQ's ~358 GB) and hybrid attn makes KV cheap. SOURCE BUILD on vLLM v0.32.0 + NGC 26.07 — glm5_next is native from v0.30.0 onward (NOT v0.29.0, despite what the recipe page claims), and v0.32.0's FlashInfer 0.7.0.post1 clears the >=0.6.18 NoPE-sparse-MLA floor. MTP head ships as layer 45 and vLLM registers Glm5NextMTPModel, but it is OFF by default (~7 GiB on a tight fit, unproven here). ⚠️ Hopper MUST run BF16 KV — --kv-cache-dtype fp8 is Blackwell-only for this model"
+      "description": "GLM-5.3-Flash 320B/18B-active multimodal MoE — a DIFFERENT model from the 744B `glm53`: new arch Glm5NextForConditionalGeneration (45 layers = 34 KDA linear-attn + 11 NoPE sparse-MLA, 288 experts, mHC), native FP8 ~306 GiB, 1M ctx, MIT. Fits ONE node at TP=4 (tighter than glm47-AWQ's ~358 GB) and hybrid attn makes KV cheap. SOURCE BUILD on vLLM v0.32.0 + NGC 26.07 — glm5_next is native from v0.30.0 onward (NOT v0.29.0, despite what the recipe page claims), and v0.32.0's FlashInfer 0.7.0.post1 clears the >=0.6.18 NoPE-sparse-MLA floor. MTP head ships as layer 45 and vLLM registers Glm5NextMTPModel, but it is OFF by default (~7 GiB on a tight fit, unproven here). ⚠️ Hopper MUST run BF16 KV — --kv-cache-dtype fp8 is Blackwell-only for this model",
+      "family": "glm",
+      "version": "5.3-flash",
+      "params": "320b",
+      "active": "18b",
+      "quant": "block FP8",
+      "ctx": "128k",
+      "status": "benchmarked 2026-11-06 (job 2732602)",
+      "perf": "95 tok/s single, 695 @16; run at <=16 concurrent (falls to 464 @64)"
     },
-    "glm53_flash_prebuilt": {
+    "glm-5.3-flash-320b-128k-prebuilt": {
       "aliases": [
+        "glm53_flash_prebuilt",
         "glm53-flash-prebuilt",
         "glm53flash-prebuilt",
         "glm53flashprebuilt"
@@ -152,10 +219,20 @@
       "container_prefix": "glm53flash",
       "index": 2,
       "storage": "projects",
-      "description": "GLM-5.3-Flash from the PREBUILT arm64 image vllm/vllm-openai:glm53-flash (container index 2) — the FALLBACK, kept only in case the v0.32.0 source build regresses. This was the primary path while glm5_next was absent from the public vLLM repo (Aug-Sep 2026); v0.30.0 made it unnecessary. Same serve shape and same Hopper BF16-KV rule as glm53_flash"
+      "description": "GLM-5.3-Flash from the PREBUILT arm64 image vllm/vllm-openai:glm53-flash (container index 2) — the FALLBACK, kept only in case the v0.32.0 source build regresses. This was the primary path while glm5_next was absent from the public vLLM repo (Aug-Sep 2026); v0.30.0 made it unnecessary. Same serve shape and same Hopper BF16-KV rule as glm53_flash",
+      "family": "glm",
+      "version": "5.3-flash",
+      "params": "320b",
+      "active": "18b",
+      "quant": "block FP8",
+      "ctx": "128k",
+      "variant": "prebuilt",
+      "status": "fallback image",
+      "perf": "see glm-5.3-flash-320b-128k"
     },
-    "borealis": {
+    "borealis-27b-128k": {
       "aliases": [
+        "borealis",
         "borealis-27b",
         "borealis27b",
         "nb-borealis"
@@ -167,10 +244,17 @@
       "container_prefix": "glm53",
       "index": 1,
       "storage": "projects",
-      "description": "Borealis 27B (National Library of Norway) Norwegian-centric instruct model, Gemma-3 arch, BF16 ~54 GB on a SINGLE GH200 (TP=1), multimodal SigLIP tower, 128K ctx. Shares the glm53 container"
+      "description": "Borealis 27B (National Library of Norway) Norwegian-centric instruct model, Gemma-3 arch, BF16 ~54 GB on a SINGLE GH200 (TP=1), multimodal SigLIP tower, 128K ctx. Shares the glm53 container",
+      "family": "borealis",
+      "params": "27b",
+      "quant": "BF16",
+      "ctx": "128k",
+      "status": "benchmarked 2026-08-18",
+      "perf": "56 tok/s single, 2,666 @64, flattest scaler"
     },
-    "dsv4flash": {
+    "deepseek-4-flash-304b-128k": {
       "aliases": [
+        "dsv4flash",
         "deepseek-v4-flash",
         "dsv4",
         "deepseek_v4_flash",
@@ -183,10 +267,18 @@
       "container_prefix": "glm53",
       "index": 1,
       "storage": "work",
-      "description": "DeepSeek-V4-Flash-0731 MoE (256+1 experts, 6 active), block-FP8 ~167 GB, 1 node TP=4, 1M ctx via YaRN. ⚠️ BLOCKED on vLLM v0.27.1 + NGC 26.07: its compressor unconditionally uses cutedsl at head_dim=512 on CUDA, which needs `quack`, and quack-kernels pins nvidia-cutlass-dsl==4.6.2 against vLLM 4.6.0 — unsatisfiable. Preset kept for a future vLLM. See README"
+      "description": "DeepSeek-V4-Flash-0731 MoE (256+1 experts, 6 active), block-FP8 ~167 GB, 1 node TP=4, 1M ctx via YaRN. ⚠️ BLOCKED on vLLM v0.27.1 + NGC 26.07: its compressor unconditionally uses cutedsl at head_dim=512 on CUDA, which needs `quack`, and quack-kernels pins nvidia-cutlass-dsl==4.6.2 against vLLM 4.6.0 — unsatisfiable. Preset kept for a future vLLM. See README",
+      "family": "deepseek",
+      "version": "4-flash",
+      "params": "304b",
+      "quant": "FP8 + int8 experts",
+      "ctx": "128k",
+      "status": "BLOCKED on this stack (2026-08-19)",
+      "perf": "never served a token"
     },
-    "dsv41": {
+    "deepseek-4.1-flash-748b-128k": {
       "aliases": [
+        "dsv41",
         "deepseek-v4.1",
         "deepseek-v4.1-flash",
         "dsv41flash",
@@ -200,10 +292,75 @@
       "container_prefix": "glm53flash",
       "index": 1,
       "storage": "work",
-      "description": "DeepSeek-V4.1-Flash — 552B backbone + 196B Engram memory, 8B active per prompt token / 16B per output token, 40 layers, 384+1 experts (6 active), 1M ctx via YaRN, vision-language, MIT. Arch DeepseekV41ForCausalLM, native in vLLM from v0.30.0 → REUSES the glm53flash container (v0.32.1.dev0), no build. THE POINT OF THIS PRESET: Engram's 196.6B-param hash tables (259.5 GiB, ~47 GiB/rank at TP4) are SPARSELY accessed by token lookup, so `--engram-config {cpu_offload:true}` parks them in pinned Grace host memory and the 96 GB cards hold only the backbone. KV is near-free (890 B/token, FP4 latents shared across layers) so WEIGHTS, not cache, set capacity. ⚠️ Needs fp8 KV (like dsv4, INVERSE of GLM-5.3-Flash) and the FLASHINFER_MLA_SPARSE_DSV41 backend — so it is BLOCKED until flashinfer imports in our container. DSpark is the only spec-decode method (V4.1 dropped MTP)"
+      "description": "DeepSeek-V4.1-Flash — 552B backbone + 196B Engram memory, 8B active per prompt token / 16B per output token, 40 layers, 384+1 experts (6 active), 1M ctx via YaRN, vision-language, MIT. Arch DeepseekV41ForCausalLM, native in vLLM from v0.30.0 → REUSES the glm53flash container (v0.32.1.dev0), no build. THE POINT OF THIS PRESET: Engram's 196.6B-param hash tables (259.5 GiB, ~47 GiB/rank at TP4) are SPARSELY accessed by token lookup, so `--engram-config {cpu_offload:true}` parks them in pinned Grace host memory and the 96 GB cards hold only the backbone. KV is near-free (890 B/token, FP4 latents shared across layers) so WEIGHTS, not cache, set capacity. Needs fp8 KV (like dsv4, INVERSE of GLM-5.3-Flash). Backend FLASHMLA_SPARSE_DSV41 (compiled into vLLM) — flashinfer is NOT needed; the earlier 'blocked on flashinfer' claim was disproved 2026-11-02. DSpark is the only spec-decode method (V4.1 dropped MTP). This is the BATCH operating point; see deepseek-4.1-flash-748b-1m and -128k-lowlat for the other two",
+      "family": "deepseek",
+      "version": "4.1-flash",
+      "params": "748b",
+      "active": "8b prompt / 16b output",
+      "quant": "FP8 + fp4 experts",
+      "ctx": "128k",
+      "status": "benchmarked + tuned 2026-11-06",
+      "perf": "112 tok/s single, 2,454 @64 (batch operating point)"
     },
-    "lagunas21": {
+    "deepseek-4.1-flash-748b-1m": {
       "aliases": [
+        "dsv41_1m",
+        "dsv41-1m",
+        "deepseek-v4.1-1m"
+      ],
+      "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+      "nodes": 1,
+      "gpus": 4,
+      "pp": 1,
+      "container_prefix": "glm53flash",
+      "index": 1,
+      "storage": "work",
+      "env": {
+        "MAX_MODEL_LEN": "1048576",
+        "DSV41_SPARSE_MLA_WORKSPACE_FACTOR": "2",
+        "CPU_OFFLOAD_GB": "5"
+      },
+      "description": "DeepSeek-V4.1-Flash long-context operating point: the full 1,048,576 window. All three knobs are required — MAX_MODEL_LEN alone fails (the prefill workspace scales with it). A real 1,023,096-token request decoded at 49.7 tok/s",
+      "family": "deepseek",
+      "version": "4.1-flash",
+      "params": "748b",
+      "active": "8b prompt / 16b output",
+      "quant": "FP8 + fp4 experts",
+      "ctx": "1m",
+      "status": "benchmarked 2026-11-06 (job 2731395)",
+      "perf": "full 1M window at 1.41x, 11.3x @128K; -30% throughput"
+    },
+    "deepseek-4.1-flash-748b-128k-lowlat": {
+      "aliases": [
+        "dsv41_lowlat",
+        "dsv41-lowlat",
+        "dsv41-dspark"
+      ],
+      "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+      "nodes": 1,
+      "gpus": 4,
+      "pp": 1,
+      "container_prefix": "glm53flash",
+      "index": 1,
+      "storage": "work",
+      "env": {
+        "ENABLE_SPECULATIVE": "1",
+        "CPU_OFFLOAD_GB": "4"
+      },
+      "description": "DeepSeek-V4.1-Flash low-latency operating point: DSpark speculative decode (acceptance 3.00 of 5). The 4 GB offload is not optional — DSpark's draft stages need resident memory. Single-user only; batch throughput falls by about half",
+      "family": "deepseek",
+      "version": "4.1-flash",
+      "params": "748b",
+      "active": "8b prompt / 16b output",
+      "quant": "FP8 + fp4 experts",
+      "ctx": "128k",
+      "variant": "lowlat",
+      "status": "benchmarked 2026-11-06 (job 2731404)",
+      "perf": "132 tok/s single @131K (DSpark); aggregate @16 -47%"
+    },
+    "laguna-s-2.1-118b-128k": {
+      "aliases": [
+        "lagunas21",
         "laguna-s-2.1",
         "laguna_s21",
         "lagunas",
@@ -216,10 +373,18 @@
       "container_prefix": "glm53",
       "index": 1,
       "storage": "work",
-      "description": "Laguna S 2.1 (Poolside) MoE (256 experts, 10 active), FP8 ~131 GB, 1 node TP=4, 1M ctx, alternating full/sliding-window attn. Speculative decode via the separate DFlash draft (vLLM registers DFlashLagunaForCausalLM). Shares the glm53 container"
+      "description": "Laguna S 2.1 (Poolside) MoE (256 experts, 10 active), FP8 ~131 GB, 1 node TP=4, 1M ctx, alternating full/sliding-window attn. Speculative decode via the separate DFlash draft (vLLM registers DFlashLagunaForCausalLM). Shares the glm53 container",
+      "family": "laguna",
+      "version": "s-2.1",
+      "params": "118b",
+      "quant": "FP8",
+      "ctx": "128k",
+      "status": "benchmarked 2026-08-18",
+      "perf": "193 tok/s single, 5,230 @64, 7,751 @128"
     },
-    "qwen38": {
+    "qwen-3.8-27b-256k": {
       "aliases": [
+        "qwen38",
         "qwen3.8",
         "qwen38-27b",
         "qwen3.8-27b",
@@ -232,10 +397,18 @@
       "container_prefix": "glm53",
       "index": 1,
       "storage": "projects",
-      "description": "Qwen3.8 27B DENSE multimodal (Qwen3_5ForConditionalGeneration), block-FP8 ~30 GB on a SINGLE GH200 card (TP=1), hybrid linear+full attn, 262K ctx. Shares the glm53 container — vLLM v0.27.1 registers this arch natively"
+      "description": "Qwen3.8 27B DENSE multimodal (Qwen3_5ForConditionalGeneration), block-FP8 ~30 GB on a SINGLE GH200 card (TP=1), hybrid linear+full attn, 262K ctx. Shares the glm53 container — vLLM v0.27.1 registers this arch natively",
+      "family": "qwen",
+      "version": "3.8",
+      "params": "27b",
+      "quant": "block FP8",
+      "ctx": "256k",
+      "status": "benchmarked 2026-08-18",
+      "perf": "86 tok/s single, 3,162 @64 (MTP unmeasured)"
     },
-    "glm47": {
+    "glm-4.7-358b-32k": {
       "aliases": [
+        "glm47",
         "glm-4.7"
       ],
       "model": "QuantTrio/GLM-4.7-AWQ",
@@ -244,10 +417,18 @@
       "pp": 1,
       "container_prefix": "glm47",
       "index": 1,
-      "description": "GLM-4.7 358B, AWQ, single-node TP=4"
+      "description": "GLM-4.7 358B, AWQ, single-node TP=4",
+      "family": "glm",
+      "version": "4.7",
+      "params": "358b",
+      "quant": "AWQ int4",
+      "ctx": "32k",
+      "status": "no current benchmark",
+      "perf": "—"
     },
-    "kimi": {
+    "kimi-k2.6-1t-128k-2n": {
       "aliases": [
+        "kimi",
         "kimi26",
         "kimi-k2.6",
         "kimi_k26"
@@ -259,10 +440,19 @@
       "container_prefix": "kimi",
       "index": 4,
       "storage": "work",
-      "description": "Kimi K2.6 1T MoE (32B active), native int4, MLA, multimodal"
+      "description": "Kimi K2.6 1T MoE (32B active), native int4, MLA, multimodal",
+      "family": "kimi",
+      "version": "k2.6",
+      "params": "1t",
+      "active": "32b",
+      "quant": "native int4",
+      "ctx": "128k",
+      "status": "benchmarked 2026-06-20 (eager)",
+      "perf": "17 tok/s per stream, 591 @32"
     },
-    "kimi27": {
+    "kimi-k2.7-code-1t-128k-2n": {
       "aliases": [
+        "kimi27",
         "kimi-k2.7",
         "kimi_k27",
         "kimi-k2.7-code",
@@ -275,10 +465,19 @@
       "container_prefix": "kimi",
       "index": 4,
       "storage": "work",
-      "description": "Kimi K2.7-Code 1T MoE (32B active), native int4 (reuses kimi container)"
+      "description": "Kimi K2.7-Code 1T MoE (32B active), native int4 (reuses kimi container)",
+      "family": "kimi",
+      "version": "k2.7-code",
+      "params": "1t",
+      "active": "32b",
+      "quant": "native int4",
+      "ctx": "128k",
+      "status": "benchmarked 2026-06-20 (eager)",
+      "perf": "17 tok/s per stream, 591 @32"
     },
-    "laguna": {
+    "laguna-m.1-225b-128k": {
       "aliases": [
+        "laguna",
         "laguna-m1",
         "laguna_m1",
         "lagunam1",
@@ -292,10 +491,19 @@
       "container_prefix": "laguna",
       "index": 1,
       "storage": "projects",
-      "description": "Laguna M.1 225B MoE (23B active), block-FP8, single-node TP=4, CUDAGraph on"
+      "description": "Laguna M.1 225B MoE (23B active), block-FP8, single-node TP=4, CUDAGraph on",
+      "family": "laguna",
+      "version": "m.1",
+      "params": "225b",
+      "active": "23b",
+      "quant": "block FP8",
+      "ctx": "128k",
+      "status": "benchmarked 2026-06-20",
+      "perf": "63 tok/s single, 2,056 @64"
     },
-    "ornith": {
+    "ornith-1.5-397b-256k-2n": {
       "aliases": [
+        "ornith",
         "ornith-397b",
         "ornith-1.5-397b",
         "ornith397b",
@@ -309,10 +517,18 @@
       "container_prefix": "glm53flash",
       "index": 1,
       "storage": "work",
-      "description": "Ornith 1.5 397B MoE (Qwen3.5 hybrid GDN+full attn, 512 experts top-10) flagship, channel/token FP8 W8A8 (418 GB), 2-node TP=4+PP=2, 256K ctx (1M via YaRN). 1.5's FP8 SHIPS the MTP head (1.0's did not). Runs on the glm53flash container (vLLM v0.32.1; qwen3_5_moe native since 0.19.1) — no build"
+      "description": "Ornith 1.5 397B MoE (Qwen3.5 hybrid GDN+full attn, 512 experts top-10) flagship, channel/token FP8 W8A8 (418 GB), 2-node TP=4+PP=2, 256K ctx (1M via YaRN). 1.5's FP8 SHIPS the MTP head (1.0's did not). Runs on the glm53flash container (vLLM v0.32.1; qwen3_5_moe native since 0.19.1) — no build",
+      "family": "ornith",
+      "version": "1.5",
+      "params": "397b",
+      "quant": "FP8 W8A8 (channel/token)",
+      "ctx": "256k",
+      "status": "benchmarked 2026-11-09 (job 2777625)",
+      "perf": "79.6 tok/s single, 1,283 @64, 4.42M-token pool"
     },
-    "ornith_1m": {
+    "ornith-1.5-397b-1m-2n": {
       "aliases": [
+        "ornith_1m",
         "ornith-1m",
         "ornith-397b-1m",
         "ornith-1.5-1m"
@@ -328,10 +544,18 @@
         "MAX_MODEL_LEN": "1048576",
         "ORNITH_YARN_FACTOR": "4"
       },
-      "description": "Ornith 1.5 397B on 2 nodes with a 1M-token window (YaRN x4 via text_config). ⚠️ NOT YET VERIFIED on the 397B — the same override is needle-verified on the 122B (job 2759667) and the 4.42M-token pool fits ~4 x 1M. Static YaRN applies to every request; use plain `ornith` unless you need >256K"
+      "description": "Ornith 1.5 397B on 2 nodes with a 1M-token window (YaRN x4 via text_config). ⚠️ NOT YET VERIFIED on the 397B — the same override is needle-verified on the 122B (job 2759667) and the 4.42M-token pool fits ~4 x 1M. Static YaRN applies to every request; use plain `ornith` unless you need >256K",
+      "family": "ornith",
+      "version": "1.5",
+      "params": "397b",
+      "quant": "FP8 W8A8 (channel/token)",
+      "ctx": "1m",
+      "status": "NOT VERIFIED on the 397B (override needle-verified on the 122B)",
+      "perf": "—"
     },
-    "ornith_1n": {
+    "ornith-1.5-397b-256k-1n": {
       "aliases": [
+        "ornith_1n",
         "ornith-1n",
         "ornith-397b-1node",
         "ornith-offload",
@@ -344,10 +568,19 @@
       "container_prefix": "glm53flash",
       "index": 1,
       "storage": "work",
-      "description": "Ornith 1.5 397B on ONE node (TP=4) — the dsv41 lesson: 418 GB of weights exceed 384 GB of HBM, so CPU_OFFLOAD_GB=20 (routed experts only) parks the excess in Grace LPDDR5X behind NVLink-C2C. Measured: 59 tok/s single-stream, 299 @64, 458K-token pool. Same weights as `ornith`; half the GPUs, no cross-node PP"
+      "description": "Ornith 1.5 397B on ONE node (TP=4) — the dsv41 lesson: 418 GB of weights exceed 384 GB of HBM, so CPU_OFFLOAD_GB=20 (routed experts only) parks the excess in Grace LPDDR5X behind NVLink-C2C. Measured: 59 tok/s single-stream, 299 @64, 458K-token pool. Same weights as `ornith`; half the GPUs, no cross-node PP",
+      "family": "ornith",
+      "version": "1.5",
+      "params": "397b",
+      "quant": "FP8 W8A8 (channel/token)",
+      "ctx": "256k",
+      "node_suffix": true,
+      "status": "benchmarked 2026-11-08 (job 2760309)",
+      "perf": "59.3 tok/s single, 299 @64, 458K-token pool (20 GiB experts in Grace)"
     },
-    "ornith_1n_lowlat": {
+    "ornith-1.5-397b-256k-1n-lowlat": {
       "aliases": [
+        "ornith_1n_lowlat",
         "ornith-1n-lowlat",
         "ornith-397b-1node-mtp",
         "ornith-1n-mtp"
@@ -364,10 +597,20 @@
         "ORNITH_SPEC_METHOD": "mtp",
         "CPU_OFFLOAD_GB": "22"
       },
-      "description": "Ornith 1.5 397B on ONE node, single-user latency shape: MTP + 22 GiB of experts in Grace (20 GiB does not fit MTP with a 256K window). Measured (job 2766587): 75.6 tok/s single at 1K, 63 at 128K — but a 315K-token pool, so 8-32K prompts lose prefix cache and @64 falls to 229. Prefer `ornith_1n` for anything concurrent"
+      "description": "Ornith 1.5 397B on ONE node, single-user latency shape: MTP + 22 GiB of experts in Grace (20 GiB does not fit MTP with a 256K window). Measured (job 2766587): 75.6 tok/s single at 1K, 63 at 128K — but a 315K-token pool, so 8-32K prompts lose prefix cache and @64 falls to 229. Prefer `ornith_1n` for anything concurrent",
+      "family": "ornith",
+      "version": "1.5",
+      "params": "397b",
+      "quant": "FP8 W8A8 (channel/token)",
+      "ctx": "256k",
+      "variant": "lowlat",
+      "node_suffix": true,
+      "status": "benchmarked 2026-11-08 (job 2766587)",
+      "perf": "75.6 tok/s single, 229 @64, 315K-token pool"
     },
-    "ornith_122b": {
+    "ornith-1.5-122b-256k": {
       "aliases": [
+        "ornith_122b",
         "ornith-122b",
         "ornith-1.5-122b",
         "ornith122b",
@@ -380,12 +623,20 @@
       "container_prefix": "glm53flash",
       "index": 1,
       "storage": "projects",
-      "description": "Ornith 1.5 122B-A10B MoE (NEW size; Qwen3.5 hybrid GDN+full attn, 48 layers, 256 experts top-8) channel/token FP8 W8A8 (133 GB), single node TP=4, 256K ctx (1M via YaRN), MTP head shipped. Runs on the glm53flash container — no build"
+      "description": "Ornith 1.5 122B-A10B MoE (NEW size; Qwen3.5 hybrid GDN+full attn, 48 layers, 256 experts top-8) channel/token FP8 W8A8 (133 GB), single node TP=4, 256K ctx (1M via YaRN), MTP head shipped. Runs on the glm53flash container — no build",
+      "family": "ornith",
+      "version": "1.5",
+      "params": "122b",
+      "active": "10b",
+      "quant": "FP8 W8A8 (channel/token)",
+      "ctx": "256k",
+      "status": "benchmarked 2026-11-08 (jobs 2754478, 2754533)",
+      "perf": "192 tok/s single, 3,300 @64 with MTP (default)"
     },
-    "ornith_122b_1m": {
+    "ornith-1.5-122b-1m": {
       "aliases": [
+        "ornith_122b_1m",
         "ornith-122b-1m",
-        "ornith-1.5-122b-1m",
         "ornith122b-1m"
       ],
       "model": "ornith-ai/Ornith-1.5-122B-FP8",
@@ -400,10 +651,19 @@
         "ORNITH_YARN_FACTOR": "4",
         "ENABLE_SPECULATIVE": "0"
       },
-      "description": "Ornith 1.5 122B with a 1M-token window (YaRN x4 via text_config). ✅ Needle-verified at 1,036,709 tokens (job 2759667): 4.59M-token pool = 4.38x @1M, 54.8 tok/s @512K, 36.2 @878K. MTP is OFF here because that is the configuration verified; ENABLE_SPECULATIVE=1 to try MTP + 1M (untested). Static YaRN applies to every request; use plain `ornith_122b` unless you need >256K"
+      "description": "Ornith 1.5 122B with a 1M-token window (YaRN x4 via text_config). ✅ Needle-verified at 1,036,709 tokens (job 2759667): 4.59M-token pool = 4.38x @1M, 54.8 tok/s @512K, 36.2 @878K. MTP is OFF here because that is the configuration verified; ENABLE_SPECULATIVE=1 to try MTP + 1M (untested). Static YaRN applies to every request; use plain `ornith_122b` unless you need >256K",
+      "family": "ornith",
+      "version": "1.5",
+      "params": "122b",
+      "active": "10b",
+      "quant": "FP8 W8A8 (channel/token)",
+      "ctx": "1m",
+      "status": "needle-verified 2026-11-08 (job 2759667)",
+      "perf": "120 tok/s @1K, 54.8 @512K, 36.2 @878K; 4.38x @1M"
     },
-    "ornith_gh200": {
+    "ornith-1.0-35b-256k": {
       "aliases": [
+        "ornith_gh200",
         "ornith-gh200",
         "ornith-1gpu",
         "ornith-solo",
@@ -418,10 +678,19 @@
       "container_prefix": "ornith",
       "index": 1,
       "storage": "projects",
-      "description": "Ornith 1.0 35B MoE (Qwen3.5, ~3B active) FP8 on a SINGLE GH200 card (TP=1), MTP on, 256K ctx — max single-user throughput (shares the ornith container)"
+      "description": "Ornith 1.0 35B MoE (Qwen3.5, ~3B active) FP8 on a SINGLE GH200 card (TP=1), MTP on, 256K ctx — max single-user throughput (shares the ornith container)",
+      "family": "ornith",
+      "version": "1.0",
+      "params": "35b",
+      "active": "3b",
+      "quant": "FP8 W8A8 (channel/token)",
+      "ctx": "256k",
+      "status": "benchmarked 2026-07-16 — its 1.0 container is purge-hollowed",
+      "perf": "174 tok/s single, 4,621 @64"
     },
-    "devstral": {
+    "devstral-2-123b-32k": {
       "aliases": [
+        "devstral",
         "mistral"
       ],
       "model": "mistralai/Devstral-2-123B-Instruct-2512",
@@ -430,10 +699,18 @@
       "pp": 1,
       "container_prefix": "devstral",
       "index": 1,
-      "description": "Devstral 2 123B, single-node TP=4"
+      "description": "Devstral 2 123B, single-node TP=4",
+      "family": "devstral",
+      "version": "2",
+      "params": "123b",
+      "quant": "FP8",
+      "ctx": "32k",
+      "status": "no current benchmark",
+      "perf": "—"
     },
-    "llama": {
+    "llama-3.3-70b-32k": {
       "aliases": [
+        "llama",
         "llama3"
       ],
       "model": "meta-llama/Llama-3.3-70B-Instruct",
@@ -442,10 +719,18 @@
       "pp": 1,
       "container_prefix": "llama",
       "index": 1,
-      "description": "Llama 3.3 70B Instruct, single-node TP=4"
+      "description": "Llama 3.3 70B Instruct, single-node TP=4",
+      "family": "llama",
+      "version": "3.3",
+      "params": "70b",
+      "quant": "BF16",
+      "ctx": "32k",
+      "status": "no current benchmark",
+      "perf": "—"
     },
-    "qwen": {
+    "qwen-2.5-72b-32k": {
       "aliases": [
+        "qwen",
         "qwen2"
       ],
       "model": "Qwen/Qwen2.5-72B-Instruct",
@@ -454,7 +739,14 @@
       "pp": 1,
       "container_prefix": "qwen",
       "index": 1,
-      "description": "Qwen 2.5 72B Instruct, single-node TP=4"
+      "description": "Qwen 2.5 72B Instruct, single-node TP=4",
+      "family": "qwen",
+      "version": "2.5",
+      "params": "72b",
+      "quant": "BF16",
+      "ctx": "32k",
+      "status": "no current benchmark",
+      "perf": "—"
     },
     "generic": {
       "aliases": [],
@@ -466,8 +758,9 @@
       "index": 1,
       "description": "Generic build defaults (no default model)"
     },
-    "glm52_awq_1n": {
+    "glm-5.2-744b-128k-1n": {
       "aliases": [
+        "glm52_awq_1n",
         "glm52awq1n",
         "glm-5.2-awq-1n"
       ],
@@ -478,10 +771,20 @@
       "container_prefix": "glm52",
       "index": 1,
       "storage": "projects",
-      "description": "GLM-5.2 AWQ-INT4 SINGLE-node TP=4 via Grace weight offload (--cpu-offload-gb); no PP wedge, long-context experiment. Requires CPU_OFFLOAD_GB (auto-defaults 40)."
+      "description": "GLM-5.2 AWQ-INT4 SINGLE-node TP=4 via Grace weight offload (--cpu-offload-gb); no PP wedge, long-context experiment. Requires CPU_OFFLOAD_GB (auto-defaults 40).",
+      "family": "glm",
+      "version": "5.2",
+      "params": "744b",
+      "active": "40b",
+      "quant": "AWQ int4",
+      "ctx": "128k",
+      "node_suffix": true,
+      "status": "benchmarked 2026-07-03",
+      "perf": "~22 tok/s single, ~241 @64 (capture + MTP + offload40)"
     },
-    "glm52_awq_mtp": {
+    "glm-5.2-744b-128k-1n-mtp": {
       "aliases": [
+        "glm52_awq_mtp",
         "glm52-awq-mtp",
         "glm52awqmtp"
       ],
@@ -493,7 +796,17 @@
       "container_prefix": "glm52",
       "index": 1,
       "storage": "projects",
-      "description": "GLM-5.2 AWQ-INT4 body + grafted FP8 MTP layer-78 (dnhkng graft of GLM-5.2-FP8). LOCAL-PATH model. Single-node TP=4 + Grace offload + MTP spec-decode (auto-on via 'MTP' in path). Container vLLM MUST carry patches/vllm-awq-fp8-mtp-quant-config.patch (live-patch or rebuild)."
+      "description": "GLM-5.2 AWQ-INT4 body + grafted FP8 MTP layer-78 (dnhkng graft of GLM-5.2-FP8). LOCAL-PATH model. Single-node TP=4 + Grace offload + MTP spec-decode (auto-on via 'MTP' in path). Container vLLM MUST carry patches/vllm-awq-fp8-mtp-quant-config.patch (live-patch or rebuild).",
+      "family": "glm",
+      "version": "5.2",
+      "params": "744b",
+      "active": "40b",
+      "quant": "AWQ int4 + FP8 MTP graft",
+      "ctx": "128k",
+      "variant": "mtp",
+      "node_suffix": true,
+      "status": "experimental (local MTP-grafted checkpoint)",
+      "perf": "see glm-5.2-744b-128k-1n"
     }
   }
 }

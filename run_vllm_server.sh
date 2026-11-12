@@ -144,6 +144,28 @@ ORNITH_REASONING_PARSER="${ORNITH_REASONING_PARSER:-qwen3}"
 # single MTP layer is applied autoregressively). Tune 1-3 and watch accept rate.
 ORNITH_MTP_METHOD="${ORNITH_MTP_METHOD:-mtp}"
 ORNITH_MTP_SPECULATIVE_TOKENS="${ORNITH_MTP_SPECULATIVE_TOKENS:-2}"
+# Ornith 1.5 spec-decode method: "mtp" (the shipped head) or "dflash" (the
+# separate block-diffusion drafter repo, 9B/35B/397B only — there is NO 122B
+# drafter). DFlash's card recipe uses 8 speculative tokens (block_size is 16).
+ORNITH_SPEC_METHOD="${ORNITH_SPEC_METHOD:-${ORNITH_MTP_METHOD}}"
+ORNITH_DFLASH_MODEL="${ORNITH_DFLASH_MODEL:-}"
+ORNITH_DFLASH_TOKENS="${ORNITH_DFLASH_TOKENS:-8}"
+# Hybrid state-cache cap. Every GDN linear-attn layer holds one recurrent-state
+# block per decode sequence, drawn from the KV budget, and vLLM's default
+# max_num_seqs=1024 can exceed the blocks available — glm53_flash died that way
+# 8.6 min in, AFTER a full load + capture. 128 covers every sweep we run.
+ORNITH_MAX_NUM_SEQS="${ORNITH_MAX_NUM_SEQS:-128}"
+# YaRN context extension (card-validated: factor 4.0 over 262144 ~= 1M). Static
+# scaling — it applies to EVERY request, which the card says slightly hurts
+# ordinary-length quality, so it is opt-in. Empty = native 256K.
+ORNITH_YARN_FACTOR="${ORNITH_YARN_FACTOR:-}"
+# Restrict CPU (UVA) weight offload to named parameter segments, e.g. "experts".
+# vLLM >= 0.32 --cpu-offload-params. Without it, --cpu-offload-gb evicts in
+# layer order, offloading dense/attention weights that EVERY step reads — the
+# dsv41 1:3 throughput exchange rate. MoE experts are read sparsely (top-k of N
+# per token), so a zero-copy UVA read over NVLink-C2C touches only the routed
+# experts' rows. Space-separated list. Empty = vLLM's non-selective default.
+CPU_OFFLOAD_PARAMS="${CPU_OFFLOAD_PARAMS:-}"
 # GDN (Gated DeltaNet) linear-attention prefill backend. On Hopper vLLM defaults
 # ("auto") to FlashInfer for the GDN prefill kernel, but flashinfer 0.6.x is
 # version-skewed against the NGC container's cutlass-dsl (its Blackwell kernel
@@ -477,15 +499,34 @@ fi
 #     linear-attn layers need a mamba/GDN kernel + recurrent state, not FLASH_ATTN).
 #   - MULTIMODAL: ships a vision tower (model.visual.*, 333 tensors) + video
 #     preprocessor. We serve it for TEXT (coding); the vision encoder just loads.
-#   - MTP: config declares mtp_num_hidden_layers=1, but the FP8 export SHIPS NO
-#     MTP WEIGHTS (layers stop at 39, zero mtp/nextn tensors). So MTP speculative
-#     decode does NOT work on the published FP8 checkpoints — it is OFF by default
-#     (ENABLE_SPECULATIVE=1 only if you point at a checkpoint that has the head).
-# Uses the qwen3_xml/qwen3 parser family. Both `ornith` (2-node 397B) and
-# `ornith_gh200` (1× GH200 35B) hit this block; it is shape-agnostic.
+#   - MTP (1.0 ONLY): config declares mtp_num_hidden_layers=1, but the 1.0 FP8
+#     export SHIPS NO MTP WEIGHTS (layers stop at 39, zero mtp/nextn tensors).
+#
+# Ornith 1.5 (org renamed deepreinforce-ai -> ornith-ai; 1.0 repo URLs redirect).
+# Same arch and same channel/token W8A8 FP8. VERIFIED from the published 1.5 FP8
+# config.json + model.safetensors.index.json (2026-11-08):
+#   - sizes: 9B, 35B-A3B, 122B-A10B (NEW, 48 layers, 256 experts top-8, 133 GB),
+#     397B (60 layers, 512 experts top-10, 418 GB). Hybrid 3:1 GDN:full, 2 KV heads.
+#   - MTP HEAD IS SHIPPED in 1.5's FP8: 785 `mtp.*` tensors (122B/35B), 1553 (397B).
+#     The exact reverse of 1.0. vLLM registers Qwen3_5MoeMTP, so MTP is usable.
+#   - DFlash block-diffusion drafters published for 9B/35B/397B (NOT 122B):
+#     ornith-ai/Ornith-1.5-<size>-DFlash, arch DFlashDraftModel (registered in
+#     v0.32.1), block_size 16, the card's recipe uses num_speculative_tokens 8.
+#   - 1M context via YaRN factor 4 over 262144 (card-validated), static scaling.
+# Uses the qwen3_xml/qwen3 parser family. `ornith` (2-node 397B), `ornith_1n`
+# (1-node 397B + Grace offload), `ornith_122b` and `ornith_gh200` all hit this
+# block; it is shape-agnostic.
 IS_ORNITH=0
 if [[ "${MODEL}" == *"Ornith"* ]] || [[ "${MODEL}" == *"ornith"* ]]; then
     IS_ORNITH=1
+fi
+IS_ORNITH15=0
+if [[ "${IS_ORNITH}" == "1" && ( "${MODEL}" == *"1.5"* ) ]]; then
+    IS_ORNITH15=1
+fi
+IS_ORNITH_397B=0
+if [[ "${IS_ORNITH}" == "1" && "${MODEL}" == *"397B"* ]]; then
+    IS_ORNITH_397B=1
 fi
 
 # Detect Qwen3.8 (Alibaba, open weights 2026-08-13/14, Apache 2.0). VERIFIED from
@@ -784,6 +825,37 @@ if [[ "${IS_GLM52}" == "1" && "${IS_AWQ}" == "1" && "${NUM_NODES}" -le 1 && -z "
     CPU_OFFLOAD_GB=40
     echo "[INFO] single-node GLM-5.2 AWQ: defaulting CPU_OFFLOAD_GB=${CPU_OFFLOAD_GB} (weights exceed HBM without offload)"
 fi
+
+# Ornith 397B on ONE node (preset ornith_1n): 418 GB of FP8 weights is ~97.4 GiB
+# per rank at TP=4 — more than a whole 96 GB card, before any KV. So park part
+# of it in Grace LPDDR5X behind NVLink-C2C, the dsv41 lesson. Two refinements
+# over dsv41's recipe:
+#   - offload ONLY the routed experts (CPU_OFFLOAD_PARAMS=experts). They are ~93%
+#     of the bytes but each token touches 10 of 512, so a zero-copy UVA read moves
+#     a small fraction of the offloaded bytes per step. dsv41 offloaded in layer
+#     order and paid ~1:3 throughput per GB.
+#   - the default is a STARTING POINT, sized from arithmetic (97.4 GiB weights −
+#     ~85 GiB budget at util 0.90 + activations/graphs + a KV pool), to be walked
+#     DOWN by measurement — dsv41's rule is "use the minimum that reaches the
+#     target".
+if [[ "${IS_ORNITH_397B}" == "1" && "${NUM_NODES}" -le 1 ]]; then
+    # MEASURED 2026-11-08 (experts-only, 0 failures each):
+    #   30 GiB (job 2754516): 50.3 single, 219 @64, pool 1,142,125 tokens
+    #   20 GiB (job 2760309): 59.3 single, 299 @64, pool   458,494 tokens (1.75x @256K)
+    # and a layer-order 20 GiB control (2759654): 38.7 single, 274 @64. So 20 is
+    # the default — every GiB offloaded is a GiB read over C2C per step under
+    # batch. Raise it only to buy KV pool (~1 GiB of pool per GiB, the dsv41
+    # rate) for more concurrent long-context streams.
+    if [[ -z "${CPU_OFFLOAD_GB:-}" ]]; then
+        CPU_OFFLOAD_GB=20
+        echo "[INFO] single-node Ornith 397B: defaulting CPU_OFFLOAD_GB=${CPU_OFFLOAD_GB} — weights exceed HBM"
+    fi
+    # Experts-only whenever offloading on this shape, even if only the GB was
+    # given: job 2759654 set CPU_OFFLOAD_GB=20 alone and silently got a
+    # layer-order offload. CPU_OFFLOAD_PARAMS=all selects the non-selective mode.
+    CPU_OFFLOAD_PARAMS="${CPU_OFFLOAD_PARAMS:-experts}"
+fi
+[[ "${CPU_OFFLOAD_PARAMS:-}" == "all" ]] && CPU_OFFLOAD_PARAMS=""
 
 # GLM-5.2 cold load is vLLM-pipeline-bound, not I/O-bound: the default loader
 # takes ~56 min for the ~415 GiB AWQ checkpoint (and MTP double-loads to ~84 min).
@@ -1318,8 +1390,20 @@ elif [[ "${ENABLE_SPECULATIVE}" == "auto" ]]; then
     # but the published FP8 checkpoints ship NO MTP weights (verified on-cluster),
     # so --speculative-config mtp would fail to load a draft. Opt in with
     # ENABLE_SPECULATIVE=1 only against a checkpoint that actually has the head.
-    if [[ "${IS_ORNITH}" == "1" && "${ENABLE_SPECULATIVE}" == "auto" ]]; then
-        echo "[INFO] Ornith: MTP speculative decode OFF (FP8 checkpoint ships no MTP weights). ENABLE_SPECULATIVE=1 to force."
+    # Ornith 1.5 DOES ship the head, but it stays opt-in until measured here:
+    # spec decode trades aggregate for single-stream (dsv41's DSpark lost 47% at
+    # 16 streams), so it is an operating point, not a free default.
+    # EXCEPT the 122B, where it is MEASURED (job 2754533 vs baseline 2754478,
+    # 2026-11-08): MTP x2 accepts 2.17 tokens/step, +40..64% single-stream at
+    # every context 1K-256K, +19% aggregate @64 at 1K, -2.5% @64 at 8K (the only
+    # regression), for 1.2 GiB/GPU and 4.50M -> 3.89M KV tokens. So on by default.
+    if [[ "${IS_ORNITH15}" == "1" && "${MODEL}" == *"122B"* && "${ENABLE_SPECULATIVE}" == "auto" ]]; then
+        USE_SPECULATIVE=1
+        echo "[INFO] Ornith 1.5 122B: MTP ON by default (measured +61% single-stream). ENABLE_SPECULATIVE=0 to disable."
+    elif [[ "${IS_ORNITH15}" == "1" && "${ENABLE_SPECULATIVE}" == "auto" ]]; then
+        echo "[INFO] Ornith 1.5: spec decode OFF by default (MTP head IS shipped; DFlash drafter exists for 35B/397B). ENABLE_SPECULATIVE=1 [ORNITH_SPEC_METHOD=mtp|dflash] to enable."
+    elif [[ "${IS_ORNITH}" == "1" && "${ENABLE_SPECULATIVE}" == "auto" ]]; then
+        echo "[INFO] Ornith 1.0: MTP speculative decode OFF (FP8 checkpoint ships no MTP weights). ENABLE_SPECULATIVE=1 to force."
     fi
 fi
 
@@ -1339,15 +1423,30 @@ elif [[ "${USE_SPECULATIVE}" == "1" && "${PP_SIZE}" -gt 1 ]]; then
     echo "[INFO] ALLOW_MTP_PP=1: keeping MTP enabled with PP_SIZE=${PP_SIZE} (testing main's SupportsPP)"
 fi
 
+# Ornith DFlash: the drafter is a SEPARATE repo, named like the target with
+# -FP8 swapped for -DFlash (ornith-ai/Ornith-1.5-397B-FP8 -> ...-397B-DFlash).
+# There is no 122B drafter, so refuse loudly rather than 404 inside the job.
+if [[ "${USE_SPECULATIVE}" == "1" && "${IS_ORNITH}" == "1" && "${ORNITH_SPEC_METHOD}" == "dflash" && -z "${ORNITH_DFLASH_MODEL}" ]]; then
+    ORNITH_DFLASH_MODEL="${MODEL%-FP8}-DFlash"
+    if [[ "${MODEL}" == *"122B"* ]]; then
+        echo "[ERROR] Ornith 1.5 122B has no published DFlash drafter; use ORNITH_SPEC_METHOD=mtp or set ORNITH_DFLASH_MODEL." >&2
+        exit 1
+    fi
+fi
+
 echo "Speculative Decoding:"
 if [[ "${USE_SPECULATIVE}" == "1" ]]; then
     if [[ "${IS_GLM_MOE}" == "1" ]]; then
         echo "  Enabled:          yes"
         echo "  Method:           MTP (Multi-Token Prediction)"
         echo "  Spec Tokens:      ${MTP_SPECULATIVE_TOKENS}"
+    elif [[ "${IS_ORNITH}" == "1" && "${ORNITH_SPEC_METHOD}" == "dflash" ]]; then
+        echo "  Enabled:          yes"
+        echo "  Method:           dflash (drafter ${ORNITH_DFLASH_MODEL})"
+        echo "  Spec Tokens:      ${ORNITH_DFLASH_TOKENS}"
     elif [[ "${IS_ORNITH}" == "1" ]]; then
         echo "  Enabled:          yes"
-        echo "  Method:           ${ORNITH_MTP_METHOD} (native qwen3_5_moe MTP)"
+        echo "  Method:           ${ORNITH_SPEC_METHOD} (native qwen3_5_moe MTP)"
         echo "  Spec Tokens:      ${ORNITH_MTP_SPECULATIVE_TOKENS}"
     else
         echo "  Enabled:          yes"
@@ -1403,17 +1502,22 @@ fi
 
 if [[ "${IS_ORNITH}" == "1" ]]; then
     echo ""
-    echo "Ornith 1.0 Settings:"
+    if [[ "${IS_ORNITH15}" == "1" ]]; then echo "Ornith 1.5 Settings:"; else echo "Ornith 1.0 Settings:"; fi
     echo "  Tool Parser:      ${ORNITH_TOOL_PARSER:-<none>}"
     echo "  Reasoning Parser: ${ORNITH_REASONING_PARSER:-<none>}"
     echo "  Auto Tool Choice: ${ENABLE_AUTO_TOOL_CHOICE}"
     echo "  Attention:        hybrid (Gated-DeltaNet linear + full self-attn), backend ${VLLM_ATTENTION_BACKEND:-<auto-select>}"
     echo "  Multimodal:       vision tower present (served for text)"
     if [[ "${USE_SPECULATIVE}" == "1" ]]; then
-        echo "  MTP:              ${ORNITH_MTP_SPECULATIVE_TOKENS} tokens (forced via ENABLE_SPECULATIVE=1)"
+        echo "  Spec decode:      ${ORNITH_SPEC_METHOD} (ENABLE_SPECULATIVE=1)"
+    elif [[ "${IS_ORNITH15}" == "1" ]]; then
+        echo "  Spec decode:      off (opt-in; MTP head shipped in 1.5)"
     else
-        echo "  MTP:              off (FP8 checkpoint ships no MTP weights)"
+        echo "  MTP:              off (1.0 FP8 checkpoint ships no MTP weights)"
     fi
+    echo "  Max num seqs:     ${ORNITH_MAX_NUM_SEQS:-<vLLM default>} (hybrid GDN state-cache cap)"
+    echo "  YaRN factor:      ${ORNITH_YARN_FACTOR:-<off, native 262144>}"
+    echo "  CPU offload:      ${CPU_OFFLOAD_GB:-0} GiB/GPU, params: ${CPU_OFFLOAD_PARAMS:-<non-selective>}"
     if [[ "${TP_SIZE}" == "1" ]]; then
         echo "  Shape:            single GH200 card (TP=1) — max single-user throughput"
     elif [[ "${NUM_NODES}" -gt 1 ]]; then
@@ -1662,6 +1766,13 @@ fi
 
 if [[ -n "${CPU_OFFLOAD_GB:-}" && "${CPU_OFFLOAD_GB}" != "0" ]]; then
     VLLM_ARGS+=("--cpu-offload-gb" "${CPU_OFFLOAD_GB}")
+    # Selective offload (vLLM >= 0.32): only parameters whose name contains one
+    # of these exact segments are offloaded. nargs="+" style, one element each.
+    if [[ -n "${CPU_OFFLOAD_PARAMS:-}" ]]; then
+        # shellcheck disable=SC2206
+        _OFFLOAD_PARAMS=(${CPU_OFFLOAD_PARAMS})
+        VLLM_ARGS+=("--cpu-offload-params" "${_OFFLOAD_PARAMS[@]}")
+    fi
 fi
 
 # Native CPU KV-cache offload (queue item (b), plans/proposed/glm52_kv_tiering.md):
@@ -1741,7 +1852,12 @@ if [[ "${USE_SPECULATIVE}" == "1" ]]; then
     elif [[ "${IS_ORNITH}" == "1" ]]; then
         # Ornith (qwen3_5_moe) ships a native MTP module — vLLM's generic "mtp"
         # method loads it and drafts from the model's own head, no draft model.
-        SPEC_CONFIG='{"method": "'${ORNITH_MTP_METHOD}'", "num_speculative_tokens": '${ORNITH_MTP_SPECULATIVE_TOKENS}'}'
+        if [[ "${ORNITH_SPEC_METHOD}" == "dflash" ]]; then
+            # 1.5 DFlash: separate block-diffusion drafter (card recipe: 8 tokens).
+            SPEC_CONFIG='{"method": "dflash", "model": "'${ORNITH_DFLASH_MODEL}'", "num_speculative_tokens": '${ORNITH_DFLASH_TOKENS}'}'
+        else
+            SPEC_CONFIG='{"method": "'${ORNITH_SPEC_METHOD}'", "num_speculative_tokens": '${ORNITH_MTP_SPECULATIVE_TOKENS}'}'
+        fi
     else
         # Default: ngram speculative decoding
         SPEC_CONFIG='{"method": "ngram", "num_speculative_tokens": '${NUM_SPECULATIVE_TOKENS}', "prompt_lookup_max": '${PROMPT_LOOKUP_MAX}'}'
@@ -1865,6 +1981,28 @@ if [[ "${IS_ORNITH}" == "1" ]]; then
     # Passed as one array element straight to `vllm serve`, so the JSON is safe.
     if [[ -n "${ORNITH_GDN_PREFILL_BACKEND}" ]]; then
         VLLM_ARGS+=("--additional-config" "{\"gdn_prefill_backend\": \"${ORNITH_GDN_PREFILL_BACKEND}\"}")
+    fi
+    if [[ -n "${ORNITH_MAX_NUM_SEQS}" ]]; then
+        VLLM_ARGS+=("--max-num-seqs" "${ORNITH_MAX_NUM_SEQS}")
+    fi
+    # YaRN. ⚠️ NOT the model card's form. The card gives a TOP-LEVEL
+    #   --hf-overrides '{"rope_scaling": {...}}'
+    # but Ornith is Qwen3_5MoeForConditionalGeneration: the text model builds its
+    # rotary embedding from text_config.rope_parameters (qwen3_5.py: get_rope(...,
+    # rope_parameters=config.rope_parameters)), and vLLM's _apply_dict_overrides
+    # just setattr()s a top-level `rope_scaling` onto the OUTER multimodal config,
+    # where nothing reads it. So the card's recipe leaves plain M-RoPE in place
+    # and only VLLM_ALLOW_LONG_MAX_MODEL_LEN lets the window exceed 262144 — the
+    # positions past it are untrained. Target the nested text config instead;
+    # _update_nested MERGES dicts, so mrope_section/interleaved/partial_rotary/
+    # theta are kept and only the scaling keys are added. vLLM's yarn branch
+    # builds MRotaryEmbedding(scaling_factor=...), so YaRN+M-RoPE is supported.
+    # max_position_embeddings is raised too: for yarn vLLM treats it as ALREADY
+    # scaled (config/model.py), so this is what lifts the derived max_model_len.
+    # MAX_MODEL_LEN must still be raised by the caller (the 256K default stays).
+    if [[ -n "${ORNITH_YARN_FACTOR}" ]]; then
+        _YARN_MAXPOS=$(awk -v f="${ORNITH_YARN_FACTOR}" 'BEGIN{printf "%d", 262144*f}')
+        VLLM_ARGS+=("--hf-overrides" "{\"text_config\": {\"rope_parameters\": {\"rope_type\": \"yarn\", \"factor\": ${ORNITH_YARN_FACTOR}, \"original_max_position_embeddings\": 262144}, \"max_position_embeddings\": ${_YARN_MAXPOS}}}")
     fi
 fi
 

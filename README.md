@@ -241,7 +241,9 @@ export ANTHROPIC_BASE_URL=http://localhost:8002 ANTHROPIC_AUTH_TOKEN=x && claude
 | `kimi` | `moonshotai/Kimi-K2.6` | 8 (2 nodes × 4) | `vllm-kimi-4` | TP=4 + PP=2, native int4, MLA, multimodal, vLLM 0.21. Eager. reasoning_tokens on chat/completions |
 | `kimi27` | `moonshotai/Kimi-K2.7-Code` | 8 (2 nodes × 4) | `vllm-kimi-4` (shared) | Same arch + container as K2.6 (no rebuild); thinking-only |
 | `laguna` | `poolside/Laguna-M.1-FP8` | 4 | `vllm-laguna-1` | TP=4, single node. FP8 (~225 GB), dense attention (FLASH_ATTN), CUDAGraph on. vLLM v0.21.0, `poolside_v1` parsers |
-| `ornith` | `deepreinforce-ai/Ornith-1.0-397B-FP8` | 8 (2 nodes × 4) | `vllm-ornith-1` | **397B flagship.** TP=4 + PP=2, FP8 W8A8 (~400 GB). Qwen3.5 hybrid-attn MoE, 256K ctx, PIECEWISE capture + engine-as-actor Ray. MTP off (no head in FP8). Same multi-node PP wedge risk as glm51. vLLM main, transformers ≥5.8.1 |
+| `ornith` | `ornith-ai/Ornith-1.5-397B-FP8` | 8 (2 nodes × 4) | `vllm-glm53flash-1` (shared) | **Ornith 1.5 397B flagship.** TP=4 + PP=2, FP8 W8A8 (418 GB), 256K ctx. No build — qwen3_5_moe is native in the v0.32.1 container. 1.5 ships the MTP head (opt-in). ✅ Serves: **79.6 tok/s single, 1,283 @64**, 4.42M-token pool, 0 failures (job 2777625) |
+| `ornith_1n` | `ornith-ai/Ornith-1.5-397B-FP8` | **4 (1 node)** | `vllm-glm53flash-1` (shared) | **The 397B on ONE node**: 20 GiB/GPU of routed experts in Grace memory (`--cpu-offload-params experts`). ✅ Serves: **59 tok/s single-stream, 299 @64** at the 20 GiB default (458K-token pool); aggregate is offload-bandwidth-bound |
+| `ornith_122b` | `ornith-ai/Ornith-1.5-122B-FP8` | 4 (1 node) | `vllm-glm53flash-1` (shared) | **New in 1.5.** 122B-A10B, FP8 W8A8 (133 GB, persistent tier), TP=4. ✅ **192 tok/s single-stream, 3,300 @64 with MTP (default on)**, 4.5M-token pool, 17× @256K |
 | `ornith_gh200` | `deepreinforce-ai/Ornith-1.0-35B-FP8` | 1 | `vllm-ornith-1` (shared) | **35B on a single GH200 card** (TP=1), ~3B active, hybrid linear+full attn, multimodal, 256K ctx — max single-user throughput. MTP off (no head in FP8). Shares the `ornith` container, `qwen3_xml`/`qwen3` parsers |
 | `gemma4` | Gemma 4 (31B, multimodal) | 1–2 | `vllm-gemma4-1` | vLLM v0.19.0, AWQ |
 | `devstral` | `mistralai/Devstral-2-123B-Instruct-2512` | 4 | `vllm-devstral-1` | TP=4 |
@@ -267,11 +269,14 @@ actually spend.
 | `qwen38` | 27B dense FP8 | 1 | 3,162 tok/s | **3,162** |
 | `borealis` | 27B Gemma-3 BF16 | 1 | 2,666 tok/s | **2,666** |
 | `lagunas21` | Laguna S 2.1 FP8 | 4 | 7,751 tok/s | **1,938** |
+| `ornith_122b` | Ornith 1.5 122B-A10B FP8, MTP | 4 | 3,300 tok/s | **825** |
 | `dsv41` | **748B** + Engram offload | 4 | 2,465 tok/s | **616** |
 | `laguna` | Laguna M.1 FP8 | 4 | 2,056 tok/s | **514** |
 | `glm53_flash` | 320B/18B `glm5_next` | 4 | 695 tok/s | **174** |
 | `glm51` | 744B AWQ | 8 | 895 tok/s | **112** |
-| `ornith` | 397B MoE FP8 | 8 | 845 tok/s | **106** |
+| `ornith` | Ornith 1.5 397B FP8, 2 nodes | 8 | 1,283 tok/s | **160** |
+| `ornith` (1.0) | Ornith 1.0 397B MoE FP8, 2 nodes | 8 | 845 tok/s | **106** |
+| `ornith_1n` | Ornith 1.5 397B, 1 node, 20 GiB experts in Grace | 4 | 299 tok/s | **75** |
 | `kimi27` | 1T int4, eager | 8 | 591 tok/s | **74** |
 | `glm52` | 744B FP8, eager | 12 | 419 tok/s | **35** |
 
@@ -285,6 +290,227 @@ and among the large models **`dsv41` is the standout** — 616 tok/s/GPU against
 a comparable parameter count, i.e. ~18× better use of the same allocation. `dsv41` is also the
 only large preset serving a **1M context** (see its section for the three operating points).
 Presets not listed have never served: `glm53`, `glm52_awq`, `dsv4flash` (blocked), `glm47`.
+
+### Ornith 1.5 `ornith_122b` — 122B-A10B FP8, 1 node × 4 GH200, TP=4 · 2026-11-08 (job 2754478)
+
+**New size in 1.5. Serves first time, no build** — `vllm-glm53flash-1-sandbox` (vLLM
+v0.32.1, transformers 5.19) carries `qwen3_5_moe` natively. Load **51 s**, 30.01 GiB/GPU,
+PIECEWISE + FULL CUDA graphs captured clean. **KV pool 52.95 GiB/GPU = 4,503,736 tokens,
+17.18× concurrency at the full 262,144 window** — only 12 of 48 layers hold KV (3:1
+GDN:full) with 2 KV heads, so the pool is ~20× dsv41's. Baseline config: spec decode off,
+`max_num_seqs` 128, prefix caching on, Triton GDN prefill, native 256K (no YaRN).
+
+`sweep_context_matrix.sh`, `max_tokens=200`, reasoning on, 0 failures in every cell:
+
+| context (actual tokens) | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| 1,040 — per-stream tok/s | **119.2** | 104.4 | 95.6 | 89.6 | 70.1 | 56.6 | 44.0 |
+| 1,040 — aggregate tok/s | 119.1 | 207.8 | 381.7 | 715.1 | 1,115 | 1,793 | **2,770** |
+| 8,036 — per-stream | 116.9 | | 93.5 | | 68.6 | | 45.7 |
+| 8,036 — aggregate | 116.0 | | 366.5 | | 1,049 | | 2,643 |
+| 32,012 — per-stream | 111.6 | | 87.5 | | 54.2 | | |
+| 127,922 — per-stream | 93.4 | | 69.7 | | | | |
+| 255,799 — per-stream | 71.8 | 62.6 | | | | | |
+
+- Above dsv41 (2,465 peak), below `lagunas21` on the same 4 GPUs (5,230 @64, 7,751 @128).
+- Decode is **flat to 32K** (−6%) and keeps **60% of short-context speed at the full 256K**.
+- ⚠️ Read **per-stream** at long context: `agg_tok_s` includes client-side prompt
+  construction (a 256K prompt is ~1.4 MB of text), so it understates the server.
+- ⚠️ TTFTs (0.18 s @1K → 0.95 s @256K) are **prefix-cache warm** — each cell's discarded
+  warm-up pass sends the same prompt. They are not cold-prefill figures.
+
+#### `ornith_122b` + MTP — the shipped head, now the default · 2026-11-08 (job 2754533)
+
+`ENABLE_SPECULATIVE=1 ORNITH_SPEC_METHOD=mtp` (2 draft tokens). The head costs 1.2 GiB/GPU;
+KV pool 4.50M → **3.89M tokens (14.85× @256K)**. **Mean acceptance length 2.17.** 0 failures.
+
+| context | 1 stream: base → MTP | 4 streams (per-stream) | 16 streams (per-stream) | 64 streams (aggregate) |
+|---|---|---|---|---|
+| 1K | 119.2 → **192.1** (+61%) | 95.6 → 131.6 | 70.1 → 101.4 | 2,770 → **3,300** (+19%) |
+| 8K | 116.9 → 191.5 (+64%) | 93.5 → 138.1 | 68.6 → 91.4 | 2,643 → 2,578 (−2.5%) |
+| 32K | 111.6 → 183.2 (+64%) | 87.5 → 132.7 | 54.2 → 82.6 | |
+| 128K | 93.4 → 142.5 (+53%) | 69.7 → 88.2 | | |
+| 256K | 71.8 → 100.8 (+40%) | (2 streams) 62.6 → 84.5 | | |
+
+**192 tok/s ties `lagunas21` (192.8) for the fastest single stream measured here**, ahead of ornith_gh200's 174. `lagunas21` remains far ahead on aggregate, but falls off faster with context (47 tok/s at 200K vs 101 here at 256K — ⚠️ not like-for-like: this sweep's prompts are prefix-cache warm, and the Laguna TTFTs were cold). And unlike dsv41's DSpark (−47% aggregate @16), MTP here is **neutral-to-positive at
+batch** — 8K @64 is the only cell that regressed. So **MTP is now ON by default for the
+122B** (`ENABLE_SPECULATIVE=0` to disable); other Ornith sizes stay opt-in until measured.
+
+#### `ornith_122b` @ 1M via the model card's YaRN recipe — ❌ RUNS, BUT IS WRONG · 2026-11-08 (job 2754537)
+
+`MAX_MODEL_LEN=1048576` + the card's `--hf-overrides '{"rope_scaling": {yarn, factor 4}}'`.
+Pool 4,598,409 tokens (4.39× @1M), and the throughput matrix looks healthy all the way out —
+**an 878,117-token request decoded at 36.2 tok/s with 0 failures** (511K: 41.5). It means
+nothing. `needle_probe.py` (passcode planted at 2% depth, asked for at the end):
+
+| prompt tokens | passcode recovered | answer |
+|---|---|---|
+| 33,975 | ✅ | correct |
+| 207,148 | ✅ | correct (inside the native 262,144) |
+| **621,676** | ❌ | `ductductductductduct…` |
+
+**The card's recipe is a silent no-op on vLLM.** Ornith is `…ForConditionalGeneration`; the
+rotary embedding is built from `text_config.rope_parameters`, and vLLM applies a top-level
+`rope_scaling` override to the *outer* config, where nothing reads it. Only
+`VLLM_ALLOW_LONG_MAX_MODEL_LEN` lets the window grow, so every position past 262,144 runs on
+untrained plain M-RoPE. `ORNITH_YARN_FACTOR` now overrides `text_config` instead (commit
+`c7778ab`); its verification run is below. ⚠️ **Lesson: a throughput sweep cannot detect a
+broken position encoding — verify long context with a needle, not with tok/s.**
+
+#### `ornith_122b` @ 1M via the CORRECTED YaRN override — ✅ WORKS · 2026-11-08 (job 2759667)
+
+`MAX_MODEL_LEN=1048576 ORNITH_YARN_FACTOR=4` (MTP off, so only YaRN differs from job
+2754537) — now packaged as the preset **`ornith_122b_1m`**
+(`./olivia.sh server start ornith_122b_1m`). The override now targets `text_config.rope_parameters`. Three independent signs it
+took: the "greater than the derived max_model_len" warning is **gone** (derived =
+`max_seq_len=1048576`), weights load **0.1 GiB larger** (30.11 vs 30.01 GiB — a 4× rotary
+cache), and the needle:
+
+| prompt tokens | card recipe (2754537) | corrected (2759667) |
+|---|---|---|
+| 33,975 | ✅ | ✅ |
+| 207,148 | ✅ | ✅ |
+| 621,675 | ❌ `ductduct…` | ✅ |
+| **1,036,709** | — | ✅ (122.5 s, ~8.5K tok/s prefill) |
+
+**A full 1M-token context, correct, on one node.** Pool 4,591,062 tokens = 4.38× @1M.
+Per-stream decode (0 failures): 1K 119.9 · 128K 97.6 · 256K 77.9 · **512K 54.8 · 878K 36.2**;
+16 streams @1K 1,134 aggregate. **Static YaRN costs nothing measurable at short context**
+(119.9 vs 119.2 baseline) — the card's quality caveat for short inputs is untested here.
+
+### Ornith 1.5 `ornith_1n` — 397B on ONE node, experts in Grace memory · 2026-11-08 (job 2754516)
+
+The flagship's 418 GB (~97.4 GiB/GPU) exceeds a whole 96 GB card, so the dsv41 lesson
+applies — but refined: `CPU_OFFLOAD_GB=30` restricted to **`--cpu-offload-params experts`**
+(new in vLLM 0.32), so only routed-expert weights live in Grace LPDDR5X and are read by
+zero-copy UVA over NVLink-C2C. Logged **30.17 GiB/GPU offloaded**, 64.83 GiB/GPU resident,
+load 252 s, CUDA graphs clean, **KV 16.79 GiB/GPU = 1,142,125 tokens (4.36× @256K)**.
+0 failures.
+
+| context | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| 1K — per-stream tok/s | **50.3** | 33.1 | 21.8 | 13.7 | 8.2 | 5.1 | 3.4 |
+| 1K — aggregate | 50.3 | 66.0 | 87.2 | 109.3 | 130.7 | 164.0 | **218.8** |
+| 8K — per-stream | 50.7 | | 22.3 | | 8.6 | | |
+| 32K — per-stream | 49.7 | | 22.4 | 13.9 | | | |
+| 128K — per-stream | 45.4 | 31.9 | | | | | |
+| 256K — per-stream | 40.5 | | | | | | |
+
+**What it shows — the expert-offload hypothesis was half right.**
+- ✅ Single stream works: **50 tok/s**, and flat with context (−20% at 256K). At batch 1 each
+  token touches 10 of 512 experts, so only their rows cross C2C. A layer-order offload of
+  the same 30 GiB would stream *all* of it every step (~70 ms/step at ~450 GB/s → ≤14 tok/s).
+- ❌ Batch does not scale: aggregate **131 @16, 219 @64**. With more sequences per step,
+  top-10-of-512 routing touches nearly every expert, so each step reads most of the 30 GiB
+  over C2C — the ~70 ms/step floor above, ≈8 tok/s/stream at 16. **Offloaded bytes per step
+  are the ceiling, so the lever is the dsv41 rule: offload the minimum.** 20 GiB and
+  20 GiB + MTP are queued next.
+#### The layer-order control — 20 GiB, non-selective · 2026-11-08 (job 2759654)
+
+An accident made useful: `CPU_OFFLOAD_PARAMS` was not forwarded by `olivia.sh` (fixed in
+`a87141e`), so this run offloaded **20.04 GiB/GPU in layer order** — dsv41's mode — instead
+of experts only. Resident 74.95 GiB/GPU, load 337 s, **KV 7.17 GiB = 453,354 tokens (1.73×
+@256K)**: 10 GiB less offload bought back 9.6 GiB of pool, the same ~1:1 rate dsv41 measured.
+
+| | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| layer-order 20 GiB — 1K aggregate | 38.7 | 60.5 | 89.8 | 124.5 | 158.7 | 208.3 | **273.6** |
+| experts-only 30 GiB — 1K aggregate | **50.3** | 66.0 | 87.2 | 109.3 | 130.7 | 164.0 | 218.8 |
+
+Single-stream by context, layer-order 20 GiB: 38.7 (1K) · 39.1 (8K) · 38.6 (32K) · 36.2
+(128K) · 32.9 (256K). 0 failures.
+
+- ❌ **My prediction was wrong.** I expected layer-order to cap at ~20 tok/s (all 20 GiB
+  read every step at an assumed ~450 GB/s). It reached **38.7**, which implies **~800 GB/s
+  effective over C2C** — about twice my assumption.
+- The two runs differ in **two** variables (mode and amount), so this does not yet say which
+  mode is better. Read only what is safe: experts-only wins **batch-1 latency** even while
+  offloading 50% more; layer-order at 20 GiB wins **every batch ≥4** and gives up 60% of the
+  pool. Experts-only at 20 GiB (queued) is the run that separates mode from amount.
+
+#### Experts-only at 20 GiB — the separating run, and the new default · 2026-11-08 (job 2760309)
+
+Same amount as the control (20.61 vs 20.04 GiB/GPU offloaded), so **only the mode differs**.
+Resident 74.38 GiB/GPU, **pool 458,494 tokens (1.75× @256K)** — matches the control's
+453,354. 0 failures.
+
+| 1K aggregate | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| **experts-only 20 GiB** | **59.3** | **82.9** | **113.0** | **149.3** | **174.4** | **222.9** | **298.7** |
+| layer-order 20 GiB | 38.7 | 60.5 | 89.8 | 124.5 | 158.7 | 208.3 | 273.6 |
+| experts-only 30 GiB | 50.3 | 66.0 | 87.2 | 109.3 | 130.7 | 164.0 | 218.8 |
+
+Single-stream by context: **59.3 (1K) · 59.2 (8K) · 58.0 (32K) · 52.0 (128K) · 45.3 (256K)**
+vs layer-order's 38.7 → 32.9. 16 streams @8K: 186.8 vs 169.5.
+
+- ✅ **Expert-targeted offload wins every cell** at equal bytes: **+53% single-stream**,
+  +9% @64. The margin narrows with batch exactly as the mechanism predicts — a bigger batch
+  touches more experts, so expert-only reads converge toward reading everything.
+- ✅ **Amount matters more than I thought:** 30 → 20 GiB (both experts-only) is +18% single,
+  +36% @64. The dsv41 rule holds: **offload the minimum**. `CPU_OFFLOAD_GB` default is now
+  **20** (was 30); raise it only to buy pool (~1 GiB per GiB) for concurrent long contexts.
+- The 397B on one node is now **59 tok/s single-stream** — 73% of the 1.0 397B's 81.5 on
+  **twice the GPUs** — and holds 45 tok/s at 256K.
+
+#### Experts-only 20 GiB + MTP — ❌ does not fit a 256K window · 2026-11-08 (job 2760314)
+
+The MTP head and its speculator cost **+3.14 GiB/GPU** (77.52 vs 74.38 GiB resident), leaving
+3.52 GiB of KV against the **4.21 GiB one 262,144-token request needs**:
+`ValueError: To serve at least one request with the model's max seq len (262144), (4.21 GiB
+KV cache is needed, ...)`. Died at startup after a full load + capture (~7 min). Retrying at
+`CPU_OFFLOAD_GB=22`.
+
+#### Experts-only 22 GiB + MTP — a latency option, not a default · 2026-11-08 (job 2766587)
+
+22.12 GiB/GPU offloaded, resident 76.01, **pool 315,376 tokens (1.20× @256K)**, mean
+acceptance length **2.33**. 0 failures. Compared with experts-only 20 GiB, no MTP (2760309):
+
+| 1 stream | 1K | 8K | 32K | 128K | 256K |
+|---|---|---|---|---|---|
+| no MTP (20 GiB) | 59.3 | 59.2 | 58.0 | 52.0 | 45.3 |
+| **MTP (22 GiB)** | **75.6** | 54.3 | 26.7 | **63.2** | **51.8** |
+| MTP TTFT (s) | 0.40 | 1.36 | 5.09 | 0.71 | 1.28 |
+
+Aggregate @1K: 113 @4 (= no-MTP), 149 @8 (=), 187 vs 174 @16, 217 vs 223 @32, **229 vs 299
+@64 with p95 TTFT 45 s**.
+
+- When the prompt is prefix-cached, MTP is worth **+14 to +27%** single-stream.
+- ⚠️ The per-stream column includes TTFT, and the 8K/32K cells show TTFTs of 1.4–5.1 s where
+  the no-MTP run had ~0.4 s — i.e. **prefix-cache misses, not slower decode**. The 3.1 GiB
+  the head costs shrinks a pool that was already small; 8 streams × 32K is 256K of a 315K
+  pool, so the warm-up's prompts do not survive. The cause is inferred from TTFT, not
+  separately measured.
+- **So: off by default on `ornith_1n`** (unlike the 122B, whose 3.9M-token pool has room).
+  For single-user latency work use the preset **`ornith_1n_lowlat`** (= `ENABLE_SPECULATIVE=1
+  CPU_OFFLOAD_GB=22`). At
+  `CPU_OFFLOAD_GB=20` it does not start with a 256K window (job 2760314, above).
+
+- For reference, the 1.0 397B on **2 nodes** (no offload) reached 81.5 single / 845 @16. One
+  node halves the GPUs and avoids cross-node PP, but at batch the 2-node shape is far better
+  per GPU (106 vs 33 tok/s/GPU @16). Use `ornith_1n` for **single-user / scarce-node** work.
+
+### Ornith 1.5 `ornith` — 397B, 2 nodes × 4 GH200, TP=4 + PP=2, PIECEWISE · 2026-11-09 (job 2777625)
+
+**On the `vllm-glm53flash-1` container (v0.32.1), no build.** 47.6–48.1 GiB/GPU, weights in
+~127 s, **KV 4,418,411 tokens (16.9× @256K)**, PIECEWISE capture, engine-as-actor Ray. 0 failures,
+**no PP decode wedge**. (First attempt, job 2762334, served too but got no requests — the sweep's
+multi-node head-node bug, fixed in `5202f01`.)
+
+| context | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| 1K — per-stream | **79.6** | 71.6 | 41.4 | 38.2 | 32.1 | 26.9 | 20.0 |
+| 1K — aggregate | 79.6 | 142.9 | 165.4 | 305.0 | 512.6 | 857.4 | **1,269.7** |
+| 8K — per-stream / agg | 73.4 | | 42.3 | | 31.1 / 485 | | 20.9 / **1,283** |
+| 32K — per-stream | 76.0 | | 40.4 | | 29.2 | | |
+| 128K — per-stream | 71.8 | | 36.2 | | | | |
+| 256K — per-stream | 63.1 | 53.2 | | | | | |
+
+- vs the 1.0 397B on the same shape (pinned main `251f7e4`): single **79.6 vs 81.5** (same), and
+  it now scales to **64 streams** (1.0 was measured to 16: 845; 1.5 @16: 513 — the 1.0 sweep used
+  `max_tokens=256`, this one 200, so the @16 gap is not like-for-like).
+- vs `ornith_1n` (same weights, **half the GPUs**): +34% single (79.6 vs 59.3), **4.2× @64**
+  (1,270 vs 299), 9.6× the pool. Per GPU @64: **159** vs 75. **Use 2 nodes for batch/serving;
+  `ornith_1n` only when 2 nodes will not schedule.**
 
 ### Ornith 1.0 `ornith_gh200` — 35B MoE FP8 on 1× GH200, CUDAGraph · 2026-07-16/17
 Concurrency sweep (`bench_sweep.py`, `max_tokens=512`, warm/JIT-cached pass on the pinned-commit rebuild):

@@ -96,6 +96,10 @@ fi
 echo "[matrix] using bench driver: $BENCH"
 python3 -c "import json,urllib.request" 2>/dev/null || { echo "[matrix] FATAL: python3 stdlib unusable"; exit 1; }
 
+# squeue %N is a COMPRESSED list on a multi-node job ("gpu-1-[24,43]"), which is
+# not a hostname: job 2762334 served fine while this script polled nothing, and
+# the idle watchdog cancelled it after 20 min. vLLM's API runs on the first node.
+head_node() { local l; l=$(squeue -j "$1" -h -o "%N" 2>/dev/null | tr -d ' '); [ -n "$l" ] && [ "$l" != "(null)" ] && scontrol show hostnames "$l" 2>/dev/null | head -1; }
 job_alive() { squeue -j "$JOB" -h -o "%T" 2>/dev/null | grep -qE "RUNNING|PENDING|COMPLETING"; }
 
 # READY_WAIT is generous ON PURPOSE. The first version hardcoded 3600s, which
@@ -110,7 +114,7 @@ NODE=""
 _iters=$((READY_WAIT / 10))
 for i in $(seq 1 "$_iters"); do
   job_alive || { echo "[matrix] job $JOB gone before it was ready"; exit 1; }
-  NODE=$(squeue -j "$JOB" -h -o "%N" 2>/dev/null | tr -d ' ')
+  NODE=$(head_node "$JOB")
   if [ -n "$NODE" ] && curl -sf --max-time 5 "http://${NODE}:8000/health" >/dev/null 2>&1; then
     echo "[matrix] server healthy on $NODE after ~$((i*10))s"; break
   fi

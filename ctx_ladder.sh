@@ -19,12 +19,16 @@ cd "$D" || exit 1
 cleanup() { rc=$?; echo "[ladder] exiting (rc=$rc) -- cancelling job $JOB"; scancel "$JOB" 2>/dev/null; }
 trap cleanup EXIT
 
+# squeue %N is a COMPRESSED list on a multi-node job ("gpu-1-[24,43]"), which is
+# not a hostname: job 2762334 served fine while this script polled nothing, and
+# the idle watchdog cancelled it after 20 min. vLLM's API runs on the first node.
+head_node() { local l; l=$(squeue -j "$1" -h -o "%N" 2>/dev/null | tr -d ' '); [ -n "$l" ] && [ "$l" != "(null)" ] && scontrol show hostnames "$l" 2>/dev/null | head -1; }
 job_alive() { squeue -j "$JOB" -h -o "%T" 2>/dev/null | grep -qE "RUNNING|PENDING|COMPLETING"; }
 for i in $(seq 1 240); do
   job_alive || { echo "JOB $JOB gone before start"; exit 1; }
-  N=$(squeue -j "$JOB" -h -o "%N" 2>/dev/null); [ -n "$N" ] && break; sleep 10
+  N=$(head_node "$JOB"); [ -n "$N" ] && break; sleep 10
 done
-NODE=$(squeue -j "$JOB" -h -o "%N" 2>/dev/null); echo "node=$NODE"
+NODE=$(head_node "$JOB"); echo "node=$NODE"
 code=000
 for i in $(seq 1 240); do
   job_alive || { echo "JOB $JOB DIED waiting for health"; exit 1; }

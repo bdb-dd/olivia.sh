@@ -1139,6 +1139,23 @@ start_server_job() {
     local pp_size="${5:-1}"
     local preset="${6:-}"   # for per-preset HF-cache tier; empty for --container path
 
+    # Preset-variant env defaults (presets.json "env"). Exported BEFORE the
+    # forwarding below so the existing whitelists carry them into the job, and
+    # only when unset, so `FOO=x ./olivia.sh server start <variant>` still wins.
+    if [[ -n "${preset}" ]]; then
+        local _pk _pv _penv
+        _penv=$(preset_query env "${preset}") || { error "presets.json env for '${preset}' is invalid"; return 1; }
+        while IFS='=' read -r _pk _pv; do
+            [[ -z "${_pk}" ]] && continue
+            if [[ -z "${!_pk+x}" ]]; then
+                export "${_pk}=${_pv}"
+                echo "    preset env: ${_pk}=${_pv}" >&2
+            else
+                echo "    preset env: ${_pk}=${!_pk} (caller override; preset says ${_pv})" >&2
+            fi
+        done <<< "${_penv}"
+    fi
+
     info "Starting vLLM server..."
     echo "    Container: ${container}" >&2
     echo "    Model:     ${model}" >&2
@@ -1207,7 +1224,7 @@ start_server_job() {
                        VLLM_USE_RAY_V2_EXECUTOR_BACKEND DISABLE_CUSTOM_ALL_REDUCE \
                        VLLM_CACHE VLLM_CACHE_ROOT TRITON_CACHE_DIR \
                        DG_JIT_CACHE_DIR TORCHINDUCTOR_CACHE_DIR \
-                       CPU_OFFLOAD_GB ENABLE_EXPERT_PARALLEL KV_CACHE_DTYPE \
+                       CPU_OFFLOAD_GB CPU_OFFLOAD_PARAMS ENABLE_EXPERT_PARALLEL KV_CACHE_DTYPE \
                        KV_OFFLOAD_EXPERIMENT KV_OFFLOAD_GB \
                        LOAD_FORMAT CONTAINER_PYTHONPATH \
                        VLLM_PP_LAYER_PARTITION EXTRA_VLLM_ARGS; do
@@ -1318,7 +1335,7 @@ start_server_job() {
     # able to point each job at its own cache root keeps a weird failure in one
     # from being attributed to the other.
     local _k _v _fwd=""
-    for _k in $(compgen -v | grep -E '^(DSV4|DSV41|GLM5|GLM52|GLM53|GLM53_FLASH|GLM47|KIMI|ORNITH|QWEN38|BOREALIS|LAGUNA|INKLING|MINIMAX)_[A-Z0-9_]+$|^(MAX_MODEL_LEN|MAX_NUM_SEQS|MAX_NUM_BATCHED_TOKENS|GPU_MEM_UTIL|CUDAGRAPH_MODE|KV_CACHE_DTYPE|FORCE_KV_CACHE_DTYPE|CPU_OFFLOAD_GB|KV_OFFLOAD_GB|ENABLE_SPECULATIVE|IDLE_TIMEOUT|SERVED_MODEL_NAME|ATTENTION_BACKEND|ENFORCE_EAGER|TRITON_CACHE_DIR|DG_JIT_CACHE_DIR|TORCHINDUCTOR_CACHE_DIR)$|^VLLM_[A-Z0-9_]+$' 2>/dev/null | sort -u); do
+    for _k in $(compgen -v | grep -E '^(DSV4|DSV41|GLM5|GLM52|GLM53|GLM53_FLASH|GLM47|KIMI|ORNITH|QWEN38|BOREALIS|LAGUNA|INKLING|MINIMAX)_[A-Z0-9_]+$|^(MAX_MODEL_LEN|MAX_NUM_SEQS|MAX_NUM_BATCHED_TOKENS|GPU_MEM_UTIL|CUDAGRAPH_MODE|KV_CACHE_DTYPE|FORCE_KV_CACHE_DTYPE|CPU_OFFLOAD_GB|CPU_OFFLOAD_PARAMS|KV_OFFLOAD_GB|ENABLE_SPECULATIVE|IDLE_TIMEOUT|SERVED_MODEL_NAME|ATTENTION_BACKEND|ENFORCE_EAGER|TRITON_CACHE_DIR|DG_JIT_CACHE_DIR|TORCHINDUCTOR_CACHE_DIR)$|^VLLM_[A-Z0-9_]+$' 2>/dev/null | sort -u); do
         case "$_k" in
             *TOKEN*|*SECRET*|*PASSWORD*|*PASSWD*|*APIKEY*|*API_KEY*|*_KEY)
                 warn "refusing to forward ${_k} (looks like a credential; env vars are echoed and visible in \`ps\`)"

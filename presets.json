@@ -311,6 +311,25 @@
       "storage": "work",
       "description": "Ornith 1.5 397B MoE (Qwen3.5 hybrid GDN+full attn, 512 experts top-10) flagship, channel/token FP8 W8A8 (418 GB), 2-node TP=4+PP=2, 256K ctx (1M via YaRN). 1.5's FP8 SHIPS the MTP head (1.0's did not). Runs on the glm53flash container (vLLM v0.32.1; qwen3_5_moe native since 0.19.1) — no build"
     },
+    "ornith_1m": {
+      "aliases": [
+        "ornith-1m",
+        "ornith-397b-1m",
+        "ornith-1.5-1m"
+      ],
+      "model": "ornith-ai/Ornith-1.5-397B-FP8",
+      "nodes": 2,
+      "gpus": 4,
+      "pp": 2,
+      "container_prefix": "glm53flash",
+      "index": 1,
+      "storage": "work",
+      "env": {
+        "MAX_MODEL_LEN": "1048576",
+        "ORNITH_YARN_FACTOR": "4"
+      },
+      "description": "Ornith 1.5 397B on 2 nodes with a 1M-token window (YaRN x4 via text_config). ⚠️ NOT YET VERIFIED on the 397B — the same override is needle-verified on the 122B (job 2759667) and the 4.42M-token pool fits ~4 x 1M. Static YaRN applies to every request; use plain `ornith` unless you need >256K"
+    },
     "ornith_1n": {
       "aliases": [
         "ornith-1n",
@@ -327,6 +346,26 @@
       "storage": "work",
       "description": "Ornith 1.5 397B on ONE node (TP=4) — the dsv41 lesson: 418 GB of weights exceed 384 GB of HBM, so CPU_OFFLOAD_GB=20 (routed experts only) parks the excess in Grace LPDDR5X behind NVLink-C2C. Measured: 59 tok/s single-stream, 299 @64, 458K-token pool. Same weights as `ornith`; half the GPUs, no cross-node PP"
     },
+    "ornith_1n_lowlat": {
+      "aliases": [
+        "ornith-1n-lowlat",
+        "ornith-397b-1node-mtp",
+        "ornith-1n-mtp"
+      ],
+      "model": "ornith-ai/Ornith-1.5-397B-FP8",
+      "nodes": 1,
+      "gpus": 4,
+      "pp": 1,
+      "container_prefix": "glm53flash",
+      "index": 1,
+      "storage": "work",
+      "env": {
+        "ENABLE_SPECULATIVE": "1",
+        "ORNITH_SPEC_METHOD": "mtp",
+        "CPU_OFFLOAD_GB": "22"
+      },
+      "description": "Ornith 1.5 397B on ONE node, single-user latency shape: MTP + 22 GiB of experts in Grace (20 GiB does not fit MTP with a 256K window). Measured (job 2766587): 75.6 tok/s single at 1K, 63 at 128K — but a 315K-token pool, so 8-32K prompts lose prefix cache and @64 falls to 229. Prefer `ornith_1n` for anything concurrent"
+    },
     "ornith_122b": {
       "aliases": [
         "ornith-122b",
@@ -342,6 +381,26 @@
       "index": 1,
       "storage": "projects",
       "description": "Ornith 1.5 122B-A10B MoE (NEW size; Qwen3.5 hybrid GDN+full attn, 48 layers, 256 experts top-8) channel/token FP8 W8A8 (133 GB), single node TP=4, 256K ctx (1M via YaRN), MTP head shipped. Runs on the glm53flash container — no build"
+    },
+    "ornith_122b_1m": {
+      "aliases": [
+        "ornith-122b-1m",
+        "ornith-1.5-122b-1m",
+        "ornith122b-1m"
+      ],
+      "model": "ornith-ai/Ornith-1.5-122B-FP8",
+      "nodes": 1,
+      "gpus": 4,
+      "pp": 1,
+      "container_prefix": "glm53flash",
+      "index": 1,
+      "storage": "projects",
+      "env": {
+        "MAX_MODEL_LEN": "1048576",
+        "ORNITH_YARN_FACTOR": "4",
+        "ENABLE_SPECULATIVE": "0"
+      },
+      "description": "Ornith 1.5 122B with a 1M-token window (YaRN x4 via text_config). ✅ Needle-verified at 1,036,709 tokens (job 2759667): 4.59M-token pool = 4.38x @1M, 54.8 tok/s @512K, 36.2 @878K. MTP is OFF here because that is the configuration verified; ENABLE_SPECULATIVE=1 to try MTP + 1M (untested). Static YaRN applies to every request; use plain `ornith_122b` unless you need >256K"
     },
     "ornith_gh200": {
       "aliases": [

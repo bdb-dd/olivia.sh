@@ -142,6 +142,9 @@ Unified CLI for managing vLLM on an HPC cluster. Uses SSH ControlMaster for sing
 | `ornith` | `ornith-ai/Ornith-1.5-397B-FP8` | 8 (2 nodes × 4) | **Ornith 1.5 397B flagship** (org renamed from `deepreinforce-ai`). TP=4 + PP=2, FP8 W8A8 (418 GB). Qwen3.5 hybrid-attn MoE, 256K ctx (1M via `ORNITH_YARN_FACTOR=4`). **Runs on the `glm53flash` container (vLLM v0.32.1) — no build**; qwen3_5_moe is native since 0.19.1. **1.5's FP8 ships the MTP head** (1.0's did not) — spec decode is opt-in (`ENABLE_SPECULATIVE=1`, `ORNITH_SPEC_METHOD=mtp\|dflash`) |
 | `ornith_1n` | `ornith-ai/Ornith-1.5-397B-FP8` | **4 (1 node)** | The same 397B on **one node**: 418 GB exceeds 384 GB of HBM, so `CPU_OFFLOAD_GB=20` (default, measured best) parks the excess in Grace LPDDR5X — restricted to the routed experts via `CPU_OFFLOAD_PARAMS=experts` (`--cpu-offload-params`, vLLM ≥0.32). The dsv41 lesson, refined. Half the GPUs of `ornith`, no cross-node PP. **Measured: 59 tok/s single-stream, 299 @64** |
 | `ornith_122b` | `ornith-ai/Ornith-1.5-122B-FP8` | 4 (1 node) | **New in 1.5:** 122B-A10B, 48 layers, 256 experts top-8, FP8 W8A8 (133 GB, persistent tier), TP=4. **MTP on by default** (192 tok/s single, 3,300 @64). 1M via `ORNITH_YARN_FACTOR=4` + `MAX_MODEL_LEN=1048576` — ⚠️ NOT the model card's top-level `rope_scaling` override, which is a silent no-op (needle-verified). **No DFlash drafter** for this size |
+| `ornith_122b_1m` | `ornith-ai/Ornith-1.5-122B-FP8` | 4 (1 node) | **1M-token window** (`MAX_MODEL_LEN=1048576 ORNITH_YARN_FACTOR=4`, MTP off — the verified config). ✅ Needle-verified at 1,036,709 tokens; 4.38× @1M |
+| `ornith_1m` | `ornith-ai/Ornith-1.5-397B-FP8` | 8 (2 nodes × 4) | The 2-node 397B with the same 1M window. ⚠️ **Not yet verified on the 397B** (the override is shape-agnostic; the 4.42M-token pool fits ~4 × 1M) |
+| `ornith_1n_lowlat` | `ornith-ai/Ornith-1.5-397B-FP8` | 4 (1 node) | Single-user latency shape of `ornith_1n`: MTP + `CPU_OFFLOAD_GB=22`. 75.6 tok/s single, but a 315K-token pool and 229 @64 |
 | `ornith_gh200` | `deepreinforce-ai/Ornith-1.0-35B-FP8` | **1** | **35B on a single GH200 card** (TP=1). FP8 W8A8 (~35 GB, ~3B active), hybrid linear+full attn (auto backend), multimodal, 256K ctx — max single-user throughput. MTP off (no head in FP8). Still points at the (purge-hollowed) 1.0 `ornith` container — not moved to 1.5, `qwen3_xml`/`qwen3` parsers |
 | `devstral` | `mistralai/Devstral-2-123B-Instruct-2512` | 4 | TP=4 |
 | `llama` | `meta-llama/Llama-3.3-70B-Instruct` | 4 | TP=4 |
@@ -365,6 +368,18 @@ truth for the runtime preset table: `olivia.sh` (via `presets.py`) and the
 durable router (`model_router.py`) both read it, so the CLI and the router stay in
 sync. The old `preset_field`/`normalize_preset` case statements in `olivia.sh`
 were extracted into `presets.json` — don't re-add per-preset data to the bash.
+**Preset variants (`"env"`).** A preset may carry an `"env"` object of server env
+defaults, e.g. `"env": {"MAX_MODEL_LEN": "1048576", "ORNITH_YARN_FACTOR": "4"}`, so a
+tested operating point is one name instead of a remembered recipe (`ornith_122b_1m`,
+`ornith_1m`, `ornith_1n_lowlat`). `olivia.sh server start` exports each one **only if
+the caller has not set it** — `ENABLE_SPECULATIVE=1 ./olivia.sh server start
+ornith_122b_1m` still wins — and prints which value it used. `presets.py env <name>`
+shows them. Names are validated on load (`^[A-Z][A-Z0-9_]*$`, nothing credential-like:
+these values are echoed and ride in the sbatch command line), and they must also be on
+`start_server_job`'s forwarding whitelist to reach the job. Variants share the base's
+repo id, so a request routed by repo id resolves to the base preset (same weights,
+same storage tier).
+
 Set `"storage": "work"` for a model that lives on the `/cluster/work` mirror
 (doesn't fit the 1 TiB project quota); it defaults to `projects` (persistent).
 `olivia.sh` resolves `HF_HOME` from this for `prefetch`/`server start`, so the

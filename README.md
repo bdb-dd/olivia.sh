@@ -360,7 +360,8 @@ broken position encoding — verify long context with a needle, not with tok/s.*
 #### `ornith_122b` @ 1M via the CORRECTED YaRN override — ✅ WORKS · 2026-11-08 (job 2759667)
 
 `MAX_MODEL_LEN=1048576 ORNITH_YARN_FACTOR=4` (MTP off, so only YaRN differs from job
-2754537). The override now targets `text_config.rope_parameters`. Three independent signs it
+2754537) — now packaged as the preset **`ornith_122b_1m`**
+(`./olivia.sh server start ornith_122b_1m`). The override now targets `text_config.rope_parameters`. Three independent signs it
 took: the "greater than the derived max_model_len" warning is **gone** (derived =
 `max_seq_len=1048576`), weights load **0.1 GiB larger** (30.11 vs 30.01 GiB — a 4× rotary
 cache), and the needle:
@@ -480,7 +481,8 @@ Aggregate @1K: 113 @4 (= no-MTP), 149 @8 (=), 187 vs 174 @16, 217 vs 223 @32, **
   pool, so the warm-up's prompts do not survive. The cause is inferred from TTFT, not
   separately measured.
 - **So: off by default on `ornith_1n`** (unlike the 122B, whose 3.9M-token pool has room).
-  `ENABLE_SPECULATIVE=1 CPU_OFFLOAD_GB=22` for single-user latency work. At
+  For single-user latency work use the preset **`ornith_1n_lowlat`** (= `ENABLE_SPECULATIVE=1
+  CPU_OFFLOAD_GB=22`). At
   `CPU_OFFLOAD_GB=20` it does not start with a 256K window (job 2760314, above).
 
 - For reference, the 1.0 397B on **2 nodes** (no offload) reached 81.5 single / 845 @16. One

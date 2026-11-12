@@ -1139,6 +1139,23 @@ start_server_job() {
     local pp_size="${5:-1}"
     local preset="${6:-}"   # for per-preset HF-cache tier; empty for --container path
 
+    # Preset-variant env defaults (presets.json "env"). Exported BEFORE the
+    # forwarding below so the existing whitelists carry them into the job, and
+    # only when unset, so `FOO=x ./olivia.sh server start <variant>` still wins.
+    if [[ -n "${preset}" ]]; then
+        local _pk _pv _penv
+        _penv=$(preset_query env "${preset}") || { error "presets.json env for '${preset}' is invalid"; return 1; }
+        while IFS='=' read -r _pk _pv; do
+            [[ -z "${_pk}" ]] && continue
+            if [[ -z "${!_pk+x}" ]]; then
+                export "${_pk}=${_pv}"
+                echo "    preset env: ${_pk}=${_pv}" >&2
+            else
+                echo "    preset env: ${_pk}=${!_pk} (caller override; preset says ${_pv})" >&2
+            fi
+        done <<< "${_penv}"
+    fi
+
     info "Starting vLLM server..."
     echo "    Container: ${container}" >&2
     echo "    Model:     ${model}" >&2

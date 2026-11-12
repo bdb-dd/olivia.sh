@@ -29,6 +29,7 @@ CLI::
     presets.py normalize <name>            # canonical name (or lower-cased input)
     presets.py field <name> <field>        # model|served_name|nodes|gpus|pp|resources|prefix|index|port|storage|description
     presets.py shellvars <name>            # PRESET_*=... lines for `eval` in bash
+    presets.py env <name>                  # KEY=VALUE server env defaults of a preset variant
     presets.py container <name> [index]    # vllm-<prefix>-<index>-sandbox
     presets.py list [--aliases]            # canonical preset names
     presets.py match <model-string>        # canonical preset a request `model` routes to (empty if none)
@@ -39,6 +40,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
@@ -47,6 +49,31 @@ PRESETS_JSON = os.environ.get(
     "OLIVIA_PRESETS_JSON",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "presets.json"),
 )
+
+
+_ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_ENV_SECRET = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|APIKEY|API_KEY|_KEY$")
+
+
+def _validated_env(canonical: str, env: dict) -> dict:
+    """Reject anything that could not be a plain server knob.
+
+    These values are echoed by olivia.sh and ride in the sbatch command line, so
+    a credential must never be stored here — and a malformed name would only
+    fail later, on the cluster, after a queue wait.
+    """
+    if not isinstance(env, dict):
+        raise ValueError(f"preset {canonical!r}: 'env' must be an object")
+    out = {}
+    for k, v in env.items():
+        if not _ENV_NAME.match(k):
+            raise ValueError(f"preset {canonical!r}: bad env var name {k!r}")
+        if _ENV_SECRET.search(k):
+            raise ValueError(f"preset {canonical!r}: {k!r} looks like a credential")
+        if not isinstance(v, (str, int, float)) or isinstance(v, bool):
+            raise ValueError(f"preset {canonical!r}: {k!r} must be a string or number")
+        out[k] = str(v)
+    return out
 
 
 @dataclass
@@ -63,6 +90,10 @@ class Preset:
     port: int = 8000
     storage: str = "projects"  # HF-cache tier: "projects" (persistent) or "work" (at-risk)
     description: str = ""
+    # Server env defaults baked into a preset VARIANT (e.g. a 1M-context or a
+    # low-latency shape of the same weights). olivia.sh exports each one only if
+    # the caller has not set it, so an explicit `FOO=x ./olivia.sh ...` wins.
+    env: dict = field(default_factory=dict)
     known: bool = True  # False for synthesised custom presets
 
     @property
@@ -104,6 +135,7 @@ class Registry:
                 port=int(spec.get("port", self.defaults.get("port", 8000))),
                 storage=spec.get("storage", self.defaults.get("storage", "projects")),
                 description=spec.get("description", ""),
+                env=_validated_env(canonical, spec.get("env", {})),
             )
         # Lower-cased alias/canonical -> canonical, for normalize().
         self._alias_index: dict = {}
@@ -241,6 +273,13 @@ def main(argv: list) -> int:
             print("usage: presets.py shellvars <name>", file=sys.stderr)
             return 2
         print(_cmd_shellvars(reg.resolve(rest[0])))
+        return 0
+    if cmd == "env":
+        if not rest:
+            print("usage: presets.py env <name>", file=sys.stderr)
+            return 2
+        for k, v in reg.resolve(rest[0]).env.items():
+            print(f"{k}={v}")
         return 0
     if cmd == "container":
         if not rest:

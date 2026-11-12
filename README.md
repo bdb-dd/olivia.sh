@@ -554,6 +554,34 @@ Aggregate @1K: 113 @4 (= no-MTP), 149 @8 (=), 187 vs 174 @16, 217 vs 223 @32, **
   CPU_OFFLOAD_GB=22`). At
   `CPU_OFFLOAD_GB=20` it does not start with a 256K window (job 2760314, above).
 
+#### DFlash on the 1-node 397B — ❌ slower than no spec decode in every cell · 2026-11-12 (jobs 2851679, 2852244)
+
+`ORNITH_SPEC_METHOD=dflash` (drafter `ornith-ai/Ornith-1.5-397B-DFlash`, 8 draft tokens — the
+card's recipe). **At the default 20 GiB it does not start** (job 2851679): the drafter's weights
+cost only +0.9 GiB/GPU, but its capture + activation reservation for 9-token verification left
+**2.61 GiB of KV against the 4.59 GiB** one 262,144-token request needs. I had sized it from the
+weights alone. At **`CPU_OFFLOAD_GB=23`** (job 2852244) it serves: pool 5.66 GiB = **323,258
+tokens (1.23× @256K)**, 0 failures. vLLM warned that no KV-cache group was identified as the
+draft model's; drafting worked regardless.
+
+The drafter is **good** — mean acceptance length **2.9–3.2** (MTP: 2.33) — but per-position
+acceptance collapses after ~3 (0.70–0.80, 0.46–0.50, 0.30–0.32, 0.21, 0.13, 0.09, 0.08, 0.05). On
+this shape every verified token routes through experts read from Grace, so verifying 9 tokens
+per step costs far more than the ~3 it yields:
+
+| | no spec, 20 GiB (2760309) | MTP, 22 GiB (2766587) | **DFlash ×8, 23 GiB (2852244)** |
+|---|---|---|---|
+| 1 stream @1K | 59.3 | **75.6** | 51.0 |
+| 4 / 16 / 64 streams @1K (agg) | **113 / 174 / 299** | 113 / 187 / 229 | 76 / 108 / 121 |
+| 1 stream @8K / 32K | 59.2 / 58.0 | 54.3 / 26.7 | 37.4 / 23.4 |
+| 1 stream @128K / 256K | 52.0 / 45.3 | **63.2 / 51.8** | 44.7 / 38.2 |
+| p95 TTFT @64 | 9.0 s | 45.5 s | **92.3 s** |
+
+**Verdict: no DFlash preset.** Untested, and worth one run if latency matters here:
+`ORNITH_DFLASH_TOKENS=3` or `4` (positions 5–8 are accepted ≤13% of the time), and vLLM's
+graph-memory reservation — 4.07 GiB estimated vs 1.3 GiB actual — is ~2.8 GiB of KV left on the
+table. DFlash on the 2-node shape is blocked by the PP + spec-decode guard.
+
 - For reference, the 1.0 397B on **2 nodes** (no offload) reached 81.5 single / 845 @16. One
   node halves the GPUs and avoids cross-node PP, but at batch the 2-node shape is far better
   per GPU (106 vs 33 tok/s/GPU @16). Use `ornith_1n` for **single-user / scarce-node** work.

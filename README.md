@@ -296,7 +296,7 @@ and `server start` prints it before submitting.
 | `ornith-1.5-397b-256k-1n` | `ornith_1n` | benchmarked 2026-11-08 (job 2760309) |
 | `ornith-1.5-397b-256k-1n-lowlat` | `ornith_1n_lowlat` | benchmarked 2026-11-08 (job 2766587) |
 | `ornith-1.5-122b-256k` | `ornith_122b` | benchmarked 2026-11-08 (jobs 2754478, 2754533) |
-| `ornith-1.5-122b-1m` | `ornith_122b_1m` | needle-verified 2026-11-08 (job 2759667) |
+| `ornith-1.5-122b-1m` | `ornith_122b_1m` | needle-verified with MTP 2026-11-12 (job 2851670) |
 | `ornith-1.0-35b-256k` | `ornith_gh200` | benchmarked 2026-07-16 — its 1.0 container is purge-hollowed |
 | `devstral-2-123b-32k` | `devstral` | no current benchmark |
 | `llama-3.3-70b-32k` | `llama` | no current benchmark |

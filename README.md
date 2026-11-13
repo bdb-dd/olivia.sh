@@ -298,6 +298,7 @@ and `server start` prints it before submitting.
 | `ornith-1.5-122b-256k` | `ornith_122b` | benchmarked 2026-11-08 (jobs 2754478, 2754533) |
 | `ornith-1.5-122b-1m` | `ornith_122b_1m` | needle-verified 2026-11-08 (job 2759667) |
 | `ornith-1.0-35b-256k` | `ornith_gh200` | benchmarked 2026-07-16 — its 1.0 container is purge-hollowed |
+| `ornith-1.5-35b-256k` | *(new 2026-11-12)* | benchmarked 2026-11-12 (jobs 2853361, 2853381, 2853393) |
 | `devstral-2-123b-32k` | `devstral` | no current benchmark |
 | `llama-3.3-70b-32k` | `llama` | no current benchmark |
 | `qwen-2.5-72b-32k` | `qwen` | no current benchmark |
@@ -562,6 +563,34 @@ multi-node head-node bug, fixed in `5202f01`.)
 - vs `ornith_1n` (same weights, **half the GPUs**): +34% single (79.6 vs 59.3), **4.2× @64**
   (1,270 vs 299), 9.6× the pool. Per GPU @64: **159** vs 75. **Use 2 nodes for batch/serving;
   `ornith_1n` only when 2 nodes will not schedule.**
+
+### Ornith 1.5 `ornith-1.5-35b-256k` — 35B-A3B on 1× GH200, and the DFlash test · 2026-11-12
+
+Ornith 1.5 35B-A3B FP8 (39 GB, work tier), TP=1, the glm53flash container, 0 failures in every
+cell of all three runs. The PI's question was whether DFlash pays off where verification is
+**cheap** — no offload, ~3B active — unlike the 1-node 397B, where it lost to everything.
+
+| 1 GPU | no spec (2853361) | **MTP ×2 (2853393)** | DFlash ×8 (2853381) |
+|---|---|---|---|
+| weights / KV pool | 35.17 GiB / **2,419,948 tok (9.2× @256K)** | 36.78 / 2,035,951 (7.8×) | 36.00 / 1,503,103 (5.7×) |
+| acceptance length | — | 2.09 (pos: 0.70, 0.39) | 2.45 (pos: 0.69, 0.31, 0.14, 0.09, …) |
+| 1 stream @1K | 169.5 | **249.5** | **250.1** |
+| 1 stream @8K / 32K | 166.8 / 156.9 | **261.9 / 234.0** | 243.0 / 203.5 |
+| 1 stream @128K / 256K | 132.2 / 102.4 | **190.2 / 132.0** | 169.9 / 117.6 |
+| 16 streams @1K / @8K (agg) | 1,505 / 1,420 | **1,890 / 1,640** | 1,610 / 770 |
+| 64 streams @1K (agg) | 3,348 | **3,826** | 2,004 (p95 TTFT 4.6 s) |
+| 4 streams @128K (per stream) | 98.9 | **111.9** | 20.8 (TTFT 6.6 s) |
+
+- **MTP wins or ties every cell**: +47% single-stream, +14% @64 over no spec decode. It is now
+  **on by default for the 35B**, as for the 122B (`ENABLE_SPECULATIVE=0` disables).
+- **DFlash, half right:** with cheap verification it does catch MTP at batch-1 short context
+  (250 vs 250) — but it cannot pull ahead, because acceptance decays faster than on the 397B
+  (position 2: 0.31 here vs 0.46 there; positions ≥3 ≤0.14), so most of its 8 drafts are wasted.
+  Under batch the 9-token verification saturates the GPU and the drafter's own KV takes ~0.9M
+  tokens of pool, so prefixes get evicted (TTFT 1.6–6.6 s at 8–128K). **No DFlash preset.**
+- vs the 1.0 35B (`ornith-1.0-35b-256k`, 174 single / 4,621 @64): **not like-for-like** — that
+  sweep used `max_tokens=512` (this one 200, so per-request prefill weighs more here) on a
+  different container. Single-stream is comparable without MTP; with MTP 1.5 is +43%.
 
 ### Ornith 1.0 `ornith_gh200` — 35B MoE FP8 on 1× GH200, CUDAGraph · 2026-07-16/17
 Concurrency sweep (`bench_sweep.py`, `max_tokens=512`, warm/JIT-cached pass on the pinned-commit rebuild):

@@ -1397,9 +1397,15 @@ elif [[ "${ENABLE_SPECULATIVE}" == "auto" ]]; then
     # 2026-11-08): MTP x2 accepts 2.17 tokens/step, +40..64% single-stream at
     # every context 1K-256K, +19% aggregate @64 at 1K, -2.5% @64 at 8K (the only
     # regression), for 1.2 GiB/GPU and 4.50M -> 3.89M KV tokens. So on by default.
-    if [[ "${IS_ORNITH15}" == "1" && "${MODEL}" == *"122B"* && "${ENABLE_SPECULATIVE}" == "auto" ]]; then
+    # The 35B is MEASURED too (job 2853393 vs base 2853361, 2026-11-12, 1 GPU):
+    # +47% single-stream (249.5 vs 169.5), +14% @64 (3,826 vs 3,348), ahead at
+    # every context; acceptance 2.09. DFlash x8 (job 2853381) tied it only at
+    # batch-1 short context and fell to 2,004 @64 — MTP is the method. Only the
+    # 397B stays opt-in: its 1-node shape has no KV room for the head (needs
+    # CPU_OFFLOAD_GB=22) and 2 nodes run PP, which disables spec decode.
+    if [[ "${IS_ORNITH15}" == "1" && "${IS_ORNITH_397B}" != "1" && ( "${MODEL}" == *"122B"* || "${MODEL}" == *"35B"* ) && "${ENABLE_SPECULATIVE}" == "auto" ]]; then
         USE_SPECULATIVE=1
-        echo "[INFO] Ornith 1.5 122B: MTP ON by default (measured +61% single-stream). ENABLE_SPECULATIVE=0 to disable."
+        echo "[INFO] Ornith 1.5 ${MODEL##*Ornith-1.5-}: MTP ON by default (measured +47..61% single-stream). ENABLE_SPECULATIVE=0 to disable."
     elif [[ "${IS_ORNITH15}" == "1" && "${ENABLE_SPECULATIVE}" == "auto" ]]; then
         echo "[INFO] Ornith 1.5: spec decode OFF by default (MTP head IS shipped; DFlash drafter exists for 35B/397B). ENABLE_SPECULATIVE=1 [ORNITH_SPEC_METHOD=mtp|dflash] to enable."
     elif [[ "${IS_ORNITH}" == "1" && "${ENABLE_SPECULATIVE}" == "auto" ]]; then

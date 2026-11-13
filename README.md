@@ -296,7 +296,7 @@ and `server start` prints it before submitting.
 | `ornith-1.5-397b-256k-1n` | `ornith_1n` | benchmarked 2026-11-08 (job 2760309) |
 | `ornith-1.5-397b-256k-1n-lowlat` | `ornith_1n_lowlat` | benchmarked 2026-11-08 (job 2766587) |
 | `ornith-1.5-122b-256k` | `ornith_122b` | benchmarked 2026-11-08 (jobs 2754478, 2754533) |
-| `ornith-1.5-122b-1m` | `ornith_122b_1m` | needle-verified 2026-11-08 (job 2759667) |
+| `ornith-1.5-122b-1m` | `ornith_122b_1m` | needle-verified with MTP 2026-11-12 (job 2851670) |
 | `ornith-1.0-35b-256k` | `ornith_gh200` | benchmarked 2026-07-16 — its 1.0 container is purge-hollowed |
 | `devstral-2-123b-32k` | `devstral` | no current benchmark |
 | `llama-3.3-70b-32k` | `llama` | no current benchmark |
@@ -429,6 +429,24 @@ Per-stream decode (0 failures): 1K 119.9 · 128K 97.6 · 256K 77.9 · **512K 54.
 16 streams @1K 1,134 aggregate. **Static YaRN costs nothing measurable at short context**
 (119.9 vs 119.2 baseline) — the card's quality caveat for short inputs is untested here.
 
+#### `ornith-1.5-122b-1m` with MTP — ✅ needle-verified, now the variant's default · 2026-11-12 (job 2851670)
+
+Same as job 2759667 (corrected YaRN x4, 1M window) but with MTP on. Weights 31.33 GiB/GPU
+(30.11 + the 1.2 GiB head), **pool 4,034,670 tokens (3.85× @1M)**, mean acceptance length
+**2.27**, 0 failures. **Needle recovered at 33,977 / 207,148 / 621,676 / 1,036,709 tokens** — MTP
+does not disturb long-context retrieval.
+
+| context | MTP off (2759667) | **MTP on (2851670)** | gain |
+|---|---|---|---|
+| 1K | 119.9 | **196.1** | +64% |
+| 128K | 97.6 | **140.4** | +44% |
+| 256K | 77.9 | **105.9** | +36% |
+| 512K | 54.8 | **70.0** | +28% |
+| 878K | 36.2 | **48.5** | +34% |
+
+Aggregate @1K: 1,541 @16, **3,321 @64** (MTP-off 1M run: 1,134 @16). The `ornith-1.5-122b-1m`
+variant therefore no longer forces `ENABLE_SPECULATIVE=0`; it inherits the 122B's MTP default.
+
 ### Ornith 1.5 `ornith_1n` — 397B on ONE node, experts in Grace memory · 2026-11-08 (job 2754516)
 
 The flagship's 418 GB (~97.4 GiB/GPU) exceeds a whole 96 GB card, so the dsv41 lesson
@@ -535,6 +553,34 @@ Aggregate @1K: 113 @4 (= no-MTP), 149 @8 (=), 187 vs 174 @16, 217 vs 223 @32, **
   For single-user latency work use the preset **`ornith_1n_lowlat`** (= `ENABLE_SPECULATIVE=1
   CPU_OFFLOAD_GB=22`). At
   `CPU_OFFLOAD_GB=20` it does not start with a 256K window (job 2760314, above).
+
+#### DFlash on the 1-node 397B — ❌ slower than no spec decode in every cell · 2026-11-12 (jobs 2851679, 2852244)
+
+`ORNITH_SPEC_METHOD=dflash` (drafter `ornith-ai/Ornith-1.5-397B-DFlash`, 8 draft tokens — the
+card's recipe). **At the default 20 GiB it does not start** (job 2851679): the drafter's weights
+cost only +0.9 GiB/GPU, but its capture + activation reservation for 9-token verification left
+**2.61 GiB of KV against the 4.59 GiB** one 262,144-token request needs. I had sized it from the
+weights alone. At **`CPU_OFFLOAD_GB=23`** (job 2852244) it serves: pool 5.66 GiB = **323,258
+tokens (1.23× @256K)**, 0 failures. vLLM warned that no KV-cache group was identified as the
+draft model's; drafting worked regardless.
+
+The drafter is **good** — mean acceptance length **2.9–3.2** (MTP: 2.33) — but per-position
+acceptance collapses after ~3 (0.70–0.80, 0.46–0.50, 0.30–0.32, 0.21, 0.13, 0.09, 0.08, 0.05). On
+this shape every verified token routes through experts read from Grace, so verifying 9 tokens
+per step costs far more than the ~3 it yields:
+
+| | no spec, 20 GiB (2760309) | MTP, 22 GiB (2766587) | **DFlash ×8, 23 GiB (2852244)** |
+|---|---|---|---|
+| 1 stream @1K | 59.3 | **75.6** | 51.0 |
+| 4 / 16 / 64 streams @1K (agg) | **113 / 174 / 299** | 113 / 187 / 229 | 76 / 108 / 121 |
+| 1 stream @8K / 32K | 59.2 / 58.0 | 54.3 / 26.7 | 37.4 / 23.4 |
+| 1 stream @128K / 256K | 52.0 / 45.3 | **63.2 / 51.8** | 44.7 / 38.2 |
+| p95 TTFT @64 | 9.0 s | 45.5 s | **92.3 s** |
+
+**Verdict: no DFlash preset.** Untested, and worth one run if latency matters here:
+`ORNITH_DFLASH_TOKENS=3` or `4` (positions 5–8 are accepted ≤13% of the time), and vLLM's
+graph-memory reservation — 4.07 GiB estimated vs 1.3 GiB actual — is ~2.8 GiB of KV left on the
+table. DFlash on the 2-node shape is blocked by the PP + spec-decode guard.
 
 - For reference, the 1.0 397B on **2 nodes** (no offload) reached 81.5 single / 845 @16. One
   node halves the GPUs and avoids cross-node PP, but at batch the 2-node shape is far better
